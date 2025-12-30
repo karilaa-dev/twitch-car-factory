@@ -66,8 +66,22 @@ async def notify_all(message: str) -> None:
             pass
 
 
-async def restart_user_with_notification(user_id: str) -> bool:
-    """Restart a user instance and send notification when launched."""
+async def notify_user(telegram_id: int, message: str) -> None:
+    """Send notification to a specific telegram user."""
+    if not BotContext.bot:
+        return
+    try:
+        await BotContext.bot.send_message(telegram_id, message, parse_mode="Markdown")
+    except Exception:
+        pass
+
+
+async def restart_user_with_notification(user_id: str, trigger_telegram_id: int | None = None) -> bool:
+    """Restart a user instance and send notification when launched.
+    
+    If trigger_telegram_id is provided, only notify that user.
+    Otherwise, notify all whitelisted users.
+    """
     if not BotContext.process_manager.is_running(user_id):
         return False
     
@@ -77,31 +91,37 @@ async def restart_user_with_notification(user_id: str) -> bool:
     # Start the instance
     success = BotContext.process_manager.start_instance(user_id)
     
+    # Choose notification method based on trigger
+    if trigger_telegram_id is not None:
+        notify = lambda msg: notify_user(trigger_telegram_id, msg)
+    else:
+        notify = notify_all
+    
     if success:
         if BotContext.health_monitor:
             BotContext.health_monitor.reset_user(user_id)
-        await notify_all(f"✅ Instance `{user_id}` restarted successfully")
+        await notify(f"✅ Instance `{user_id}` restarted successfully")
     else:
-        await notify_all(f"❌ Failed to restart instance `{user_id}`")
+        await notify(f"❌ Failed to restart instance `{user_id}`")
     
     return success
 
 
-async def restart_users_with_preset(preset_name: str) -> int:
+async def restart_users_with_preset(preset_name: str, trigger_telegram_id: int | None = None) -> int:
     """Restart all running users who have this preset assigned. Returns count of restarted."""
     restarted = 0
     for user_id in BotContext.config.twitch_users:
         user_state = BotContext.data.get_user_state(user_id)
         if user_state.assigned_preset == preset_name and BotContext.process_manager.is_running(user_id):
-            if await restart_user_with_notification(user_id):
+            if await restart_user_with_notification(user_id, trigger_telegram_id):
                 restarted += 1
     return restarted
 
 
-async def do_restart_if_running(user_id: str) -> bool:
+async def do_restart_if_running(user_id: str, trigger_telegram_id: int | None = None) -> bool:
     """Restart a user if running and send notification. Returns True if was running."""
     if BotContext.process_manager.is_running(user_id):
-        await restart_user_with_notification(user_id)
+        await restart_user_with_notification(user_id, trigger_telegram_id)
         return True
     return False
 
@@ -246,7 +266,7 @@ async def user_action(callback: CallbackQuery):
         await callback.answer(msg, show_alert=True)
     elif action == "restart":
         await callback.answer(f"🔄 Restarting {user_id}...", show_alert=True)
-        await restart_user_with_notification(user_id)
+        await restart_user_with_notification(user_id, callback.from_user.id)
     else:
         await callback.answer("Unknown action", show_alert=True)
         return
@@ -477,7 +497,7 @@ async def preset_add_channels(message: Message, state: FSMContext):
             # Add channels to existing preset
             for ch in channels:
                 BotContext.data.add_channel_to_preset(preset_name, ch)
-            restarted = await restart_users_with_preset(preset_name)
+            restarted = await restart_users_with_preset(preset_name, message.from_user.id)
             restart_msg = f" Restarted {restarted} user(s)." if restarted else ""
             await state.clear()
             
@@ -532,7 +552,7 @@ async def done_adding_channels(callback: CallbackQuery, state: FSMContext):
         # Add channels to existing preset
         for ch in channels:
             BotContext.data.add_channel_to_preset(preset_name, ch)
-        restarted = await restart_users_with_preset(preset_name)
+        restarted = await restart_users_with_preset(preset_name, callback.from_user.id)
         restart_msg = f" Restarted {restarted} user(s)." if restarted else ""
         await state.clear()
         
@@ -615,7 +635,7 @@ async def preset_remove_channel(callback: CallbackQuery):
     channel = parts[2]
 
     BotContext.data.remove_channel_from_preset(preset_name, channel)
-    restarted = await restart_users_with_preset(preset_name)
+    restarted = await restart_users_with_preset(preset_name, callback.from_user.id)
     restart_msg = f" ({restarted} restarted)" if restarted else ""
     await callback.answer(f"Removed {channel}{restart_msg}")
 
@@ -735,7 +755,7 @@ async def preset_assign_user(callback: CallbackQuery):
         if user_id == "__all__":
             for uid in BotContext.config.twitch_users:
                 BotContext.data.set_user_mode_default(uid)
-                await do_restart_if_running(uid)
+                await do_restart_if_running(uid, callback.from_user.id)
             await callback.answer("✅ All users set to default", show_alert=True)
         else:
             user_state = BotContext.data.get_user_state(user_id)
@@ -743,7 +763,7 @@ async def preset_assign_user(callback: CallbackQuery):
                 await callback.answer("Already using default")
             else:
                 BotContext.data.set_user_mode_default(user_id)
-                await do_restart_if_running(user_id)
+                await do_restart_if_running(user_id, callback.from_user.id)
                 await callback.answer(f"Set {user_id} to default")
         
         # Refresh
@@ -764,7 +784,7 @@ async def preset_assign_user(callback: CallbackQuery):
             for uid in BotContext.config.twitch_users:
                 if BotContext.data.set_user_mode_custom(uid):
                     count += 1
-                    await do_restart_if_running(uid)
+                    await do_restart_if_running(uid, callback.from_user.id)
             await callback.answer(f"✅ Set {count} users to custom", show_alert=True)
         else:
             user_state = BotContext.data.get_user_state(user_id)
@@ -774,7 +794,7 @@ async def preset_assign_user(callback: CallbackQuery):
                 await callback.answer(f"⚠️ {user_id} has no custom channels", show_alert=True)
             else:
                 BotContext.data.set_user_mode_custom(user_id)
-                await do_restart_if_running(user_id)
+                await do_restart_if_running(user_id, callback.from_user.id)
                 await callback.answer(f"Set {user_id} to custom")
         
         # Refresh
@@ -793,17 +813,17 @@ async def preset_assign_user(callback: CallbackQuery):
     if user_id == "__all__":
         for uid in BotContext.config.twitch_users:
             BotContext.data.assign_preset_to_user(uid, preset_name)
-            await do_restart_if_running(uid)
+            await do_restart_if_running(uid, callback.from_user.id)
         await callback.answer("✅ Assigned to all users", show_alert=True)
     else:
         user_state = BotContext.data.get_user_state(user_id)
         if user_state.assigned_preset == preset_name:
             BotContext.data.set_user_mode_default(user_id)
-            await do_restart_if_running(user_id)
+            await do_restart_if_running(user_id, callback.from_user.id)
             await callback.answer(f"Removed from {user_id}")
         else:
             BotContext.data.assign_preset_to_user(user_id, preset_name)
-            await do_restart_if_running(user_id)
+            await do_restart_if_running(user_id, callback.from_user.id)
             await callback.answer(f"Assigned to {user_id}")
 
     # Refresh the view
@@ -862,7 +882,7 @@ async def assign_preset_to_user(callback: CallbackQuery):
         await callback.answer(f"✅ Assigned preset '{preset_name}'", show_alert=True)
 
     # Restart if running
-    await do_restart_if_running(user_id)
+    await do_restart_if_running(user_id, callback.from_user.id)
 
     # Refresh user view
     is_running = BotContext.process_manager.is_running(user_id)
@@ -923,7 +943,7 @@ async def user_custom_channels_input(message: Message, state: FSMContext):
     await state.clear()
 
     # Restart if running
-    await do_restart_if_running(user_id)
+    await do_restart_if_running(user_id, message.from_user.id)
 
     is_running = BotContext.process_manager.is_running(user_id)
     await message.answer(
@@ -952,7 +972,7 @@ async def cancel_input(callback: CallbackQuery, state: FSMContext):
         if channels:
             for ch in channels:
                 BotContext.data.add_channel_to_preset(preset_name, ch)
-            await restart_users_with_preset(preset_name)
+            await restart_users_with_preset(preset_name, callback.from_user.id)
         
         preset = BotContext.data.get_preset(preset_name)
         if preset:
