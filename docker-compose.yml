@@ -1,5 +1,5 @@
 services:
-  twitch-farm:
+  twitch-car-factory:
     build: .
     image: ghcr.io/karilaa/twitch-car-factory:latest
     container_name: twitch-car-factory
