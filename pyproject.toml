@@ -1,5 +1,5 @@
 [project]
-name = "twitch-farm"
+name = "twitch-cat-factory"
 version = "0.1.0"
 description = "Telegram bot for controlling Twitch Channel Points Miner"
 readme = "README.md"

@@ -1051,26 +1051,7 @@ wheels = [
 ]
 
 [[package]]
-name = "twitch-channel-points-miner-v2"
-version = "2.0.4"
-source = { git = "https://github.com/rdavydov/Twitch-Channel-Points-Miner-v2.git#92b9e74d37f617dc046cebb2b6bf077515c72664" }
-dependencies = [
-    { name = "colorama" },
-    { name = "emoji" },
-    { name = "flask" },
-    { name = "irc" },
-    { name = "millify" },
-    { name = "pandas" },
-    { name = "pillow" },
-    { name = "pre-commit" },
-    { name = "python-dateutil" },
-    { name = "pytz" },
-    { name = "requests" },
-    { name = "websocket-client" },
-]
-
-[[package]]
-name = "twitch-farm"
+name = "twitch-cat-factory"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
@@ -1088,6 +1069,25 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0.1" },
     { name = "twitch-channel-points-miner-v2", git = "https://github.com/rdavydov/Twitch-Channel-Points-Miner-v2.git" },
     { name = "validators", specifier = ">=0.35.0" },
+]
+
+[[package]]
+name = "twitch-channel-points-miner-v2"
+version = "2.0.4"
+source = { git = "https://github.com/rdavydov/Twitch-Channel-Points-Miner-v2.git#92b9e74d37f617dc046cebb2b6bf077515c72664" }
+dependencies = [
+    { name = "colorama" },
+    { name = "emoji" },
+    { name = "flask" },
+    { name = "irc" },
+    { name = "millify" },
+    { name = "pandas" },
+    { name = "pillow" },
+    { name = "pre-commit" },
+    { name = "python-dateutil" },
+    { name = "pytz" },
+    { name = "requests" },
+    { name = "websocket-client" },
 ]
 
 [[package]]
