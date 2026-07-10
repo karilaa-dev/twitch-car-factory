@@ -11,13 +11,11 @@ on:
         required: true
         type: string
 
-permissions:
-  contents: read
-  packages: write
-
 jobs:
   test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -59,9 +57,47 @@ jobs:
   build-and-push:
     needs: test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Determine tags
+        id: tags
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          LC_ALL: C
+        run: |
+          set -euo pipefail
+          repository_lower="$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          image_name="ghcr.io/${repository_lower}"
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            image_tag="$REF_NAME"
+          else
+            image_tag="$INPUT_TAG"
+          fi
+          tag_pattern='^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'
+          if [[ ! "$image_tag" =~ $tag_pattern ]]; then
+            echo "Invalid Docker image tag." >&2
+            exit 1
+          fi
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            printf 'tags=%s:%s,%s:latest\n' "$image_name" "$image_tag" "$image_name" >> "$GITHUB_OUTPUT"
+          else
+            printf 'tags=%s:%s\n' "$image_name" "$image_tag" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -69,19 +105,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Determine tags
-        id: tags
-        run: |
-          image_name="ghcr.io/${GITHUB_REPOSITORY,,}"
-          if [[ "${{ github.event_name }}" == "push" ]]; then
-            echo "tags=${image_name}:${{ github.ref_name }},${image_name}:latest" >> $GITHUB_OUTPUT
-          else
-            echo "tags=${image_name}:${{ inputs.tag }}" >> $GITHUB_OUTPUT
-          fi
 
       - name: Build and push
         uses: docker/build-push-action@v6
