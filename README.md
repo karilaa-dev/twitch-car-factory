@@ -1,99 +1,160 @@
-# Twitch Farm Telegram Bot
+# Twitch Farm Control Room
 
-A Telegram bot for controlling multiple Twitch Channel Points Miner instances.
+An admin-only Django control plane for running multiple Twitch Channel Points
+Miner instances. SQLite stores shared controller state while `config.yaml`
+remains the source of truth for Twitch credentials, default channels, and the
+initial autostart policy.
 
-## Features
+## Reliability model
 
-- **Multi-user support**: Run separate miner instances for each Twitch account
-- **Channel presets**: Create and manage channel list presets for easy switching
-- **Instance control**: Start, stop, and restart individual or all instances
-- **Health monitoring**: Automatic health checks every minute with notifications on failures
-- **Auto-restart**: Crashed instances are automatically restarted
-- **Whitelist**: Only authorized Telegram users can control the bot
+- An admin **Stop** sets durable desired state to `stopped`; the account stays
+  stopped across worker and container restarts.
+- An unexpected process exit while desired state is `running` opens an incident
+  and triggers supervised recovery.
+- Each launch records an immutable ordered channel snapshot and fingerprint.
+  The worker periodically reconciles that fingerprint with current configuration
+  and restarts a miner that is watching stale channels.
+- The web process never owns subprocesses. One `run_miner_worker` process holds
+  the singleton lock, leases commands, owns all child processes, and records
+  runs, incidents, restart attempts, and recovery.
+- Twitch passwords stay in YAML. Children receive only a run ID and account key,
+  never a password in argv.
 
-## Setup
-
-### 1. Install dependencies
-
-```bash
-uv sync
-```
-
-### 2. Configure the bot
-
-Copy the example config and edit it:
-
-```bash
-cp config.yaml.example config.yaml
-```
-
-Edit `config.yaml`:
-
-1. Set your Telegram bot token (get one from [@BotFather](https://t.me/BotFather))
-2. Add your Telegram user ID to the whitelist
-3. Add your Twitch accounts under `twitch_users`
-
-### 3. Run the bot
-
-```bash
-uv run python main.py
-```
-
-## Configuration
-
-### config.yaml
-
-```yaml
-telegram:
-  bot_token: "YOUR_BOT_TOKEN_HERE"
-  whitelist:
-    - 123456789  # Your Telegram user ID
-
-twitch_users:
-  my_account:
-    username: "my_twitch_username"
-    password: "my_password"
-    claim_drops: true
-    claim_moments: true
-    watch_streak: true
-
-default_channels:
-  - "channel1"
-  - "channel2"
-```
-
-### Getting your Telegram user ID
-
-Send `/start` to [@userinfobot](https://t.me/userinfobot) to get your Telegram user ID.
-
-## Bot Commands
-
-- `/start` - Open the control panel
-
-### Control Panel Features
-
-- **Users**: View and manage all Twitch users
-  - Start/stop/restart individual instances
-  - Assign channel presets
-  - Set custom channels
-- **Presets**: Manage channel presets
-  - Create new presets
-  - Add/remove channels
-  - Delete presets
-- **Start All / Stop All**: Control all instances at once
+See [the feature and state map](docs/bot-feature-map.md) for full behavior.
 
 ## Architecture
 
-The bot runs each Twitch user as a separate subprocess, allowing independent control and isolation. The health monitor checks all instances every minute and:
+```text
+admins -> Django web -> SQLite command/state tables -> singleton worker
+                                                        |-- miner child A
+                                                        `-- miner child B
 
-1. Detects crashed instances
-2. Sends notifications to all whitelisted users
-3. Automatically restarts failed instances
+config.yaml ---------- credentials/defaults ------------^
+cookies/ (read-only seed) -------------------------------^
+runtime/cookies/ (worker-only writable sessions) --------^
+```
 
-## Files
+All Django staff accounts see and operate the same farm. Twitch accounts are
+not editable in the web panel; change `config.yaml`, then restart the worker or
+run `sync_config_accounts`.
 
-- `config.yaml` - Main configuration (not tracked in git)
-- `data/presets.json` - Channel presets
-- `data/state.json` - User states and assignments
-- `cookies/` - Twitch session cookies
+## Local setup
 
+Requires Python 3.13 and [uv](https://docs.astral.sh/uv/).
+
+```bash
+cp config.yaml.example config.yaml
+uv sync --frozen
+uv run python manage.py migrate
+uv run python manage.py createsuperuser
+```
+
+For a new installation, synchronize YAML-backed accounts:
+
+```bash
+uv run python manage.py sync_config_accounts
+```
+
+Run the web and worker in separate terminals:
+
+```bash
+uv run python manage.py runserver
+uv run python manage.py run_miner_worker
+```
+
+Open <http://127.0.0.1:8000/> and sign in with a staff account.
+
+## Configuration
+
+```yaml
+settings:
+  autostart_instances: false
+
+twitch_users:
+  primary:
+    username: "your_twitch_username"
+    password: "YOUR_PASSWORD_HERE"
+
+default_channels:
+  - "channel_one"
+  - "channel_two"
+```
+
+`autostart_instances` seeds desired-running only when an account is first
+discovered or imported. It does not undo a later intentional admin stop.
+
+Keep `config.yaml` mode `0600` and `cookies/` mode `0700`. Neither belongs in
+Git or the container image.
+
+## Migrate legacy JSON
+
+Stop the Telegram controller before importing so it cannot launch miners or
+rewrite JSON concurrently. Back up `config.yaml`, `data/`, `cookies/`, and any
+refreshed `runtime/cookies/` into a protected directory such as `backups/`
+that is not mounted into the web container, then:
+
+```bash
+uv run python manage.py migrate
+uv run python manage.py import_legacy_data --config config.yaml --data-dir data --dry-run
+uv run python manage.py import_legacy_data --config config.yaml --data-dir data
+```
+
+The importer migrates presets, custom channels, and account selections. Legacy
+`pid` and `is_running` values are deliberately ignored. State-only account keys
+are retained as unconfigured/non-runnable records so data is not silently lost.
+An identical rerun is safe; use `--replace` only when intentionally replacing
+changed imported controller data.
+
+## Docker Compose
+
+```bash
+cp .env.example .env
+# Set a strong DJANGO_SECRET_KEY and the real hostname/origin.
+# Set PUID/PGID in .env to the output of `id -u` and `id -g`.
+install -d -m 700 data cookies runtime
+docker compose run --rm migrate
+docker compose --profile tools run --rm importer \
+  python manage.py import_legacy_data --config /app/config.yaml --data-dir /app/data --dry-run
+docker compose --profile tools run --rm importer
+docker compose up -d web worker
+```
+
+The services share `./data`, but only the worker/importer mount `config.yaml`
+and the original cookies; those secret-source mounts are read-only. Each miner
+copies its seed cookie into the worker-only `runtime/cookies/` mount and runs
+there so the upstream library can refresh sessions without modifying the
+backup. The web container cannot mount or read those Twitch session files.
+Compose runs every service as the non-root `PUID`/`PGID` that owns the
+bind-mounted files. SQLite must remain on local storage, and only one worker
+replica is supported.
+
+## Safe validation
+
+The fake miner can exercise lifecycle and recovery without Twitch credentials:
+
+```bash
+uv run python manage.py run_fake_miner --help
+```
+
+Run the full validation suite:
+
+```bash
+uv run pytest -q
+uv run python manage.py check
+DJANGO_DEBUG=0 DJANGO_SECRET_KEY='use-a-random-value-at-least-50-characters-long-here' \
+  uv run python manage.py check --deploy
+uv run python manage.py makemigrations --check --dry-run
+docker compose config --quiet
+```
+
+## Production notes
+
+- Set `DJANGO_DEBUG=0`, a strong `DJANGO_SECRET_KEY`, the external host, trusted
+  HTTPS origin, and secure cookies in `.env`.
+- Put Gunicorn behind Caddy or another TLS reverse proxy.
+- Back up `data/db.sqlite3` with SQLite's online backup mechanism or while the
+  services are stopped; copying a live WAL database as one file is not safe.
+- Dashboard incidents replace Telegram alerts in this release. Email/webhook
+  delivery and schedules are intentionally out of scope.
+- Rotate any credential that previously appeared in the tracked legacy
+  `instance.py`; deleting the file does not revoke an exposed password.

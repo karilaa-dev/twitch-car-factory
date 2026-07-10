@@ -1,0 +1,80 @@
+{% extends "controller/base.html" %}
+
+{% block title %}{{ preset.name }}{% endblock %}
+
+{% block content %}
+  <ol class="breadcrumb" aria-label="Breadcrumb">
+    <li><a href="{% url 'controller:preset_list' %}">Presets</a></li>
+    <li aria-current="page">{{ preset.name }}</li>
+  </ol>
+
+  <header class="page-header">
+    <div class="page-heading">
+      <p class="eyebrow">Channel plan {{ preset.pk|stringformat:'03d' }}</p>
+      <h1>{{ preset.name }}</h1>
+      <p class="lede">{{ preset.channels.all|length }} ordered channel{{ preset.channels.all|length|pluralize }} · {{ preset.account_selections.all|length }} assigned account{{ preset.account_selections.all|length|pluralize }}</p>
+    </div>
+    <a class="button button--primary" href="{% url 'controller:preset_edit' preset.pk %}">Edit plan</a>
+  </header>
+
+  <div class="detail-layout">
+    <div class="stack">
+      <section class="panel" aria-labelledby="channels-title">
+        <header class="panel__header"><h2 id="channels-title">Ordered channel manifest</h2></header>
+        <div class="panel__body">
+          <dl class="launch-manifest">
+            {% for channel in preset.channels.all %}
+              <div class="manifest-row">
+                <dt>Position {{ forloop.counter|stringformat:'02d' }}</dt>
+                <dd><span class="channel-tag">{{ channel.name }}</span></dd>
+              </div>
+            {% empty %}
+              <div class="manifest-row"><dt>Interlock</dt><dd>No channels — this preset cannot launch.</dd></div>
+            {% endfor %}
+          </dl>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="assign-title">
+        <header class="panel__header"><h2 id="assign-title">Account assignment</h2></header>
+        <div class="panel__body">
+          <form class="form-grid" method="post" action="{% url 'controller:preset_assign' preset.pk %}">
+            {% csrf_token %}
+            {% if assignment_form.non_field_errors %}<div class="message error">{{ assignment_form.non_field_errors }}</div>{% endif %}
+            <fieldset class="field">
+              <legend>Use this preset for</legend>
+              <div class="checkbox-grid">{{ assignment_form.accounts }}</div>
+              {{ assignment_form.accounts.errors }}
+            </fieldset>
+            <button class="button button--primary" type="submit">Commit assignments</button>
+          </form>
+        </div>
+        <footer class="panel__footer">Deselected accounts that currently use this plan return to config.yaml defaults. Desired-running accounts restart onto the validated change.</footer>
+      </section>
+    </div>
+
+    <aside class="stack">
+      <section class="panel" aria-labelledby="meta-title">
+        <header class="panel__header"><h2 id="meta-title">Plan record</h2></header>
+        <div class="panel__body">
+          <dl class="launch-manifest">
+            <div class="manifest-row"><dt>Created</dt><dd>{{ preset.created_at|date:'Y-m-d H:i T' }}</dd></div>
+            <div class="manifest-row"><dt>Revised</dt><dd>{{ preset.updated_at|date:'Y-m-d H:i T' }}</dd></div>
+            <div class="manifest-row"><dt>Assigned</dt><dd>{{ preset.account_selections.all|length }} account{{ preset.account_selections.all|length|pluralize }}</dd></div>
+          </dl>
+        </div>
+      </section>
+
+      <section class="panel panel--danger" aria-labelledby="delete-title">
+        <header class="panel__header"><h2 id="delete-title">Retire plan</h2></header>
+        <div class="panel__body">
+          <p class="muted">Deletion is blocked while any account references this preset. Reassign those accounts first.</p>
+          <form method="post" action="{% url 'controller:preset_delete' preset.pk %}">
+            {% csrf_token %}
+            <button class="button button--danger" type="submit">Delete {{ preset.name }}</button>
+          </form>
+        </div>
+      </section>
+    </aside>
+  </div>
+{% endblock %}

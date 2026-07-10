@@ -1,0 +1,53 @@
+{% extends "controller/base.html" %}
+{% load control_room %}
+
+{% block title %}Accounts{% endblock %}
+
+{% block content %}
+  <header class="page-header">
+    <div class="page-heading">
+      <p class="eyebrow">Configured units</p>
+      <h1>Account rack</h1>
+      <p class="lede">Accounts are mirrored from config.yaml. Credentials stay outside the database and are never rendered by this control surface.</p>
+    </div>
+    <a class="button" href="{% url 'controller:dashboard' %}">Open runtime board</a>
+  </header>
+
+  {% if account_rows %}
+    <div class="record-grid">
+      {% for row in account_rows %}
+        <article class="record-card">
+          <header class="record-card__header">
+            <div>
+              <h2><a href="{% url 'controller:account_detail' row.account.pk %}">{{ row.account.config_key }}</a></h2>
+              <span class="muted">{{ row.account.display_username }}</span>
+            </div>
+            <span class="status-light" data-tone="{{ row.observed|state_tone }}" aria-label="Observed {{ row.observed }}"></span>
+          </header>
+          <div class="record-card__body">
+            <div class="state-pair">
+              <span class="state-block"><small>Desired</small><span class="status-chip" data-tone="{{ row.desired|state_tone }}">{{ row.desired }}</span></span>
+              <span class="state-pair__arrow" aria-hidden="true">→</span>
+              <span class="state-block"><small>Observed</small><span class="status-chip" data-tone="{{ row.observed|state_tone }}">{{ row.observed }}</span></span>
+            </div>
+            <p class="muted">
+              {% if row.current_run %}{{ row.source_mode }} / {{ row.source_name }} · {{ row.channels|length }} active channel{{ row.channels|length|pluralize }}{% else %}No active launch snapshot{% endif %}
+            </p>
+            {% if row.open_incident %}<span class="status-chip" data-tone="danger">Recovery incident open</span>{% endif %}
+          </div>
+          <footer class="record-card__footer">
+            <span>{% if row.account.is_configured %}config synchronized{% else %}config entry missing{% endif %}</span>
+            <a href="{% url 'controller:account_detail' row.account.pk %}">Inspect unit →</a>
+          </footer>
+        </article>
+      {% endfor %}
+    </div>
+  {% else %}
+    <div class="empty-state">
+      <div>
+        <div class="empty-state__mark"><span>0</span></div>
+        <p>No accounts have been synchronized from config.yaml.</p>
+      </div>
+    </div>
+  {% endif %}
+{% endblock %}

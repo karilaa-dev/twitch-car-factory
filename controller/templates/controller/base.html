@@ -1,0 +1,62 @@
+{% load static %}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b0e0d">
+  <title>{% block title %}Control Room{% endblock %} · Twitch Farm</title>
+  <link rel="stylesheet" href="{% static 'controller/css/control-room.css' %}">
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to control surface</a>
+  <div class="caution-rail" aria-hidden="true"></div>
+  <header class="site-header">
+    <div class="header-inner">
+      <a class="brand" href="{% url 'controller:dashboard' %}" aria-label="Twitch Farm control room home">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-copy">
+          <strong>Twitch Farm</strong>
+          <small>Process control / 01</small>
+        </span>
+      </a>
+
+      {% with current=request.resolver_match.url_name %}
+        <nav class="primary-nav" aria-label="Primary navigation">
+          <a href="{% url 'controller:dashboard' %}" {% if current == 'dashboard' or current == 'status_fragment' %}aria-current="page"{% endif %}>Runtime</a>
+          <a href="{% url 'controller:account_list' %}" {% if 'account' in current %}aria-current="page"{% endif %}>Accounts</a>
+          <a href="{% url 'controller:preset_list' %}" {% if 'preset' in current %}aria-current="page"{% endif %}>Presets</a>
+        </nav>
+      {% endwith %}
+
+      <div class="operator-panel">
+        <span class="operator-id">
+          <small>Operator</small>
+          <strong>{{ request.user.get_username }}</strong>
+        </span>
+        <form method="post" action="{% url 'controller:logout' %}">
+          {% csrf_token %}
+          <button class="button button--quiet" type="submit">Sign out</button>
+        </form>
+      </div>
+    </div>
+  </header>
+
+  <main class="page-shell" id="main-content" tabindex="-1">
+    {% if messages %}
+      <div class="message-stack" aria-live="polite">
+        {% for message in messages %}
+          <div class="message {{ message.tags|default:'info' }}">{{ message }}</div>
+        {% endfor %}
+      </div>
+    {% endif %}
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="site-footer">
+    Shared operator state · durable SQLite command ledger · process ownership isolated to supervisor
+  </footer>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

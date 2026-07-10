@@ -1,0 +1,138 @@
+{% load control_room %}
+<section
+  id="live-status"
+  data-live-status
+  data-status-url="{% url 'controller:status_fragment' %}"
+  aria-label="Live farm telemetry"
+>
+  <div class="metric-grid">
+    <article class="metric">
+      <span class="metric__label">Desired online</span>
+      <strong class="metric__value">{{ summary.desired_running }}</strong>
+      <span class="metric__note">of {{ summary.total }} known accounts</span>
+    </article>
+    <article class="metric">
+      <span class="metric__label">Confirmed running</span>
+      <strong class="metric__value">{{ summary.observed_running }}</strong>
+      <span class="metric__note">past startup confirmation</span>
+    </article>
+    <article class="metric">
+      <span class="metric__label">Degraded</span>
+      <strong class="metric__value">{{ summary.degraded }}</strong>
+      <span class="metric__note">periodic recovery active</span>
+    </article>
+    <article class="metric">
+      <span class="metric__label">Open incidents</span>
+      <strong class="metric__value">{{ summary.open_incidents }}</strong>
+      <span class="metric__note">durable accident records</span>
+    </article>
+  </div>
+
+  <div class="supervisor-bar" role="status">
+    <div class="supervisor-bar__identity">
+      <span class="status-light" data-tone="{{ supervisor.status|state_tone }}" aria-hidden="true"></span>
+      <span class="status-copy">
+        <strong>{{ supervisor.label }}</strong>
+        <small>
+          owner {{ supervisor.owner_id }}{% if supervisor.pid %} · pid {{ supervisor.pid }}{% endif %}
+          {% if supervisor.heartbeat_at %} · heartbeat {{ supervisor.heartbeat_at|timesince }} ago{% endif %}
+        </small>
+      </span>
+    </div>
+    <span class="poll-indicator" data-poll-indicator>Telemetry refreshes every 5 seconds</span>
+  </div>
+
+  {% if supervisor.status != 'healthy' %}
+    <div class="message error" role="alert">
+      Runtime commands remain durable, but no live supervisor currently owns process reconciliation. Check the worker service.
+    </div>
+  {% endif %}
+
+  {% if account_rows %}
+    <div class="machine-table-wrap">
+      <table class="machine-table">
+        <thead>
+          <tr>
+            <th scope="col">Account</th>
+            <th scope="col">Target → actual</th>
+            <th scope="col">Launch source</th>
+            <th scope="col">Exact active channels</th>
+            <th scope="col">Process</th>
+            <th scope="col">Controls</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in account_rows %}
+            <tr>
+              <td data-label="Account">
+                <span class="machine-id">
+                  <a href="{% url 'controller:account_detail' row.account.pk %}">{{ row.account.config_key }}</a>
+                  <small>{{ row.account.display_username }}{% if not row.account.is_configured %} · config missing{% endif %}</small>
+                </span>
+              </td>
+              <td data-label="Target / actual">
+                <span class="state-pair">
+                  <span class="state-block">
+                    <small>Desired</small>
+                    <span class="status-chip" data-tone="{{ row.desired|state_tone }}">{{ row.desired }}</span>
+                  </span>
+                  <span class="state-pair__arrow" aria-hidden="true">→</span>
+                  <span class="state-block">
+                    <small>Observed</small>
+                    <span class="status-chip" data-tone="{{ row.observed|state_tone }}">{{ row.observed }}</span>
+                  </span>
+                </span>
+              </td>
+              <td data-label="Launch source">
+                {% if row.current_run %}
+                  <span class="mono">{{ row.source_mode }}</span><br>
+                  <small class="muted">{{ row.source_name }}</small>
+                {% else %}
+                  <span class="faint">No active run</span>
+                {% endif %}
+              </td>
+              <td data-label="Channels">
+                {% if row.channels %}
+                  <span class="channel-trace">
+                    {% for channel in row.channels %}<span class="channel-tag">{{ channel }}</span>{% endfor %}
+                  </span>
+                {% else %}
+                  <span class="faint">No launch snapshot</span>
+                {% endif %}
+              </td>
+              <td data-label="Process">
+                {% if row.pid %}<span class="mono">pid {{ row.pid }}</span>{% else %}<span class="faint">unassigned</span>{% endif %}
+                {% if row.open_incident %}<br><span class="status-chip" data-tone="danger">incident open</span>{% endif %}
+              </td>
+              <td data-label="Controls">
+                <div class="button-row">
+                  {% if row.desired == 'running' %}
+                    <form method="post" action="{% url 'controller:account_action' row.account.pk 'stop' %}">
+                      {% csrf_token %}<button class="button button--quiet button--danger" type="submit">Stop</button>
+                    </form>
+                  {% elif row.account.is_configured %}
+                    <form method="post" action="{% url 'controller:account_action' row.account.pk 'start' %}">
+                      {% csrf_token %}<button class="button button--quiet button--safe" type="submit">Start</button>
+                    </form>
+                  {% endif %}
+                  {% if row.account.is_configured %}
+                    <form method="post" action="{% url 'controller:account_action' row.account.pk 'restart' %}">
+                      {% csrf_token %}<button class="button button--quiet" type="submit">Restart</button>
+                    </form>
+                  {% endif %}
+                </div>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% else %}
+    <div class="empty-state">
+      <div>
+        <div class="empty-state__mark"><span>0</span></div>
+        <p>No accounts are mirrored yet. Run the configuration sync or legacy importer before starting the supervisor.</p>
+      </div>
+    </div>
+  {% endif %}
+</section>

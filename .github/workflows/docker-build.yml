@@ -16,7 +16,48 @@ permissions:
   packages: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Validate Django and migrations
+        env:
+          DJANGO_DEBUG: "1"
+          TWITCH_FARM_DB: /tmp/twitch-farm-ci.sqlite3
+        run: |
+          uv run python manage.py check
+          uv run python manage.py makemigrations --check --dry-run
+
+      - name: Validate production security settings
+        env:
+          DJANGO_DEBUG: "0"
+          DJANGO_SECRET_KEY: "ci-only-security-check-abcdefghijklmnopqrstuvwxyz-0123456789"
+          DJANGO_SECURE_COOKIES: "1"
+        run: uv run python manage.py check --deploy
+
+      - name: Run tests
+        env:
+          DJANGO_DEBUG: "1"
+        run: uv run pytest -q
+
+      - name: Validate Compose
+        env:
+          DJANGO_SECRET_KEY: "ci-only-compose-validation-abcdefghijklmnopqrstuvwxyz-0123456789"
+        run: docker compose config --quiet
+
   build-and-push:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -35,10 +76,11 @@ jobs:
       - name: Determine tags
         id: tags
         run: |
+          image_name="ghcr.io/${GITHUB_REPOSITORY,,}"
           if [[ "${{ github.event_name }}" == "push" ]]; then
-            echo "tags=ghcr.io/${{ github.repository }}:${{ github.ref_name }},ghcr.io/${{ github.repository }}:latest" >> $GITHUB_OUTPUT
+            echo "tags=${image_name}:${{ github.ref_name }},${image_name}:latest" >> $GITHUB_OUTPUT
           else
-            echo "tags=ghcr.io/${{ github.repository }}:${{ inputs.tag }}" >> $GITHUB_OUTPUT
+            echo "tags=${image_name}:${{ inputs.tag }}" >> $GITHUB_OUTPUT
           fi
 
       - name: Build and push
@@ -49,5 +91,3 @@ jobs:
           tags: ${{ steps.tags.outputs.tags }}
           provenance: false
           sbom: false
-
-      

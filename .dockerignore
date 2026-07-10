@@ -23,15 +23,10 @@ ENV/
 # Data (mounted as volumes)
 data/
 cookies/
+runtime/
+backups/
 config.yaml
 
-# Docker
-Dockerfile
-docker-compose.yml
-.dockerignore
-
 # Other
-*.md
 *.log
 .DS_Store
-

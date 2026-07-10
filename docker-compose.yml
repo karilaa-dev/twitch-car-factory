@@ -1,13 +1,73 @@
-services:
-  twitch-car-factory:
-    build: .
-    image: ghcr.io/karilaa/twitch-car-factory:latest
-    container_name: twitch-car-factory
-    restart: unless-stopped
-    volumes:
-      - ./config.yaml:/app/config.yaml:ro
-      - ./data:/app/data
-      - ./cookies:/app/cookies
-    environment:
-      - TZ=UTC
+x-app: &app
+  build: .
+  image: ghcr.io/karilaa-dev/twitch-car-factory:${TWITCH_FARM_IMAGE_TAG:-latest}
+  # Match the owner of the bind-mounted config/data/cookies. The defaults are
+  # the conventional first Linux user; set PUID/PGID to `id -u`/`id -g` on
+  # hosts that use different IDs (macOS commonly uses 501/20).
+  user: "${PUID:-1000}:${PGID:-1000}"
+  environment: &app-environment
+    DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?Set DJANGO_SECRET_KEY in .env}
+    DJANGO_DEBUG: ${DJANGO_DEBUG:-0}
+    DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1,[::1]}
+    DJANGO_CSRF_TRUSTED_ORIGINS: ${DJANGO_CSRF_TRUSTED_ORIGINS:-}
+    DJANGO_SECURE_COOKIES: ${DJANGO_SECURE_COOKIES:-1}
+    DJANGO_SECURE_SSL_REDIRECT: ${DJANGO_SECURE_SSL_REDIRECT:-1}
+    DJANGO_SECURE_HSTS_SECONDS: ${DJANGO_SECURE_HSTS_SECONDS:-31536000}
+    DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS: ${DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS:-1}
+    DJANGO_SECURE_HSTS_PRELOAD: ${DJANGO_SECURE_HSTS_PRELOAD:-1}
+    TWITCH_FARM_DB: /app/data/db.sqlite3
+    TWITCH_FARM_CONFIG: /app/config.yaml
+    TWITCH_FARM_COOKIES_DIR: /app/cookies
+    TWITCH_FARM_WORKER_LOCK: /app/data/miner-worker.lock
+    TZ: UTC
+  volumes:
+    - ./data:/app/data
 
+services:
+  migrate:
+    <<: *app
+    command: ["python", "manage.py", "migrate", "--noinput"]
+    restart: "no"
+
+  web:
+    <<: *app
+    command: ["gunicorn", "twitch_farm.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "2", "--access-logfile", "-"]
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:${TWITCH_FARM_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; request=urllib.request.Request('http://127.0.0.1:8000/healthz/', headers={'X-Forwarded-Proto':'https'}); urllib.request.urlopen(request, timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    <<: *app
+    command: ["python", "manage.py", "run_miner_worker"]
+    restart: unless-stopped
+    environment:
+      <<: *app-environment
+      TWITCH_FARM_RUNTIME_DIR: /app/runtime
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - ./data:/app/data
+      - ./runtime:/app/runtime
+      - ./config.yaml:/app/config.yaml:ro
+      - ./cookies:/app/cookies:ro
+
+  importer:
+    <<: *app
+    profiles: ["tools"]
+    command: ["python", "manage.py", "import_legacy_data", "--config", "/app/config.yaml", "--data-dir", "/app/data"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
+      - ./cookies:/app/cookies:ro

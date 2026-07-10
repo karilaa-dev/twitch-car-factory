@@ -11,10 +11,20 @@ wheels/
 
 # Configuration (contains secrets)
 config.yaml
+.env
 
 # Data files
 data/presets.json
 data/state.json
+data/*.sqlite3
+data/*.sqlite3-*
+data/miner-worker.lock
+backups/
 
 # Cookies
 cookies/
+runtime/
+
+# Django generated files
+staticfiles/
+.pytest_cache/
