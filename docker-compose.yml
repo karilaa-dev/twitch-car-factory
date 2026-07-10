@@ -39,7 +39,16 @@ services:
     ports:
       - "127.0.0.1:${TWITCH_FARM_PORT:-8000}:8000"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; request=urllib.request.Request('http://127.0.0.1:8000/healthz/', headers={'X-Forwarded-Proto':'https'}); urllib.request.urlopen(request, timeout=3)"]
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import os, urllib.request;
+          allowed = [host.strip() for host in os.environ.get('DJANGO_ALLOWED_HOSTS', '').split(',') if host.strip()];
+          host = next((candidate.lstrip('.') for candidate in allowed if candidate != '*'), 'localhost');
+          request = urllib.request.Request('http://127.0.0.1:8000/healthz/', headers={'Host': host, 'X-Forwarded-Proto': 'https'});
+          urllib.request.urlopen(request, timeout=3)
       interval: 15s
       timeout: 5s
       retries: 5

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 from django.contrib.auth import get_user_model
-from django.test import Client, TestCase
+from django.test import Client, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
@@ -83,6 +83,20 @@ class WebViewTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.content, b"ok\n")
         self.assertNotContains(response, self.account.config_key)
+
+    @override_settings(
+        ALLOWED_HOSTS=["farm.example.com"],
+        SECURE_SSL_REDIRECT=True,
+    )
+    def test_healthz_accepts_the_configured_production_host(self):
+        response = self.client.get(
+            reverse("controller:healthz"),
+            HTTP_HOST="farm.example.com",
+            HTTP_X_FORWARDED_PROTO="https",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b"ok\n")
 
     def test_every_control_surface_requires_staff(self):
         preset = self.create_preset()
