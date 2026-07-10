@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
+import textwrap
 
 import pytest
 from django.core.exceptions import ValidationError
@@ -120,6 +124,128 @@ def test_channel_resolution_selection_restart_and_command_coalescing(tmp_path, s
     assert first.status == MinerCommand.Status.CANCELLED
     assert stop.status == MinerCommand.Status.QUEUED
     assert account.runtime_state.desired_state == MinerInstanceState.DesiredState.STOPPED
+
+
+def test_sqlite_immediate_transactions_preserve_latest_concurrent_command(
+    tmp_path,
+):
+    config_path = make_config(tmp_path)
+    database_path = tmp_path / "concurrent.sqlite3"
+    project_root = Path(__file__).resolve().parents[1]
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "DJANGO_DEBUG": "1",
+            "DJANGO_SECRET_KEY": "concurrency-test-only",
+            "TWITCH_FARM_CONFIG": str(config_path),
+            "TWITCH_FARM_DB": str(database_path),
+        }
+    )
+    migration = subprocess.run(
+        [sys.executable, "manage.py", "migrate", "--noinput", "--verbosity", "0"],
+        cwd=project_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert migration.returncode == 0, migration.stdout + migration.stderr
+
+    # pytest-django's shared in-memory SQLite database uses SQLITE_LOCKED table
+    # semantics that don't honor busy_timeout. Exercise the real file-backed
+    # deployment mode in a child process instead.
+    probe = textwrap.dedent(
+        """
+        import os
+        from threading import Event, Thread
+
+        import django
+
+        os.environ.setdefault("DJANGO_SETTINGS_MODULE", "twitch_farm.settings")
+        django.setup()
+
+        from django.db import close_old_connections, transaction
+
+        from controller.models import MinerAccount, MinerCommand, MinerInstanceState
+        from controller.services import enqueue_command, sync_config_accounts
+
+        sync_config_accounts()
+        account_id = MinerAccount.objects.get(config_key="primary").pk
+        first_has_written = Event()
+        release_first = Event()
+        second_started = Event()
+        second_finished = Event()
+        errors = []
+
+        def queue_start_while_holding_transaction():
+            close_old_connections()
+            try:
+                with transaction.atomic():
+                    account = MinerAccount.objects.get(pk=account_id)
+                    enqueue_command(account, MinerCommand.Action.START)
+                    first_has_written.set()
+                    if not release_first.wait(timeout=5):
+                        raise TimeoutError("first transaction release timed out")
+            except BaseException as exc:
+                errors.append(repr(exc))
+            finally:
+                close_old_connections()
+
+        def queue_later_stop():
+            close_old_connections()
+            second_started.set()
+            try:
+                account = MinerAccount.objects.get(pk=account_id)
+                enqueue_command(account, MinerCommand.Action.STOP)
+            except BaseException as exc:
+                errors.append(repr(exc))
+            finally:
+                second_finished.set()
+                close_old_connections()
+
+        first = Thread(target=queue_start_while_holding_transaction, daemon=True)
+        second = Thread(target=queue_later_stop, daemon=True)
+        first.start()
+        if not first_has_written.wait(timeout=5):
+            raise AssertionError("first request did not reach its held transaction")
+        second.start()
+        if not second_started.wait(timeout=5):
+            raise AssertionError("second request did not start")
+        serialized = not second_finished.wait(timeout=0.1)
+        release_first.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+        if first.is_alive() or second.is_alive():
+            raise AssertionError("concurrent command threads did not finish")
+        if not serialized:
+            raise AssertionError(f"later request did not serialize: {errors}")
+        if errors:
+            raise AssertionError(f"concurrent command failed: {errors}")
+
+        state = MinerInstanceState.objects.get(account_id=account_id)
+        commands = list(
+            MinerCommand.objects.filter(account_id=account_id).values_list("action", "status")
+        )
+        expected = [
+            (MinerCommand.Action.START, MinerCommand.Status.CANCELLED),
+            (MinerCommand.Action.STOP, MinerCommand.Status.QUEUED),
+        ]
+        if state.desired_state != MinerInstanceState.DesiredState.STOPPED:
+            raise AssertionError(f"latest desired state was {state.desired_state!r}")
+        if commands != expected:
+            raise AssertionError(f"unexpected command history: {commands!r}")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=project_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.django_db

@@ -241,6 +241,840 @@ def test_unexpected_exit_records_incident_attempt_and_recovery(tmp_path, setting
 
 
 @pytest.mark.django_db
+def test_manual_stop_committed_between_recovery_claim_and_spawn_prevents_launch(
+    tmp_path,
+    settings,
+    monkeypatch,
+):
+    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    clock = FakeClock()
+    factory = ProcessFactory()
+    supervisor = make_supervisor(clock, factory)
+    supervisor.startup()
+    try:
+        account = MinerAccount.objects.get(config_key="primary")
+        state = MinerInstanceState.objects.get(account=account)
+        state.desired_state = MinerInstanceState.DesiredState.RUNNING
+        state.observed_state = MinerInstanceState.ObservedState.RESTARTING
+        state.next_retry_at = clock.now()
+        state.save()
+        incident = MinerIncident.objects.create(
+            account=account,
+            kind=MinerIncident.Kind.UNEXPECTED_EXIT,
+            status=MinerIncident.Status.OPEN,
+            summary="Recovery is due.",
+        )
+        attempt = RestartAttempt.objects.create(
+            incident=incident,
+            attempt_number=1,
+            scheduled_at=clock.now(),
+            outcome=RestartAttempt.Outcome.SCHEDULED,
+        )
+        original_snapshot = create_launch_snapshot
+        stop_command = None
+
+        def snapshot_then_stop(*args, **kwargs):
+            nonlocal stop_command
+            run = original_snapshot(*args, **kwargs)
+            stop_command = enqueue_command(account, MinerCommand.Action.STOP)
+            return run
+
+        monkeypatch.setattr(
+            "controller.miner_supervisor.services.create_launch_snapshot",
+            snapshot_then_stop,
+        )
+        assert supervisor._perform_due_recoveries() == 0
+
+        state.refresh_from_db()
+        attempt.refresh_from_db()
+        candidate = MinerRun.objects.get(account=account)
+        assert stop_command is not None
+        assert factory.processes == []
+        assert supervisor.processes == {}
+        assert state.desired_state == MinerInstanceState.DesiredState.STOPPED
+        assert state.observed_state == MinerInstanceState.ObservedState.STOPPED
+        assert state.current_run_id is None
+        assert state.advisory_pid is None
+        assert attempt.outcome == RestartAttempt.Outcome.FAILED
+        assert "cancelled" in attempt.error.casefold()
+        assert candidate.ended_at is not None
+        assert candidate.stop_reason == MinerRun.StopReason.START_FAILED
+
+        assert supervisor.process_pending_commands() == 1
+        stop_command.refresh_from_db()
+        incident.refresh_from_db()
+        assert stop_command.status == MinerCommand.Status.SUCCEEDED
+        assert incident.status == MinerIncident.Status.RECOVERED
+        assert len(factory.processes) == 0
+    finally:
+        supervisor.shutdown()
+
+
+@pytest.mark.django_db
+def test_recovery_spawn_transaction_failure_cleans_provisional_child(
+    tmp_path,
+    settings,
+    monkeypatch,
+):
+    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    clock = FakeClock()
+    factory = ProcessFactory()
+    supervisor = make_supervisor(clock, factory)
+    supervisor.startup()
+    try:
+        account = MinerAccount.objects.get(config_key="primary")
+        state = MinerInstanceState.objects.get(account=account)
+        state.desired_state = MinerInstanceState.DesiredState.RUNNING
+        state.observed_state = MinerInstanceState.ObservedState.RESTARTING
+        state.next_retry_at = clock.now()
+        state.save()
+        incident = MinerIncident.objects.create(
+            account=account,
+            kind=MinerIncident.Kind.UNEXPECTED_EXIT,
+            status=MinerIncident.Status.OPEN,
+            summary="Recovery is due.",
+        )
+        attempt = RestartAttempt.objects.create(
+            incident=incident,
+            attempt_number=1,
+            scheduled_at=clock.now(),
+            outcome=RestartAttempt.Outcome.SCHEDULED,
+        )
+        original_spawn = supervisor._spawn_snapshot
+        provisional = None
+
+        def spawn_then_fail_transaction(*args, **kwargs):
+            nonlocal provisional
+            provisional = original_spawn(*args, **kwargs)
+            raise OperationalError("simulated outer recovery transaction commit failure")
+
+        monkeypatch.setattr(supervisor, "_spawn_snapshot", spawn_then_fail_transaction)
+        assert supervisor._perform_due_recoveries() == 0
+
+        state.refresh_from_db()
+        attempt.refresh_from_db()
+        run = MinerRun.objects.get(pk=attempt.run_id)
+        successor = RestartAttempt.objects.get(incident=incident, attempt_number=2)
+        assert provisional is not None
+        assert provisional.confirmed is False
+        assert provisional.process.poll() == -15
+        assert account.pk not in supervisor.processes
+        assert attempt.outcome == RestartAttempt.Outcome.FAILED
+        assert successor.outcome == RestartAttempt.Outcome.SCHEDULED
+        assert RestartAttempt.objects.filter(
+            incident=incident,
+            outcome=RestartAttempt.Outcome.SCHEDULED,
+        ).count() == 1
+        assert run.ended_at is not None
+        assert run.stop_reason == MinerRun.StopReason.START_FAILED
+        assert run.startup_confirmed_at is None
+        assert state.current_run_id is None
+        assert state.advisory_pid is None
+    finally:
+        supervisor.shutdown()
+
+
+@pytest.mark.django_db
+def test_command_spawn_transaction_failure_cleans_provisional_child(
+    tmp_path,
+    settings,
+    monkeypatch,
+):
+    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    clock = FakeClock()
+    factory = ProcessFactory()
+    supervisor = make_supervisor(clock, factory)
+    supervisor.startup()
+    try:
+        account = MinerAccount.objects.get(config_key="primary")
+        original_spawn = supervisor._spawn_snapshot
+        provisional = None
+
+        def spawn_then_fail_transaction(*args, **kwargs):
+            nonlocal provisional
+            provisional = original_spawn(*args, **kwargs)
+            raise OperationalError("simulated outer command transaction commit failure")
+
+        monkeypatch.setattr(supervisor, "_spawn_snapshot", spawn_then_fail_transaction)
+        command = enqueue_command(account, MinerCommand.Action.START)
+        assert supervisor.process_pending_commands() == 1
+
+        command.refresh_from_db()
+        state = MinerInstanceState.objects.get(account=account)
+        run = MinerRun.objects.get(account=account)
+        assert provisional is not None
+        assert provisional.confirmed is False
+        assert provisional.process.poll() == -15
+        assert command.status == MinerCommand.Status.FAILED
+        assert account.pk not in supervisor.processes
+        assert run.ended_at is not None
+        assert run.stop_reason == MinerRun.StopReason.START_FAILED
+        assert run.startup_confirmed_at is None
+        assert state.current_run_id is None
+        assert state.advisory_pid is None
+        assert state.observed_state == MinerInstanceState.ObservedState.DEGRADED
+
+        supervisor.check_health()
+        state.refresh_from_db()
+        assert account.pk not in supervisor.processes
+        assert state.observed_state != MinerInstanceState.ObservedState.RUNNING
+    finally:
+        supervisor.shutdown()
+
+
+@pytest.mark.django_db
+def test_manual_stop_committed_during_explicit_restart_prevents_replacement_spawn(
+    tmp_path,
+    settings,
+    monkeypatch,
+):
+    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    clock = FakeClock()
+    factory = ProcessFactory()
+    supervisor = make_supervisor(clock, factory)
+    supervisor.startup()
+    try:
+        account = MinerAccount.objects.get(config_key="primary")
+        enqueue_command(account, MinerCommand.Action.START)
+        supervisor.run_once(force_checks=True)
+        old_run = MinerInstanceState.objects.get(account=account).current_run
+        original_snapshot = create_launch_snapshot
+        stop_command = None
+
+        def snapshot_then_stop(*args, **kwargs):
+            nonlocal stop_command
+            run = original_snapshot(*args, **kwargs)
+            stop_command = enqueue_command(account, MinerCommand.Action.STOP)
+            return run
+
+        monkeypatch.setattr(
+            "controller.miner_supervisor.services.create_launch_snapshot",
+            snapshot_then_stop,
+        )
+        restart = enqueue_command(account, MinerCommand.Action.RESTART)
+        assert supervisor.process_pending_commands() == 2
+
+        restart.refresh_from_db()
+        stop_command.refresh_from_db()
+        old_run.refresh_from_db()
+        state = MinerInstanceState.objects.get(account=account)
+        candidate = MinerRun.objects.exclude(pk=old_run.pk).get(account=account)
+        assert restart.status == MinerCommand.Status.FAILED
+        assert stop_command.status == MinerCommand.Status.SUCCEEDED
+        assert state.desired_state == MinerInstanceState.DesiredState.STOPPED
+        assert state.observed_state == MinerInstanceState.ObservedState.STOPPED
+        assert state.current_run_id is None
+        assert old_run.stop_reason == MinerRun.StopReason.ADMIN_RESTART
+        assert candidate.stop_reason == MinerRun.StopReason.START_FAILED
+        assert candidate.ended_at is not None
+        assert len(factory.processes) == 1
+        assert supervisor.processes == {}
+    finally:
+        supervisor.shutdown()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "active_outcome",
+    (RestartAttempt.Outcome.SCHEDULED, RestartAttempt.Outcome.STARTED),
+)
+def test_explicit_restart_supersedes_active_recovery_attempts_until_confirmation(
+    tmp_path,
+    settings,
+    active_outcome,
+):
+    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    clock = FakeClock()
+    supervisor = make_supervisor(clock, ProcessFactory())
+    supervisor.startup()
+    try:
+        account = MinerAccount.objects.get(config_key="primary")
+        state = MinerInstanceState.objects.get(account=account)
+        state.desired_state = MinerInstanceState.DesiredState.RUNNING
+        state.observed_state = MinerInstanceState.ObservedState.DEGRADED
+        state.retry_count = 3
+        state.next_retry_at = clock.now()
+        state.last_error = "Previous recovery failed."
+        state.save()
+        incident = MinerIncident.objects.create(
+            account=account,
+            kind=MinerIncident.Kind.UNEXPECTED_EXIT,
+            status=MinerIncident.Status.OPEN,
+            summary="Waiting for recovery.",
+        )
+        attempt = RestartAttempt.objects.create(
+            incident=incident,
+            attempt_number=4,
+            scheduled_at=clock.now(),
+            started_at=(
+                clock.now() if active_outcome == RestartAttempt.Outcome.STARTED else None
+            ),
+            outcome=active_outcome,
+        )
+
+        command = enqueue_command(
+            account,
+            MinerCommand.Action.RESTART,
+            reason="Admin requested restart.",
+        )
+
+        state.refresh_from_db()
+        attempt.refresh_from_db()
+        incident.refresh_from_db()
+        assert state.retry_count == 3
+        assert state.next_retry_at == clock.now()
+        assert state.last_error == "Previous recovery failed."
+        assert attempt.outcome == active_outcome
+        assert attempt.finished_at is None
+        assert incident.status == MinerIncident.Status.OPEN
+        assert incident.recovered_at is None
+
+        supervisor.run_once(force_checks=True)
+
+        command.refresh_from_db()
+        state.refresh_from_db()
+        attempt.refresh_from_db()
+        incident.refresh_from_db()
+        replacement = MinerRun.objects.get(account=account, ended_at__isnull=True)
+        assert command.status == MinerCommand.Status.SUCCEEDED
+        assert state.retry_count == 0
+        assert state.next_retry_at is None
+        assert attempt.outcome == RestartAttempt.Outcome.FAILED
+        assert attempt.finished_at is not None
+        assert "superseded by an explicit restart" in attempt.error.casefold()
+        assert replacement.startup_confirmed_at is not None
+        assert incident.status == MinerIncident.Status.RECOVERED
+        assert incident.recovered_at is not None
+        assert not RestartAttempt.objects.filter(
+            incident=incident,
+            outcome__in=(
+                RestartAttempt.Outcome.SCHEDULED,
+                RestartAttempt.Outcome.STARTED,
+            ),
+        ).exists()
+    finally:
+        supervisor.shutdown()
+
+
+@pytest.mark.django_db
+def test_live_recovery_may_confirm_before_explicit_restart_takes_over(
+    tmp_path,
+    settings,
+):
+    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    clock = FakeClock()
+    factory = ProcessFactory()
+    supervisor = make_supervisor(clock, factory)
+    supervisor.startup()
+    try:
+        account = MinerAccount.objects.get(config_key="primary")
+        state = MinerInstanceState.objects.get(account=account)
+        state.desired_state = MinerInstanceState.DesiredState.RUNNING
+        state.observed_state = MinerInstanceState.ObservedState.RESTARTING
+        state.next_retry_at = clock.now()
+        state.save()
+        incident = MinerIncident.objects.create(
+            account=account,
+            kind=MinerIncident.Kind.UNEXPECTED_EXIT,
+            status=MinerIncident.Status.OPEN,
+            summary="Recovery child is starting.",
+        )
+        attempt = RestartAttempt.objects.create(
+            incident=incident,
+            attempt_number=1,
+            scheduled_at=clock.now(),
+            outcome=RestartAttempt.Outcome.SCHEDULED,
+        )
+
+        assert supervisor._perform_due_recoveries() == 1
+        recovery_child = supervisor.processes[account.pk]
+        attempt.refresh_from_db()
+        assert recovery_child.confirmed is False
+        assert attempt.outcome == RestartAttempt.Outcome.STARTED
+
+        command = enqueue_command(account, MinerCommand.Action.RESTART)
+        attempt.refresh_from_db()
+        assert attempt.outcome == RestartAttempt.Outcome.STARTED
+
+        # Reproduce a web request arriving after the loop's command pass but
+        # before health confirmation of the already-spawned recovery child.
+        supervisor.check_health()
+        attempt.refresh_from_db()
+        incident.refresh_from_db()
+        assert recovery_child.confirmed is True
+        assert attempt.outcome == RestartAttempt.Outcome.SUCCEEDED
+        assert incident.status == MinerIncident.Status.RECOVERED
+        assert incident.recovered_at is not None
+
+        assert supervisor.process_pending_commands() == 1
+        supervisor.check_health()
+
+        command.refresh_from_db()
+        incident.refresh_from_db()
+        assert command.status == MinerCommand.Status.SUCCEEDED
+        assert incident.status == MinerIncident.Status.RECOVERED
+        assert incident.recovered_at is not None
+        assert supervisor.processes[account.pk].run_id != recovery_child.run_id
+        assert len(factory.processes) == 2
+    finally:
+        supervisor.shutdown()
+
+
+@pytest.mark.django_db
+def test_invalid_explicit_restart_does_not_cancel_live_recovery(
+    tmp_path,
+    settings,
+):
+    config_path = write_config(tmp_path / "config.yaml")
+    settings.TWITCH_FARM_CONFIG = config_path
+    clock = FakeClock()
+    factory = ProcessFactory()
+    supervisor = make_supervisor(clock, factory)
+    supervisor.startup()
+    try:
+        account = MinerAccount.objects.get(config_key="primary")
+        state = MinerInstanceState.objects.get(account=account)
+        state.desired_state = MinerInstanceState.DesiredState.RUNNING
+        state.observed_state = MinerInstanceState.ObservedState.RESTARTING
+        state.next_retry_at = clock.now()
+        state.save()
+        incident = MinerIncident.objects.create(
+            account=account,
+            kind=MinerIncident.Kind.UNEXPECTED_EXIT,
+            status=MinerIncident.Status.OPEN,
+            summary="Recovery child is starting.",
+        )
+        attempt = RestartAttempt.objects.create(
+            incident=incident,
+            attempt_number=1,
+            scheduled_at=clock.now(),
+            outcome=RestartAttempt.Outcome.SCHEDULED,
+        )
+        assert supervisor._perform_due_recoveries() == 1
+        recovery_child = supervisor.processes[account.pk]
+        assert recovery_child.confirmed is False
+
+        command = enqueue_command(account, MinerCommand.Action.RESTART)
+        write_config(config_path, channels=())
+        assert supervisor.process_pending_commands() == 1
+
+        command.refresh_from_db()
+        attempt.refresh_from_db()
+        incident.refresh_from_db()
+        assert command.status == MinerCommand.Status.FAILED
+        assert attempt.outcome == RestartAttempt.Outcome.STARTED
+        assert attempt.finished_at is None
+        assert incident.status == MinerIncident.Status.OPEN
+        assert supervisor.processes[account.pk] is recovery_child
+        assert recovery_child.process.poll() is None
+        assert len(factory.processes) == 1
+        assert MinerRun.objects.filter(account=account).count() == 1
+
+        supervisor.check_health()
+
+        attempt.refresh_from_db()
+        incident.refresh_from_db()
+        assert recovery_child.confirmed is True
+        assert attempt.outcome == RestartAttempt.Outcome.SUCCEEDED
+        assert incident.status == MinerIncident.Status.RECOVERED
+        assert incident.recovered_at is not None
+    finally:
+        supervisor.shutdown()
+
+
+@pytest.mark.django_db
+def test_invalid_restart_preserves_existing_rapid_recovery_deadline(
+    tmp_path,
+    settings,
+):
+    config_path = write_config(tmp_path / "config.yaml")
+    settings.TWITCH_FARM_CONFIG = config_path
+    clock = FakeClock()
+    factory = ProcessFactory()
+    supervisor = make_supervisor(clock, factory, rapid_restart_backoff=(5, 15, 30, 60, 120))
+    supervisor.startup()
+    try:
+        account = MinerAccount.objects.get(config_key="primary")
+        state = MinerInstanceState.objects.get(account=account)
+        rapid_deadline = clock.now() + timedelta(seconds=5)
+        state.desired_state = MinerInstanceState.DesiredState.RUNNING
+        state.observed_state = MinerInstanceState.ObservedState.RESTARTING
+        state.next_retry_at = rapid_deadline
+        state.save()
+        incident = MinerIncident.objects.create(
+            account=account,
+            kind=MinerIncident.Kind.UNEXPECTED_EXIT,
+            status=MinerIncident.Status.OPEN,
+            summary="Waiting for the first rapid retry.",
+        )
+        attempt = RestartAttempt.objects.create(
+            incident=incident,
+            attempt_number=1,
+            scheduled_at=rapid_deadline,
+            outcome=RestartAttempt.Outcome.SCHEDULED,
+        )
+
+        command = enqueue_command(account, MinerCommand.Action.RESTART)
+        write_config(config_path, channels=())
+        assert supervisor.process_pending_commands() == 1
+
+        command.refresh_from_db()
+        attempt.refresh_from_db()
+        state.refresh_from_db()
+        assert command.status == MinerCommand.Status.FAILED
+        assert attempt.outcome == RestartAttempt.Outcome.SCHEDULED
+        assert attempt.scheduled_at == rapid_deadline
+        assert state.next_retry_at == rapid_deadline
+
+        write_config(config_path)
+        clock.advance(5)
+        assert supervisor._perform_due_recoveries() == 1
+        attempt.refresh_from_db()
+        assert attempt.outcome == RestartAttempt.Outcome.STARTED
+        assert len(factory.processes) == 1
+    finally:
+        supervisor.shutdown()
+
+
+@pytest.mark.django_db
+def test_failed_validated_restart_takeover_schedules_new_rapid_attempt(
+    tmp_path,
+    settings,
+    monkeypatch,
+):
+    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    clock = FakeClock()
+    supervisor = make_supervisor(clock, ProcessFactory())
+    supervisor.startup()
+    try:
+        account = MinerAccount.objects.get(config_key="primary")
+        state = MinerInstanceState.objects.get(account=account)
+        state.desired_state = MinerInstanceState.DesiredState.RUNNING
+        state.observed_state = MinerInstanceState.ObservedState.RESTARTING
+        state.retry_count = 4
+        state.next_retry_at = clock.now() + timedelta(minutes=5)
+        state.save()
+        incident = MinerIncident.objects.create(
+            account=account,
+            kind=MinerIncident.Kind.UNEXPECTED_EXIT,
+            status=MinerIncident.Status.OPEN,
+            summary="Explicit restart will take over recovery.",
+        )
+        previous = RestartAttempt.objects.create(
+            incident=incident,
+            attempt_number=4,
+            scheduled_at=state.next_retry_at,
+            outcome=RestartAttempt.Outcome.SCHEDULED,
+        )
+
+        def fail_spawn(*args, **kwargs):
+            raise OSError("simulated spawn handoff failure")
+
+        monkeypatch.setattr(supervisor, "_spawn_snapshot", fail_spawn)
+        command = enqueue_command(account, MinerCommand.Action.RESTART)
+        assert supervisor.process_pending_commands() == 1
+
+        command.refresh_from_db()
+        previous.refresh_from_db()
+        state.refresh_from_db()
+        successor = RestartAttempt.objects.get(incident=incident, attempt_number=5)
+        candidate = MinerRun.objects.get(account=account)
+        assert command.status == MinerCommand.Status.FAILED
+        assert previous.outcome == RestartAttempt.Outcome.FAILED
+        assert successor.outcome == RestartAttempt.Outcome.SCHEDULED
+        assert successor.scheduled_at == clock.now()
+        assert state.retry_count == 0
+        assert state.next_retry_at == successor.scheduled_at
+        assert candidate.stop_reason == MinerRun.StopReason.START_FAILED
+        assert candidate.ended_at is not None
+    finally:
+        supervisor.shutdown()
+
+
+@pytest.mark.django_db
+def test_repeated_restart_coalesces_while_replacement_is_starting(
+    tmp_path,
+    settings,
+):
+    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    clock = FakeClock()
+    factory = ProcessFactory()
+    supervisor = make_supervisor(clock, factory)
+    supervisor.startup()
+    try:
+        account = MinerAccount.objects.get(config_key="primary")
+        enqueue_command(account, MinerCommand.Action.START)
+        supervisor.run_once(force_checks=True)
+        assert len(factory.processes) == 1
+
+        first_restart = enqueue_command(account, MinerCommand.Action.RESTART)
+        assert supervisor.process_pending_commands() == 1
+        first_restart.refresh_from_db()
+        assert first_restart.status == MinerCommand.Status.LEASED
+        assert supervisor.processes[account.pk].confirmed is False
+
+        repeated_restart = enqueue_command(account, MinerCommand.Action.RESTART)
+        assert repeated_restart.pk == first_restart.pk
+        assert MinerCommand.objects.filter(
+            account=account,
+            action=MinerCommand.Action.RESTART,
+        ).count() == 1
+        assert supervisor.process_pending_commands() == 0
+
+        supervisor.check_health()
+        first_restart.refresh_from_db()
+        assert first_restart.status == MinerCommand.Status.SUCCEEDED
+        assert supervisor.processes[account.pk].confirmed is True
+        assert len(factory.processes) == 2
+    finally:
+        supervisor.shutdown()
+
+
+@pytest.mark.django_db
+def test_failed_restart_signal_allows_surviving_recovery_attempt_to_succeed(
+    tmp_path,
+    settings,
+):
+    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    clock = FakeClock()
+    factory = ProcessFactory(fail_terminate=True)
+    supervisor = make_supervisor(clock, factory)
+    supervisor.startup()
+    recovery_child = None
+    try:
+        account = MinerAccount.objects.get(config_key="primary")
+        state = MinerInstanceState.objects.get(account=account)
+        state.desired_state = MinerInstanceState.DesiredState.RUNNING
+        state.observed_state = MinerInstanceState.ObservedState.RESTARTING
+        state.next_retry_at = clock.now()
+        state.save()
+        incident = MinerIncident.objects.create(
+            account=account,
+            kind=MinerIncident.Kind.UNEXPECTED_EXIT,
+            status=MinerIncident.Status.OPEN,
+            summary="Recovery child is starting.",
+        )
+        attempt = RestartAttempt.objects.create(
+            incident=incident,
+            attempt_number=1,
+            scheduled_at=clock.now(),
+            outcome=RestartAttempt.Outcome.SCHEDULED,
+        )
+        assert supervisor._perform_due_recoveries() == 1
+        recovery_child = supervisor.processes[account.pk]
+
+        command = enqueue_command(account, MinerCommand.Action.RESTART)
+        assert supervisor.process_pending_commands() == 1
+
+        command.refresh_from_db()
+        attempt.refresh_from_db()
+        incident.refresh_from_db()
+        assert command.status == MinerCommand.Status.FAILED
+        assert attempt.outcome == RestartAttempt.Outcome.STARTED
+        assert attempt.error == ""
+        assert incident.status == MinerIncident.Status.OPEN
+        assert supervisor.processes[account.pk] is recovery_child
+        assert recovery_child.process.poll() is None
+        assert recovery_child.confirmed is False
+        assert len(factory.processes) == 1
+
+        supervisor.check_health()
+
+        attempt.refresh_from_db()
+        incident.refresh_from_db()
+        assert recovery_child.confirmed is True
+        assert attempt.outcome == RestartAttempt.Outcome.SUCCEEDED
+        assert incident.status == MinerIncident.Status.RECOVERED
+        assert incident.recovered_at is not None
+    finally:
+        if recovery_child is not None:
+            recovery_child.process.fail_terminate = False
+        supervisor.shutdown()
+
+
+@pytest.mark.django_db
+def test_terminal_newer_restart_recovers_incident_for_confirmed_fallback_child(
+    tmp_path,
+    settings,
+):
+    config_path = write_config(tmp_path / "config.yaml")
+    settings.TWITCH_FARM_CONFIG = config_path
+    clock = FakeClock()
+    factory = ProcessFactory(fail_terminate=True)
+    supervisor = make_supervisor(clock, factory)
+    supervisor.startup()
+    recovery_child = None
+    try:
+        account = MinerAccount.objects.get(config_key="primary")
+        state = MinerInstanceState.objects.get(account=account)
+        state.desired_state = MinerInstanceState.DesiredState.RUNNING
+        state.observed_state = MinerInstanceState.ObservedState.RESTARTING
+        state.next_retry_at = clock.now()
+        state.save()
+        incident = MinerIncident.objects.create(
+            account=account,
+            kind=MinerIncident.Kind.UNEXPECTED_EXIT,
+            status=MinerIncident.Status.OPEN,
+            summary="Recovery child is starting.",
+        )
+        attempt = RestartAttempt.objects.create(
+            incident=incident,
+            attempt_number=1,
+            scheduled_at=clock.now(),
+            outcome=RestartAttempt.Outcome.SCHEDULED,
+        )
+        assert supervisor._perform_due_recoveries() == 1
+        recovery_child = supervisor.processes[account.pk]
+
+        first_restart = enqueue_command(account, MinerCommand.Action.RESTART)
+        assert supervisor.process_pending_commands() == 1
+        first_restart.refresh_from_db()
+        assert first_restart.status == MinerCommand.Status.FAILED
+
+        second_restart = enqueue_command(account, MinerCommand.Action.RESTART)
+        supervisor.check_health()
+        attempt.refresh_from_db()
+        incident.refresh_from_db()
+        assert recovery_child.confirmed is True
+        assert attempt.outcome == RestartAttempt.Outcome.SUCCEEDED
+        assert incident.status == MinerIncident.Status.RECOVERED
+
+        write_config(config_path, channels=())
+        assert supervisor.process_pending_commands() == 1
+
+        second_restart.refresh_from_db()
+        incident.refresh_from_db()
+        assert second_restart.status == MinerCommand.Status.FAILED
+        assert incident.status == MinerIncident.Status.RECOVERED
+        assert incident.recovered_at is not None
+        assert supervisor.processes[account.pk] is recovery_child
+        assert recovery_child.process.poll() is None
+        assert len(factory.processes) == 1
+    finally:
+        if recovery_child is not None:
+            recovery_child.process.fail_terminate = False
+        supervisor.shutdown()
+
+
+@pytest.mark.django_db
+def test_restart_bookkeeping_failure_finalizes_unused_snapshot_and_keeps_old_child(
+    tmp_path,
+    settings,
+    monkeypatch,
+):
+    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    clock = FakeClock()
+    factory = ProcessFactory()
+    supervisor = make_supervisor(clock, factory)
+    supervisor.startup()
+    try:
+        account = MinerAccount.objects.get(config_key="primary")
+        enqueue_command(account, MinerCommand.Action.START)
+        supervisor.run_once(force_checks=True)
+        old_managed = supervisor.processes[account.pk]
+        old_run = MinerRun.objects.get(pk=old_managed.run_id)
+        original_save = MinerInstanceState.save
+
+        def fail_restarting_save(instance, *args, **kwargs):
+            if instance.observed_state == MinerInstanceState.ObservedState.RESTARTING:
+                raise OperationalError("simulated restart bookkeeping failure")
+            return original_save(instance, *args, **kwargs)
+
+        monkeypatch.setattr(MinerInstanceState, "save", fail_restarting_save)
+        with pytest.raises(OperationalError):
+            supervisor.restart_account(account, reset_failures=True)
+
+        runs = list(MinerRun.objects.filter(account=account).order_by("started_at", "id"))
+        assert len(runs) == 2
+        unused_run = runs[1]
+        old_run.refresh_from_db()
+        state = MinerInstanceState.objects.get(account=account)
+        assert supervisor.processes[account.pk] is old_managed
+        assert old_managed.process.poll() is None
+        assert old_run.ended_at is None
+        assert unused_run.stop_reason == MinerRun.StopReason.START_FAILED
+        assert unused_run.ended_at is not None
+        assert state.current_run_id == old_run.pk
+        assert state.observed_state == MinerInstanceState.ObservedState.RUNNING
+        assert state.next_retry_at is None
+
+        monkeypatch.setattr(MinerInstanceState, "save", original_save)
+        replacement = supervisor.restart_account(account, reset_failures=True)
+        supervisor.check_health()
+        old_run.refresh_from_db()
+        replacement_run = MinerRun.objects.get(pk=replacement.run_id)
+        assert replacement is supervisor.processes[account.pk]
+        assert replacement.run_id != old_run.pk
+        assert old_run.stop_reason == MinerRun.StopReason.ADMIN_RESTART
+        assert replacement_run.startup_confirmed_at is not None
+        assert MinerRun.objects.filter(account=account, ended_at__isnull=True).count() == 1
+        assert len(factory.processes) == 2
+    finally:
+        supervisor.shutdown()
+
+
+@pytest.mark.django_db
+def test_unexpected_exit_keeps_handle_until_run_and_incident_bookkeeping_commits(
+    tmp_path,
+    settings,
+    monkeypatch,
+):
+    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    clock = FakeClock()
+    factory = ProcessFactory()
+    supervisor = make_supervisor(clock, factory)
+    supervisor.startup()
+    try:
+        account = MinerAccount.objects.get(config_key="primary")
+        enqueue_command(account, MinerCommand.Action.START)
+        supervisor.run_once(force_checks=True)
+        managed = supervisor.processes[account.pk]
+        failed_run = MinerRun.objects.get(pk=managed.run_id)
+        managed.process.crash(29)
+        original_close_run = supervisor._close_run
+
+        def fail_close_run(*args, **kwargs):
+            raise OperationalError("simulated unexpected-exit finalization failure")
+
+        monkeypatch.setattr(supervisor, "_close_run", fail_close_run)
+        supervisor.check_health()
+
+        failed_run.refresh_from_db()
+        assert supervisor.processes[account.pk] is managed
+        assert failed_run.ended_at is None
+        assert MinerRun.objects.filter(account=account).count() == 1
+        assert not MinerIncident.objects.filter(account=account).exists()
+        state = MinerInstanceState.objects.get(account=account)
+        heartbeat_before = state.last_heartbeat
+        clock.advance(1)
+        supervisor.heartbeat(force=True)
+        state.refresh_from_db()
+        assert state.last_heartbeat == heartbeat_before
+
+        monkeypatch.setattr(supervisor, "_close_run", original_close_run)
+        supervisor.check_health()
+        failed_run.refresh_from_db()
+        state = MinerInstanceState.objects.get(account=account)
+        assert account.pk not in supervisor.processes
+        assert failed_run.stop_reason == MinerRun.StopReason.UNEXPECTED_EXIT
+        assert failed_run.exit_code == 29
+        assert MinerIncident.objects.filter(account=account, status="open").exists()
+        assert state.current_run_id is None
+        assert state.advisory_pid is None
+        assert state.worker_id == ""
+        assert state.stable_since is None
+        assert "return code 29" in state.last_error
+        assert state.next_retry_at == clock.now()
+
+        assert supervisor._perform_due_recoveries() == 1
+        assert account.pk in supervisor.processes
+        assert supervisor.processes[account.pk].run_id != failed_run.pk
+        assert len(factory.processes) == 2
+    finally:
+        supervisor.shutdown()
+
+
+@pytest.mark.django_db
 def test_five_rapid_recovery_failures_enter_degraded_periodic_retry(tmp_path, settings):
     settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
     clock = FakeClock()
@@ -417,6 +1251,62 @@ default_channels:
         assert primary.is_configured is False
         assert primary.runtime_state.desired_state == MinerInstanceState.DesiredState.STOPPED
         assert primary.pk not in supervisor.processes
+    finally:
+        supervisor.shutdown()
+
+
+@pytest.mark.django_db
+def test_config_removal_closes_unowned_recovery_incident(tmp_path, settings):
+    config_path = write_config(tmp_path / "config.yaml")
+    settings.TWITCH_FARM_CONFIG = config_path
+    clock = FakeClock()
+    supervisor = make_supervisor(clock, ProcessFactory())
+    supervisor.startup()
+    try:
+        account = MinerAccount.objects.get(config_key="primary")
+        state = MinerInstanceState.objects.get(account=account)
+        state.desired_state = MinerInstanceState.DesiredState.RUNNING
+        state.observed_state = MinerInstanceState.ObservedState.RESTARTING
+        state.next_retry_at = clock.now() + timedelta(seconds=5)
+        state.save()
+        incident = MinerIncident.objects.create(
+            account=account,
+            kind=MinerIncident.Kind.UNEXPECTED_EXIT,
+            status=MinerIncident.Status.OPEN,
+            summary="Recovery was waiting when configuration changed.",
+        )
+        attempt = RestartAttempt.objects.create(
+            incident=incident,
+            attempt_number=1,
+            scheduled_at=state.next_retry_at,
+            outcome=RestartAttempt.Outcome.SCHEDULED,
+        )
+        config_path.write_text(
+            """settings:
+  autostart_instances: false
+twitch_users: {}
+default_channels:
+  - Alpha
+""",
+            encoding="utf-8",
+        )
+
+        supervisor.reconcile_fingerprints()
+
+        account.refresh_from_db()
+        state.refresh_from_db()
+        attempt.refresh_from_db()
+        incident.refresh_from_db()
+        assert account.is_configured is False
+        assert state.desired_state == MinerInstanceState.DesiredState.STOPPED
+        assert state.observed_state == MinerInstanceState.ObservedState.STOPPED
+        assert state.next_retry_at is None
+        assert attempt.outcome == RestartAttempt.Outcome.FAILED
+        assert "removed from config.yaml" in attempt.error
+        assert incident.status == MinerIncident.Status.RECOVERED
+        assert incident.recovered_at is not None
+        assert "no longer configured" in incident.details
+        assert supervisor.processes == {}
     finally:
         supervisor.shutdown()
 
@@ -655,6 +1545,275 @@ def test_due_recovery_waits_for_pending_run_finalization(
 
 
 @pytest.mark.django_db
+def test_recovery_claim_failure_leaves_attempt_scheduled_and_state_due(
+    tmp_path,
+    settings,
+    monkeypatch,
+):
+    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    clock = FakeClock()
+    supervisor = make_supervisor(clock, ProcessFactory())
+    supervisor.startup()
+    try:
+        account = MinerAccount.objects.get(config_key="primary")
+        state = MinerInstanceState.objects.get(account=account)
+        state.desired_state = MinerInstanceState.DesiredState.RUNNING
+        state.observed_state = MinerInstanceState.ObservedState.RESTARTING
+        state.next_retry_at = clock.now()
+        state.save()
+        incident = MinerIncident.objects.create(
+            account=account,
+            kind=MinerIncident.Kind.UNEXPECTED_EXIT,
+            status=MinerIncident.Status.OPEN,
+            summary="Waiting for recovery.",
+        )
+        attempt = RestartAttempt.objects.create(
+            incident=incident,
+            attempt_number=1,
+            scheduled_at=clock.now(),
+            outcome=RestartAttempt.Outcome.SCHEDULED,
+        )
+        original_save = RestartAttempt.save
+
+        def fail_started_save(instance, *args, **kwargs):
+            if kwargs.get("update_fields") == ("started_at", "outcome"):
+                raise OperationalError("simulated recovery claim failure")
+            return original_save(instance, *args, **kwargs)
+
+        monkeypatch.setattr(RestartAttempt, "save", fail_started_save)
+        assert supervisor._perform_due_recoveries() == 0
+
+        state.refresh_from_db()
+        attempt.refresh_from_db()
+        assert state.retry_count == 0
+        assert state.next_retry_at == clock.now()
+        assert state.observed_state == MinerInstanceState.ObservedState.RESTARTING
+        assert attempt.outcome == RestartAttempt.Outcome.SCHEDULED
+        assert attempt.started_at is None
+        assert MinerRun.objects.count() == 0
+        assert supervisor.processes == {}
+    finally:
+        supervisor.shutdown()
+
+
+@pytest.mark.django_db
+def test_recovery_run_association_failure_finalizes_snapshot_before_reschedule(
+    tmp_path,
+    settings,
+    monkeypatch,
+):
+    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    clock = FakeClock()
+    supervisor = make_supervisor(clock, ProcessFactory())
+    supervisor.startup()
+    try:
+        account = MinerAccount.objects.get(config_key="primary")
+        state = MinerInstanceState.objects.get(account=account)
+        state.desired_state = MinerInstanceState.DesiredState.RUNNING
+        state.observed_state = MinerInstanceState.ObservedState.RESTARTING
+        state.next_retry_at = clock.now()
+        state.save()
+        incident = MinerIncident.objects.create(
+            account=account,
+            kind=MinerIncident.Kind.UNEXPECTED_EXIT,
+            status=MinerIncident.Status.OPEN,
+            summary="Waiting for recovery.",
+        )
+        attempt = RestartAttempt.objects.create(
+            incident=incident,
+            attempt_number=1,
+            scheduled_at=clock.now(),
+            outcome=RestartAttempt.Outcome.SCHEDULED,
+        )
+        original_save = RestartAttempt.save
+
+        def fail_run_association(instance, *args, **kwargs):
+            if kwargs.get("update_fields") == ("run",):
+                raise OperationalError("simulated recovery run association failure")
+            return original_save(instance, *args, **kwargs)
+
+        monkeypatch.setattr(RestartAttempt, "save", fail_run_association)
+        assert supervisor._perform_due_recoveries() == 0
+
+        state.refresh_from_db()
+        attempt.refresh_from_db()
+        leaked_candidate = MinerRun.objects.get(account=account)
+        assert leaked_candidate.stop_reason == MinerRun.StopReason.START_FAILED
+        assert leaked_candidate.ended_at is not None
+        assert attempt.outcome == RestartAttempt.Outcome.FAILED
+        assert RestartAttempt.objects.filter(
+            incident=incident,
+            attempt_number=2,
+            outcome=RestartAttempt.Outcome.SCHEDULED,
+        ).exists()
+        assert state.next_retry_at == clock.now()
+        assert supervisor.pending_run_finalizations == {}
+        assert supervisor.processes == {}
+    finally:
+        supervisor.shutdown()
+
+
+@pytest.mark.django_db
+def test_cleanup_reconciliation_reuses_already_scheduled_recovery_attempt(
+    tmp_path,
+    settings,
+    monkeypatch,
+):
+    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    clock = FakeClock()
+    factory = ProcessFactory(fail_terminate=True)
+    supervisor = make_supervisor(clock, factory)
+    supervisor.startup()
+    try:
+        account = MinerAccount.objects.get(config_key="primary")
+        state = MinerInstanceState.objects.get(account=account)
+        state.desired_state = MinerInstanceState.DesiredState.RUNNING
+        state.observed_state = MinerInstanceState.ObservedState.RESTARTING
+        state.next_retry_at = clock.now()
+        state.save()
+        incident = MinerIncident.objects.create(
+            account=account,
+            kind=MinerIncident.Kind.UNEXPECTED_EXIT,
+            status=MinerIncident.Status.OPEN,
+            summary="Waiting for recovery.",
+        )
+        first_attempt = RestartAttempt.objects.create(
+            incident=incident,
+            attempt_number=1,
+            scheduled_at=clock.now(),
+            outcome=RestartAttempt.Outcome.SCHEDULED,
+        )
+        original_save = MinerInstanceState.save
+        fail_starting_save = True
+
+        def fail_first_starting_save(instance, *args, **kwargs):
+            nonlocal fail_starting_save
+            if (
+                fail_starting_save
+                and instance.observed_state == MinerInstanceState.ObservedState.STARTING
+            ):
+                fail_starting_save = False
+                raise OperationalError("simulated post-spawn database failure")
+            return original_save(instance, *args, **kwargs)
+
+        monkeypatch.setattr(MinerInstanceState, "save", fail_first_starting_save)
+        assert supervisor._perform_due_recoveries() == 0
+
+        managed = supervisor.processes[account.pk]
+        first_attempt.refresh_from_db()
+        state.refresh_from_db()
+        successor = RestartAttempt.objects.get(
+            incident=incident,
+            outcome=RestartAttempt.Outcome.SCHEDULED,
+        )
+        assert managed.cleanup_required is True
+        assert first_attempt.outcome == RestartAttempt.Outcome.FAILED
+        assert successor.attempt_number == 2
+        assert state.retry_count == 1
+        assert state.next_retry_at == successor.scheduled_at
+
+        managed.process.fail_terminate = False
+        supervisor.check_health()
+
+        state.refresh_from_db()
+        pending = list(
+            RestartAttempt.objects.filter(
+                incident=incident,
+                outcome=RestartAttempt.Outcome.SCHEDULED,
+            )
+        )
+        assert account.pk not in supervisor.processes
+        assert [attempt.pk for attempt in pending] == [successor.pk]
+        assert not RestartAttempt.objects.filter(
+            incident=incident,
+            attempt_number=3,
+        ).exists()
+        assert state.current_run_id is None
+        assert state.advisory_pid is None
+        assert state.worker_id == ""
+        assert state.stable_since is None
+        assert "post-spawn database failure" in state.last_error
+        assert state.retry_count == 1
+        assert state.next_retry_at == successor.scheduled_at
+
+        factory.fail_terminate = False
+        assert supervisor._perform_due_recoveries() == 1
+        successor.refresh_from_db()
+        state.refresh_from_db()
+        assert successor.outcome == RestartAttempt.Outcome.STARTED
+        assert state.retry_count == 2
+        assert len(factory.processes) == 2
+
+        supervisor.check_health()
+        successor.refresh_from_db()
+        incident.refresh_from_db()
+        assert successor.outcome == RestartAttempt.Outcome.SUCCEEDED
+        assert incident.status == MinerIncident.Status.RECOVERED
+    finally:
+        supervisor.shutdown()
+
+
+@pytest.mark.django_db
+def test_reset_retry_sequence_allocates_new_incident_ordinal_and_recovers(
+    tmp_path,
+    settings,
+):
+    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    clock = FakeClock()
+    factory = ProcessFactory()
+    supervisor = make_supervisor(clock, factory)
+    supervisor.startup()
+    try:
+        account = MinerAccount.objects.get(config_key="primary")
+        state = MinerInstanceState.objects.get(account=account)
+        state.desired_state = MinerInstanceState.DesiredState.RUNNING
+        state.observed_state = MinerInstanceState.ObservedState.DEGRADED
+        state.retry_count = 0
+        state.save()
+        incident = MinerIncident.objects.create(
+            account=account,
+            kind=MinerIncident.Kind.UNEXPECTED_EXIT,
+            status=MinerIncident.Status.OPEN,
+            summary="Recovery sequence was reset.",
+        )
+        RestartAttempt.objects.create(
+            incident=incident,
+            attempt_number=1,
+            scheduled_at=clock.now(),
+            started_at=clock.now(),
+            finished_at=clock.now(),
+            outcome=RestartAttempt.Outcome.FAILED,
+            error="Earlier failure before sequence reset.",
+        )
+
+        scheduled = supervisor._schedule_recovery(state, incident)
+        state.refresh_from_db()
+        assert scheduled.attempt_number == 2
+        assert scheduled.outcome == RestartAttempt.Outcome.SCHEDULED
+        assert state.retry_count == 0
+        assert state.next_retry_at == clock.now()
+        assert RestartAttempt.objects.filter(
+            incident=incident,
+            outcome=RestartAttempt.Outcome.SCHEDULED,
+        ).count() == 1
+
+        assert supervisor._perform_due_recoveries() == 1
+        state.refresh_from_db()
+        scheduled.refresh_from_db()
+        assert state.retry_count == 1
+        assert scheduled.outcome == RestartAttempt.Outcome.STARTED
+        assert account.pk in supervisor.processes
+
+        supervisor.check_health()
+        incident.refresh_from_db()
+        scheduled.refresh_from_db()
+        assert scheduled.outcome == RestartAttempt.Outcome.SUCCEEDED
+        assert incident.status == MinerIncident.Status.RECOVERED
+    finally:
+        supervisor.shutdown()
+
+
+@pytest.mark.django_db
 def test_failed_spawn_cleanup_is_never_promoted_and_retries_until_finalized(
     tmp_path,
     settings,
@@ -839,6 +1998,64 @@ def test_new_start_finalizes_dead_stop_tombstone_before_replacement(
 
 
 @pytest.mark.django_db
+def test_health_retry_preserves_planned_restart_reason_after_finalization_failure(
+    tmp_path,
+    settings,
+    monkeypatch,
+):
+    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    clock = FakeClock()
+    factory = ProcessFactory()
+    supervisor = make_supervisor(clock, factory)
+    supervisor.startup()
+    try:
+        account = MinerAccount.objects.get(config_key="primary")
+        enqueue_command(account, MinerCommand.Action.START)
+        supervisor.run_once(force_checks=True)
+        old_managed = supervisor.processes[account.pk]
+        old_run = MinerRun.objects.get(pk=old_managed.run_id)
+        original_close_run = supervisor._close_run
+        failed_once = False
+
+        def fail_old_run_once(run_id, *args, **kwargs):
+            nonlocal failed_once
+            if run_id == old_run.pk and not failed_once:
+                failed_once = True
+                raise OperationalError("simulated planned-stop finalization failure")
+            return original_close_run(run_id, *args, **kwargs)
+
+        monkeypatch.setattr(supervisor, "_close_run", fail_old_run_once)
+        command = enqueue_command(account, MinerCommand.Action.RESTART)
+        assert supervisor.process_pending_commands() == 1
+
+        command.refresh_from_db()
+        old_run.refresh_from_db()
+        assert command.status == MinerCommand.Status.FAILED
+        assert old_managed.process.poll() == -15
+        assert old_managed.pending_stop_reason == MinerRun.StopReason.ADMIN_RESTART
+        assert old_run.ended_at is None
+        assert supervisor.processes[account.pk] is old_managed
+
+        monkeypatch.setattr(supervisor, "_close_run", original_close_run)
+        supervisor.check_health()
+        supervisor.check_health()
+
+        old_run.refresh_from_db()
+        state = MinerInstanceState.objects.get(account=account)
+        assert old_run.stop_reason == MinerRun.StopReason.ADMIN_RESTART
+        assert state.desired_state == MinerInstanceState.DesiredState.RUNNING
+        assert state.current_run_id != old_run.pk
+        assert state.observed_state == MinerInstanceState.ObservedState.RUNNING
+        assert supervisor.processes[account.pk].run_id != old_run.pk
+        assert not MinerIncident.objects.filter(
+            account=account,
+            kind=MinerIncident.Kind.UNEXPECTED_EXIT,
+        ).exists()
+    finally:
+        supervisor.shutdown()
+
+
+@pytest.mark.django_db
 def test_crash_detected_during_admin_stop_remains_an_incident(tmp_path, settings):
     settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
     clock = FakeClock()
@@ -910,11 +2127,12 @@ def test_startup_fails_recovery_attempt_interrupted_by_worker_death(tmp_path, se
 
         supervisor.run_once(force_checks=True)
         incident.refresh_from_db()
+        successor = RestartAttempt.objects.get(incident=incident, attempt_number=2)
+        state.refresh_from_db()
         assert incident.status == MinerIncident.Status.RECOVERED
-        assert not RestartAttempt.objects.filter(
-            pk=attempt.pk,
-            outcome=RestartAttempt.Outcome.STARTED,
-        ).exists()
+        assert successor.outcome == RestartAttempt.Outcome.SUCCEEDED
+        assert successor.run_id == state.current_run_id
+        assert successor.finished_at is not None
     finally:
         supervisor.shutdown()
 
@@ -956,7 +2174,12 @@ def test_startup_resolves_scheduled_attempt_before_direct_reconciliation(
 
         supervisor.run_once(force_checks=True)
         incident.refresh_from_db()
+        successor = RestartAttempt.objects.get(incident=incident, attempt_number=2)
+        state.refresh_from_db()
         assert incident.status == MinerIncident.Status.RECOVERED
+        assert successor.outcome == RestartAttempt.Outcome.SUCCEEDED
+        assert successor.run_id == state.current_run_id
+        assert successor.finished_at is not None
         assert not RestartAttempt.objects.filter(
             incident=incident,
             outcome__in=(
@@ -964,6 +2187,70 @@ def test_startup_resolves_scheduled_attempt_before_direct_reconciliation(
                 RestartAttempt.Outcome.STARTED,
             ),
         ).exists()
+    finally:
+        supervisor.shutdown()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "action",
+    (MinerCommand.Action.START, MinerCommand.Action.RESTART),
+)
+def test_startup_queued_launch_takes_over_recovery_without_active_attempt_leak(
+    tmp_path,
+    settings,
+    action,
+):
+    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    sync_config_accounts()
+    account = MinerAccount.objects.get(config_key="primary")
+    state = MinerInstanceState.objects.get(account=account)
+    state.desired_state = MinerInstanceState.DesiredState.RUNNING
+    state.observed_state = MinerInstanceState.ObservedState.RESTARTING
+    state.next_retry_at = timezone.now() + timedelta(minutes=5)
+    state.save()
+    incident = MinerIncident.objects.create(
+        account=account,
+        kind=MinerIncident.Kind.UNEXPECTED_EXIT,
+        status=MinerIncident.Status.OPEN,
+        summary="Recovery was waiting when the worker stopped.",
+    )
+    interrupted = RestartAttempt.objects.create(
+        incident=incident,
+        attempt_number=1,
+        scheduled_at=state.next_retry_at,
+        outcome=RestartAttempt.Outcome.SCHEDULED,
+    )
+    command = enqueue_command(account, action)
+
+    clock = FakeClock()
+    factory = ProcessFactory()
+    supervisor = make_supervisor(clock, factory)
+    supervisor.startup()
+    try:
+        command.refresh_from_db()
+        interrupted.refresh_from_db()
+        successor = RestartAttempt.objects.get(incident=incident, attempt_number=2)
+        assert command.status == MinerCommand.Status.LEASED
+        assert interrupted.outcome == RestartAttempt.Outcome.FAILED
+        assert successor.outcome == RestartAttempt.Outcome.FAILED
+        assert f"explicit {action} command" in successor.error
+        assert not RestartAttempt.objects.filter(
+            incident=incident,
+            outcome__in=(
+                RestartAttempt.Outcome.SCHEDULED,
+                RestartAttempt.Outcome.STARTED,
+            ),
+        ).exists()
+        assert len(factory.processes) == 1
+
+        supervisor.run_once(force_checks=True)
+
+        command.refresh_from_db()
+        incident.refresh_from_db()
+        assert command.status == MinerCommand.Status.SUCCEEDED
+        assert incident.status == MinerIncident.Status.RECOVERED
+        assert incident.recovered_at is not None
     finally:
         supervisor.shutdown()
 

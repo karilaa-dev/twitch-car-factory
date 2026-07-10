@@ -90,7 +90,14 @@ DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
         "NAME": DATABASE_PATH,
-        "OPTIONS": {"timeout": int(os.getenv("SQLITE_BUSY_TIMEOUT_SECONDS", "30"))},
+        "OPTIONS": {
+            "timeout": int(os.getenv("SQLITE_BUSY_TIMEOUT_SECONDS", "30")),
+            # Acquire SQLite's single writer slot before an atomic block reads
+            # state. Without BEGIN IMMEDIATE, two web workers can both read a
+            # stale desired state and the later read-to-write upgrade fails
+            # immediately with SQLITE_BUSY instead of honoring busy_timeout.
+            "transaction_mode": "IMMEDIATE",
+        },
     }
 }
 

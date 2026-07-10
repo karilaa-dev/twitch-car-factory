@@ -25,7 +25,7 @@ from typing import Callable, IO, Protocol
 
 from django.conf import settings
 from django.db import IntegrityError, transaction
-from django.db.models import F, Q
+from django.db.models import F, Max, Q
 from django.utils import timezone
 
 from controller.models import (
@@ -324,7 +324,11 @@ class MinerSupervisor:
         if updated != 1:
             raise SupervisorLeaseLost("Miner supervisor lost its database lease.")
 
-        run_ids = [managed.run_id for managed in self.processes.values()]
+        run_ids = [
+            managed.run_id
+            for managed in self.processes.values()
+            if not managed.cleanup_required and managed.process.poll() is None
+        ]
         if run_ids:
             MinerInstanceState.objects.filter(
                 worker_id=self.worker_id,
@@ -359,7 +363,16 @@ class MinerSupervisor:
             self.reconcile_startup()
             self.heartbeat(force=True)
             self._started = True
+            # Recovered queued admin intent wins before automatic convergence.
+            # In particular, don't spawn a startup recovery child only to have
+            # an already-durable restart command replace it immediately.
+            self.process_pending_commands()
             self.reconcile_desired_state()
+            # Accounts with an open crash incident are deliberately skipped by
+            # direct desired-state reconciliation. Start their newly recorded
+            # recovery attempt now so a worker restart preserves the same
+            # incident/audit chain instead of silently bypassing it.
+            self._perform_due_recoveries()
         except Exception:
             WorkerLease.objects.filter(
                 name=self.lease_name,
@@ -454,6 +467,15 @@ class MinerSupervisor:
             finished_at=now,
             error="Recovery attempt was superseded by supervisor startup reconciliation.",
         )
+        for state in MinerInstanceState.objects.select_related("account").filter(
+            desired_state=MinerInstanceState.DesiredState.RUNNING,
+        ):
+            incident = MinerIncident.objects.filter(
+                account=state.account,
+                status=MinerIncident.Status.OPEN,
+            ).first()
+            if incident is not None:
+                self._schedule_recovery(state, incident, immediate=True)
         if lost_process_ownership and not self._recovered_stale_lease:
             MinerIncident.objects.create(
                 kind=MinerIncident.Kind.UNCLEAN_SUPERVISOR,
@@ -511,6 +533,45 @@ class MinerSupervisor:
             error=safe_error(error) if error else "",
         )
 
+    def _recover_incident_for_healthy_fallback(self, account_id: int) -> bool:
+        """Close an incident when all restart commands are terminal and the old child is healthy."""
+
+        managed = self.processes.get(account_id)
+        if (
+            managed is None
+            or not managed.confirmed
+            or managed.cleanup_required
+            or managed.pending_stop_reason
+            or managed.process.poll() is not None
+        ):
+            return False
+
+        with transaction.atomic():
+            state = MinerInstanceState.objects.select_for_update().get(account_id=account_id)
+            if (
+                state.desired_state != MinerInstanceState.DesiredState.RUNNING
+                or state.current_run_id != managed.run_id
+                or MinerCommand.objects.filter(
+                    account_id=account_id,
+                    action=MinerCommand.Action.RESTART,
+                    status__in=(
+                        MinerCommand.Status.QUEUED,
+                        MinerCommand.Status.LEASED,
+                    ),
+                ).exists()
+            ):
+                return False
+            return (
+                MinerIncident.objects.filter(
+                    account_id=account_id,
+                    status=MinerIncident.Status.OPEN,
+                ).update(
+                    status=MinerIncident.Status.RECOVERED,
+                    recovered_at=self.now(),
+                )
+                > 0
+            )
+
     def _is_superseded(self, command: MinerCommand) -> bool:
         return MinerCommand.objects.filter(
             account_id=command.account_id,
@@ -529,6 +590,8 @@ class MinerSupervisor:
                 MinerCommand.Status.CANCELLED,
                 "Superseded by a newer command for this account.",
             )
+            if command.action == MinerCommand.Action.RESTART:
+                self._recover_incident_for_healthy_fallback(command.account_id)
             return False
 
         state, _ = MinerInstanceState.objects.get_or_create(account=command.account)
@@ -546,6 +609,8 @@ class MinerSupervisor:
                 MinerCommand.Status.CANCELLED,
                 "Desired state changed after this command was queued.",
             )
+            if command.action == MinerCommand.Action.RESTART:
+                self._recover_incident_for_healthy_fallback(command.account_id)
             return False
         try:
             if command.action == MinerCommand.Action.STOP:
@@ -585,6 +650,8 @@ class MinerSupervisor:
             return True
         except Exception as exc:
             self._finish_command(command.pk, MinerCommand.Status.FAILED, exc)
+            if command.action == MinerCommand.Action.RESTART:
+                self._recover_incident_for_healthy_fallback(command.account_id)
             logger.exception("Miner command %s failed", command.pk)
             return False
 
@@ -856,6 +923,61 @@ class MinerSupervisor:
             raise
         return managed
 
+    def _spawn_snapshot_if_desired_running(
+        self,
+        run: MinerRun,
+        *,
+        command_id: int | None = None,
+    ) -> ManagedProcess:
+        """Linearize a controller launch with concurrent desired-state writes."""
+
+        managed: ManagedProcess | None = None
+        try:
+            with transaction.atomic():
+                state = MinerInstanceState.objects.select_for_update().get(
+                    account_id=run.account_id
+                )
+                if state.desired_state != MinerInstanceState.DesiredState.RUNNING:
+                    error = "Launch was cancelled because desired state changed before spawn."
+                    self._close_run(
+                        run.pk,
+                        returncode=None,
+                        reason=MinerRun.StopReason.START_FAILED,
+                        error=error,
+                    )
+                    state.current_run = None
+                    state.advisory_pid = None
+                    state.worker_id = ""
+                    state.stable_since = None
+                    state.next_retry_at = None
+                    state.observed_state = MinerInstanceState.ObservedState.STOPPED
+                    state.save(
+                        update_fields=(
+                            "current_run",
+                            "advisory_pid",
+                            "worker_id",
+                            "stable_since",
+                            "next_retry_at",
+                            "observed_state",
+                            "updated_at",
+                        )
+                    )
+                    raise RuntimeError(error)
+                managed = self._spawn_snapshot(run, command_id=command_id)
+        except Exception as exc:
+            owned = self.processes.get(run.account_id)
+            if owned is not None and owned.run_id == run.pk:
+                if not owned.cleanup_required:
+                    owned.cleanup_required = True
+                    owned.cleanup_error = safe_error(
+                        f"Launch ownership transaction did not commit: {exc}"
+                    )
+                self._reconcile_required_cleanup(owned)
+            raise
+        if managed is None:  # pragma: no cover - defensive invariant
+            raise RuntimeError("Launch transaction completed without a managed process.")
+        return managed
+
     def start_account(
         self,
         account: MinerAccount,
@@ -900,25 +1022,22 @@ class MinerSupervisor:
             return existing
         if existing is not None:
             returncode = existing.process.poll()
-            self._handle_unexpected_exit(
+            finalized = self._handle_unexpected_exit(
                 existing,
                 returncode,
                 schedule_recovery=command_id is None,
             )
+            if not finalized:
+                raise RuntimeError(
+                    "An existing miner exit is still awaiting durable bookkeeping; "
+                    "a replacement will not start yet."
+                )
             if command_id is None:
                 raise RuntimeError(
                     "An existing miner exit was detected and scheduled for supervised recovery."
                 )
 
         state, _ = MinerInstanceState.objects.get_or_create(account=account)
-        if reset_failures:
-            state.retry_count = 0
-            state.next_retry_at = None
-            state.last_error = ""
-            state.save(
-                update_fields=("retry_count", "next_retry_at", "last_error", "updated_at")
-            )
-
         if not account.is_configured:
             error = "Account is not present in the current config.yaml."
             state.observed_state = MinerInstanceState.ObservedState.DEGRADED
@@ -931,22 +1050,62 @@ class MinerSupervisor:
             )
             raise ValueError(error)
 
+        run: MinerRun | None = None
+        recovery_taken_over = False
         try:
             run = prepared_run or services.create_launch_snapshot(
                 account,
                 worker_id=self.worker_id,
             )
-            return self._spawn_snapshot(run, command_id=command_id)
+            state = self._take_over_recovery(
+                account,
+                operation="start",
+                reset_failures=reset_failures,
+            )
+            recovery_taken_over = True
+            return self._spawn_snapshot_if_desired_running(run, command_id=command_id)
         except Exception as exc:
+            if run is not None:
+                owned = self.processes.get(account.pk)
+                if owned is None or owned.run_id != run.pk:
+                    self._finalize_or_remember(
+                        run_id=run.pk,
+                        account_id=run.account_id,
+                        returncode=None,
+                        reason=MinerRun.StopReason.START_FAILED,
+                        error=exc,
+                    )
             state.refresh_from_db()
-            state.observed_state = MinerInstanceState.ObservedState.DEGRADED
             state.last_error = safe_error(exc)
-            state.next_retry_at = self.now() + timedelta(
-                seconds=self.options.degraded_retry_seconds
-            )
-            state.save(
-                update_fields=("observed_state", "last_error", "next_retry_at", "updated_at")
-            )
+            if state.desired_state == MinerInstanceState.DesiredState.STOPPED:
+                state.observed_state = MinerInstanceState.ObservedState.STOPPED
+                state.next_retry_at = None
+                state.save(
+                    update_fields=(
+                        "observed_state",
+                        "next_retry_at",
+                        "last_error",
+                        "updated_at",
+                    )
+                )
+            elif not recovery_taken_over and self._scheduled_recovery_attempt(account):
+                # Validation failed before command takeover. Preserve the exact
+                # rapid attempt/deadline that was already durable.
+                state.save(update_fields=("last_error", "updated_at"))
+            else:
+                state.observed_state = MinerInstanceState.ObservedState.DEGRADED
+                state.next_retry_at = self.now() + timedelta(
+                    seconds=self.options.degraded_retry_seconds
+                )
+                state.save(
+                    update_fields=(
+                        "observed_state",
+                        "last_error",
+                        "next_retry_at",
+                        "updated_at",
+                    )
+                )
+                self._schedule_open_recovery_if_unowned(account, state)
             raise
 
     def _close_run(
@@ -975,6 +1134,83 @@ class MinerSupervisor:
                 "A newer lifecycle command stopped this startup.",
             )
 
+    def _take_over_recovery(
+        self,
+        account: MinerAccount,
+        *,
+        operation: str,
+        reset_failures: bool,
+        preserve_attempt_id: int | None = None,
+    ) -> MinerInstanceState:
+        """Atomically transfer an open incident from auto-recovery to a validated launch."""
+
+        now = self.now()
+        with transaction.atomic():
+            state, _ = MinerInstanceState.objects.select_for_update().get_or_create(
+                account=account
+            )
+            active_attempts = RestartAttempt.objects.filter(
+                incident__account=account,
+                incident__status=MinerIncident.Status.OPEN,
+                outcome__in=(
+                    RestartAttempt.Outcome.SCHEDULED,
+                    RestartAttempt.Outcome.STARTED,
+                ),
+            )
+            if preserve_attempt_id is not None:
+                # A live recovery child keeps its STARTED attempt until its
+                # termination actually succeeds. If signaling fails, that same
+                # child can still confirm and record SUCCEEDED truthfully.
+                active_attempts = active_attempts.exclude(pk=preserve_attempt_id)
+            active_attempts.update(
+                outcome=RestartAttempt.Outcome.FAILED,
+                finished_at=now,
+                error=f"Recovery attempt was superseded by an explicit {operation} command.",
+            )
+            if reset_failures:
+                state.retry_count = 0
+            state.next_retry_at = None
+            state.last_error = ""
+            state.save(
+                update_fields=(
+                    "retry_count",
+                    "next_retry_at",
+                    "last_error",
+                    "updated_at",
+                )
+            )
+        return state
+
+    def _scheduled_recovery_attempt(self, account: MinerAccount) -> RestartAttempt | None:
+        return (
+            RestartAttempt.objects.filter(
+                incident__account=account,
+                incident__status=MinerIncident.Status.OPEN,
+                outcome=RestartAttempt.Outcome.SCHEDULED,
+            )
+            .order_by("scheduled_at", "attempt_number", "id")
+            .first()
+        )
+
+    def _schedule_open_recovery_if_unowned(
+        self,
+        account: MinerAccount,
+        state: MinerInstanceState,
+    ) -> bool:
+        if (
+            self.processes.get(account.pk) is not None
+            or state.desired_state != MinerInstanceState.DesiredState.RUNNING
+        ):
+            return False
+        incident = MinerIncident.objects.filter(
+            account=account,
+            status=MinerIncident.Status.OPEN,
+        ).first()
+        if incident is None:
+            return False
+        self._schedule_recovery(state, incident)
+        return True
+
     def stop_account(
         self,
         account: MinerAccount,
@@ -992,12 +1228,16 @@ class MinerSupervisor:
                 # The child died before this planned operation reached it. The
                 # exit is still an accident and must not be rewritten as an
                 # admin/config stop merely because detection raced a command.
-                self._handle_unexpected_exit(
+                finalized = self._handle_unexpected_exit(
                     managed,
                     existing_returncode,
                     schedule_recovery=False,
                     record_when_stopped=True,
                 )
+                if not finalized:
+                    raise RuntimeError(
+                        "The exited miner is still awaiting durable bookkeeping."
+                    )
                 state.refresh_from_db()
                 managed = None
 
@@ -1027,6 +1267,10 @@ class MinerSupervisor:
                 raise
             managed.pending_stop_reason = managed.pending_stop_reason or reason
             managed.pending_stop_forced = forced
+            self._fail_restart_attempt(
+                managed.restart_attempt_id,
+                f"Recovery attempt was superseded by planned stop reason {reason}.",
+            )
             try:
                 self._close_run(
                     managed.run_id,
@@ -1103,20 +1347,34 @@ class MinerSupervisor:
             raise RuntimeError(
                 "A previous launch is still awaiting durable run finalization; "
                 "a replacement will not restart yet."
-            )
-        # This validation and immutable snapshot happen before a healthy child
-        # is touched.  Bad YAML or an empty preset therefore cannot cause an
-        # avoidable outage.
-        run = prepared_run or services.create_launch_snapshot(account, worker_id=self.worker_id)
-        state, _ = MinerInstanceState.objects.get_or_create(account=account)
-        if reset_failures:
-            state.retry_count = 0
-            state.next_retry_at = None
-        state.observed_state = MinerInstanceState.ObservedState.RESTARTING
-        state.save(
-            update_fields=("retry_count", "next_retry_at", "observed_state", "updated_at")
         )
+        run: MinerRun | None = None
+        state: MinerInstanceState | None = None
+        recovery_taken_over = False
         try:
+            # Validation and the immutable snapshot happen before a healthy
+            # child or active recovery attempt is touched. Bad YAML or an empty
+            # preset therefore cannot cancel working recovery or cause an
+            # avoidable outage.
+            run = prepared_run or services.create_launch_snapshot(
+                account,
+                worker_id=self.worker_id,
+            )
+            existing = self.processes.get(account.pk)
+            preserve_attempt_id = (
+                existing.restart_attempt_id
+                if existing is not None and existing.process.poll() is None
+                else None
+            )
+            state = self._take_over_recovery(
+                account,
+                operation="restart",
+                reset_failures=reset_failures,
+                preserve_attempt_id=preserve_attempt_id,
+            )
+            recovery_taken_over = True
+            state.observed_state = MinerInstanceState.ObservedState.RESTARTING
+            state.save(update_fields=("observed_state", "updated_at"))
             self.stop_account(
                 account,
                 reason=reason,
@@ -1124,10 +1382,10 @@ class MinerSupervisor:
                 final_observed=MinerInstanceState.ObservedState.RESTARTING,
                 except_command_id=command_id,
             )
-            return self._spawn_snapshot(run, command_id=command_id)
+            return self._spawn_snapshot_if_desired_running(run, command_id=command_id)
         except Exception as exc:
             owned = self.processes.get(account.pk)
-            if owned is None or owned.run_id != run.pk:
+            if run is not None and (owned is None or owned.run_id != run.pk):
                 self._finalize_or_remember(
                     run_id=run.pk,
                     account_id=run.account_id,
@@ -1135,15 +1393,58 @@ class MinerSupervisor:
                     reason=MinerRun.StopReason.START_FAILED,
                     error=exc,
                 )
-            state.refresh_from_db()
-            state.observed_state = MinerInstanceState.ObservedState.DEGRADED
-            state.last_error = safe_error(exc)
-            state.next_retry_at = self.now() + timedelta(
-                seconds=self.options.degraded_retry_seconds
-            )
-            state.save(
-                update_fields=("observed_state", "last_error", "next_retry_at", "updated_at")
-            )
+            try:
+                state, _ = MinerInstanceState.objects.get_or_create(account=account)
+                state.refresh_from_db()
+                old_child_is_alive = (
+                    owned is not None
+                    and (run is None or owned.run_id != run.pk)
+                    and owned.process.poll() is None
+                )
+                state.last_error = safe_error(exc)
+                if state.desired_state == MinerInstanceState.DesiredState.STOPPED:
+                    state.observed_state = MinerInstanceState.ObservedState.STOPPED
+                    state.next_retry_at = None
+                    state.save(
+                        update_fields=(
+                            "observed_state",
+                            "last_error",
+                            "next_retry_at",
+                            "updated_at",
+                        )
+                    )
+                elif not recovery_taken_over and self._scheduled_recovery_attempt(account):
+                    # The new launch never took ownership, so its failure must
+                    # not postpone the already-scheduled rapid recovery.
+                    state.save(update_fields=("last_error", "updated_at"))
+                else:
+                    state.observed_state = (
+                        MinerInstanceState.ObservedState.RUNNING
+                        if old_child_is_alive and owned.confirmed
+                        else MinerInstanceState.ObservedState.DEGRADED
+                    )
+                    state.next_retry_at = (
+                        None
+                        if old_child_is_alive
+                        else self.now() + timedelta(seconds=self.options.degraded_retry_seconds)
+                    )
+                    state.save(
+                        update_fields=(
+                            "observed_state",
+                            "last_error",
+                            "next_retry_at",
+                            "updated_at",
+                        )
+                    )
+                    self._schedule_open_recovery_if_unowned(account, state)
+            except Exception:
+                # Preserve the original restart failure. The pending-run map or
+                # startup reconciliation still guarantees the unused snapshot
+                # will eventually close if bookkeeping remains unavailable.
+                logger.exception(
+                    "Could not persist restart failure telemetry for %s",
+                    account.config_key,
+                )
             raise
 
     # -- health, incidents, and recovery ------------------------------------
@@ -1162,14 +1463,17 @@ class MinerSupervisor:
             return incident
         detail = f"Miner run {run_id} exited with return code {returncode}."
         try:
-            return MinerIncident.objects.create(
-                account=account,
-                run_id=run_id,
-                kind=MinerIncident.Kind.UNEXPECTED_EXIT,
-                status=MinerIncident.Status.OPEN,
-                summary="Miner stopped while its desired state was running.",
-                details=safe_error(detail),
-            )
+            # Keep an IntegrityError isolated to a savepoint so callers can use
+            # this helper inside a larger atomic exit-bookkeeping transaction.
+            with transaction.atomic():
+                return MinerIncident.objects.create(
+                    account=account,
+                    run_id=run_id,
+                    kind=MinerIncident.Kind.UNEXPECTED_EXIT,
+                    status=MinerIncident.Status.OPEN,
+                    summary="Miner stopped while its desired state was running.",
+                    details=safe_error(detail),
+                )
         except IntegrityError:
             return MinerIncident.objects.get(
                 account=account,
@@ -1180,30 +1484,61 @@ class MinerSupervisor:
         self,
         state: MinerInstanceState,
         incident: MinerIncident,
+        *,
+        immediate: bool = False,
     ) -> RestartAttempt:
-        attempt_number = state.retry_count + 1
-        rapid = attempt_number <= len(self.options.rapid_restart_backoff)
-        delay = (
-            self.options.rapid_restart_backoff[attempt_number - 1]
-            if rapid
-            else self.options.degraded_retry_seconds
-        )
-        scheduled_at = self.now() + timedelta(seconds=delay)
-        attempt, _ = RestartAttempt.objects.get_or_create(
-            incident=incident,
-            attempt_number=attempt_number,
-            defaults={
-                "scheduled_at": scheduled_at,
-                "outcome": RestartAttempt.Outcome.SCHEDULED,
-            },
-        )
-        state.next_retry_at = attempt.scheduled_at
-        state.observed_state = (
-            MinerInstanceState.ObservedState.RESTARTING
-            if rapid
-            else MinerInstanceState.ObservedState.DEGRADED
-        )
-        state.save(update_fields=("next_retry_at", "observed_state", "updated_at"))
+        with transaction.atomic():
+            locked_state = MinerInstanceState.objects.select_for_update().get(pk=state.pk)
+            locked_incident = MinerIncident.objects.select_for_update().get(pk=incident.pk)
+
+            sequence_number = locked_state.retry_count + 1
+            rapid = sequence_number <= len(self.options.rapid_restart_backoff)
+            attempt = (
+                locked_incident.restart_attempts.select_for_update()
+                .filter(outcome=RestartAttempt.Outcome.SCHEDULED)
+                .order_by("scheduled_at", "attempt_number", "id")
+                .first()
+            )
+            if attempt is None:
+                # Attempt number is a durable incident audit ordinal.
+                # retry_count is the resettable rapid/degraded backoff
+                # position. Keeping them separate prevents a reset counter
+                # from reusing a FAILED row and leaving the account forever
+                # without a SCHEDULED attempt.
+                last_ordinal = (
+                    locked_incident.restart_attempts.aggregate(value=Max("attempt_number"))[
+                        "value"
+                    ]
+                    or 0
+                )
+                delay = 0 if immediate else (
+                    self.options.rapid_restart_backoff[sequence_number - 1]
+                    if rapid
+                    else self.options.degraded_retry_seconds
+                )
+                attempt = RestartAttempt.objects.create(
+                    incident=locked_incident,
+                    attempt_number=last_ordinal + 1,
+                    scheduled_at=self.now() + timedelta(seconds=delay),
+                    outcome=RestartAttempt.Outcome.SCHEDULED,
+                )
+
+            # Scheduling is idempotent. In particular, cleanup reconciliation
+            # can arrive after a failed recovery path already scheduled its
+            # successor; reusing that row preserves one deadline and one audit
+            # attempt for the next actual launch.
+            locked_state.next_retry_at = attempt.scheduled_at
+            locked_state.observed_state = (
+                MinerInstanceState.ObservedState.RESTARTING
+                if rapid
+                else MinerInstanceState.ObservedState.DEGRADED
+            )
+            locked_state.save(
+                update_fields=("next_retry_at", "observed_state", "updated_at")
+            )
+
+        state.next_retry_at = locked_state.next_retry_at
+        state.observed_state = locked_state.observed_state
         return attempt
 
     def _fail_restart_attempt(self, attempt_id: int | None, error: object) -> None:
@@ -1224,122 +1559,209 @@ class MinerSupervisor:
         *,
         schedule_recovery: bool = True,
         record_when_stopped: bool = False,
-    ) -> None:
-        self.processes.pop(managed.account_id, None)
-        self._close_run(
-            managed.run_id,
-            returncode=returncode,
-            reason=MinerRun.StopReason.UNEXPECTED_EXIT,
-            error=f"Process exited unexpectedly with return code {returncode}.",
-        )
-        if managed.command_id:
-            self._finish_command(
-                managed.command_id,
-                MinerCommand.Status.FAILED,
-                f"Miner exited during startup with return code {returncode}.",
-            )
-        self._fail_restart_attempt(
-            managed.restart_attempt_id,
-            f"Miner exited with return code {returncode}.",
-        )
+    ) -> bool:
+        try:
+            with transaction.atomic():
+                # Keep the exact dead process handle until all run/incident/state
+                # bookkeeping commits. A transient SQLite error rolls back the
+                # whole bundle and is retried by the next health pass.
+                self._close_run(
+                    managed.run_id,
+                    returncode=returncode,
+                    reason=MinerRun.StopReason.UNEXPECTED_EXIT,
+                    error=f"Process exited unexpectedly with return code {returncode}.",
+                )
+                if managed.command_id:
+                    self._finish_command(
+                        managed.command_id,
+                        MinerCommand.Status.FAILED,
+                        f"Miner exited during startup with return code {returncode}.",
+                    )
+                self._fail_restart_attempt(
+                    managed.restart_attempt_id,
+                    f"Miner exited with return code {returncode}.",
+                )
 
-        account = MinerAccount.objects.get(pk=managed.account_id)
-        state, _ = MinerInstanceState.objects.get_or_create(account=account)
-        state.current_run = None
-        state.advisory_pid = None
-        state.worker_id = ""
-        state.stable_since = None
-        state.last_error = safe_error(f"Miner exited with return code {returncode}.")
-        desired_stopped = state.desired_state == MinerInstanceState.DesiredState.STOPPED
-        if desired_stopped and not record_when_stopped:
-            state.observed_state = MinerInstanceState.ObservedState.STOPPED
-            state.next_retry_at = None
-            state.save(
-                update_fields=(
-                    "current_run",
-                    "advisory_pid",
-                    "worker_id",
-                    "stable_since",
-                    "last_error",
-                    "observed_state",
-                    "next_retry_at",
-                    "updated_at",
+                account = MinerAccount.objects.get(pk=managed.account_id)
+                state, _ = MinerInstanceState.objects.select_for_update().get_or_create(
+                    account=account
                 )
+                state.current_run = None
+                state.advisory_pid = None
+                state.worker_id = ""
+                state.stable_since = None
+                state.last_error = safe_error(f"Miner exited with return code {returncode}.")
+                # Persist ownership removal before scheduling. The scheduler
+                # reloads and locks a fresh state row, so keeping these changes
+                # only on this Python object would leave an ended run and PID
+                # displayed as current until a later launch.
+                state.save(
+                    update_fields=(
+                        "current_run",
+                        "advisory_pid",
+                        "worker_id",
+                        "stable_since",
+                        "last_error",
+                        "updated_at",
+                    )
+                )
+                desired_stopped = state.desired_state == MinerInstanceState.DesiredState.STOPPED
+                if desired_stopped and not record_when_stopped:
+                    state.observed_state = MinerInstanceState.ObservedState.STOPPED
+                    state.next_retry_at = None
+                    state.save(
+                        update_fields=(
+                            "current_run",
+                            "advisory_pid",
+                            "worker_id",
+                            "stable_since",
+                            "last_error",
+                            "observed_state",
+                            "next_retry_at",
+                            "updated_at",
+                        )
+                    )
+                else:
+                    incident = self._open_exit_incident(account, managed.run_id, returncode)
+                    if not schedule_recovery:
+                        state.observed_state = (
+                            MinerInstanceState.ObservedState.STOPPED
+                            if desired_stopped
+                            else MinerInstanceState.ObservedState.UNKNOWN
+                        )
+                        state.next_retry_at = None
+                        state.save(
+                            update_fields=(
+                                "current_run",
+                                "advisory_pid",
+                                "worker_id",
+                                "stable_since",
+                                "last_error",
+                                "observed_state",
+                                "next_retry_at",
+                                "updated_at",
+                            )
+                        )
+                        if desired_stopped:
+                            incident.status = MinerIncident.Status.RECOVERED
+                            incident.recovered_at = self.now()
+                            incident.details = safe_error(
+                                f"{incident.details} Recovery was not started because an "
+                                "intentional stop had already become the desired state."
+                            )
+                            incident.save(
+                                update_fields=(
+                                    "status",
+                                    "recovered_at",
+                                    "details",
+                                    "updated_at",
+                                )
+                            )
+                    else:
+                        self._schedule_recovery(state, incident)
+        except Exception as exc:
+            logger.exception(
+                "Unexpected-exit bookkeeping remains pending for run %s: %s",
+                managed.run_id,
+                safe_error(exc),
             )
-            return
+            return False
 
-        incident = self._open_exit_incident(account, managed.run_id, returncode)
-        if not schedule_recovery:
-            state.observed_state = (
-                MinerInstanceState.ObservedState.STOPPED
-                if desired_stopped
-                else MinerInstanceState.ObservedState.UNKNOWN
-            )
-            state.next_retry_at = None
-            state.save(
-                update_fields=(
-                    "current_run",
-                    "advisory_pid",
-                    "worker_id",
-                    "stable_since",
-                    "last_error",
-                    "observed_state",
-                    "next_retry_at",
-                    "updated_at",
-                )
-            )
-            if desired_stopped:
-                incident.status = MinerIncident.Status.RECOVERED
-                incident.recovered_at = self.now()
-                incident.details = safe_error(
-                    f"{incident.details} Recovery was not started because an intentional "
-                    "stop had already become the desired state."
-                )
-                incident.save(
-                    update_fields=("status", "recovered_at", "details", "updated_at")
-                )
-            return
-        self._schedule_recovery(state, incident)
+        if self.processes.get(managed.account_id) is managed:
+            self.processes.pop(managed.account_id, None)
+        return True
 
     def _confirm_startup(self, managed: ManagedProcess) -> None:
         now = self.now()
+        command_id = managed.command_id
+        restart_attempt_id = managed.restart_attempt_id
+        with transaction.atomic():
+            updated_run = MinerRun.objects.filter(
+                pk=managed.run_id,
+                ended_at__isnull=True,
+            ).update(startup_confirmed_at=now)
+            if updated_run != 1:
+                raise RuntimeError(
+                    f"Run {managed.run_id} could not be confirmed because it is no longer active."
+                )
+
+            state = MinerInstanceState.objects.select_for_update().get(
+                account_id=managed.account_id
+            )
+            state.observed_state = MinerInstanceState.ObservedState.RUNNING
+            state.stable_since = now
+            state.next_retry_at = None
+            state.last_error = ""
+            state.last_heartbeat = now
+            state.save(
+                update_fields=(
+                    "observed_state",
+                    "stable_since",
+                    "next_retry_at",
+                    "last_error",
+                    "last_heartbeat",
+                    "updated_at",
+                )
+            )
+
+            if command_id:
+                self._finish_command(command_id, MinerCommand.Status.SUCCEEDED)
+
+            may_close_incident = restart_attempt_id is None
+            if restart_attempt_id is not None:
+                # An explicit restart can supersede a live recovery child
+                # between spawn and confirmation. Never rewrite that terminal
+                # FAILED attempt back to SUCCEEDED or close its incident before
+                # the explicit replacement is healthy.
+                may_close_incident = (
+                    RestartAttempt.objects.filter(
+                        pk=restart_attempt_id,
+                        outcome=RestartAttempt.Outcome.STARTED,
+                    ).update(
+                        outcome=RestartAttempt.Outcome.SUCCEEDED,
+                        finished_at=now,
+                        error="",
+                    )
+                    == 1
+                )
+                if (
+                    not may_close_incident
+                    and state.desired_state == MinerInstanceState.DesiredState.RUNNING
+                ):
+                    # A validated explicit restart can supersede this attempt
+                    # and then fail to stop the still-live recovery child. If
+                    # that original child nevertheless becomes healthy after
+                    # the command is terminal, it has recovered the farm and
+                    # must not leave the incident open forever. A newer restart
+                    # keeps ownership of the incident until its own result.
+                    may_close_incident = not MinerCommand.objects.filter(
+                        account_id=managed.account_id,
+                        action=MinerCommand.Action.RESTART,
+                        status__in=(
+                            MinerCommand.Status.QUEUED,
+                            MinerCommand.Status.LEASED,
+                        ),
+                    ).exists()
+            if may_close_incident:
+                MinerIncident.objects.filter(
+                    account_id=managed.account_id,
+                    status=MinerIncident.Status.OPEN,
+                ).update(status=MinerIncident.Status.RECOVERED, recovered_at=now)
+
+        # Only publish in-memory confirmation after every durable record
+        # commits. A transient SQLite error leaves this child eligible for the
+        # next health pass to retry confirmation.
         managed.confirmed = True
-        MinerRun.objects.filter(pk=managed.run_id, ended_at__isnull=True).update(
-            startup_confirmed_at=now
-        )
-        state = MinerInstanceState.objects.get(account_id=managed.account_id)
-        state.observed_state = MinerInstanceState.ObservedState.RUNNING
-        state.stable_since = now
-        state.next_retry_at = None
-        state.last_error = ""
-        state.last_heartbeat = now
-        state.save(
-            update_fields=(
-                "observed_state",
-                "stable_since",
-                "next_retry_at",
-                "last_error",
-                "last_heartbeat",
-                "updated_at",
-            )
-        )
+        managed.command_id = None
+        managed.restart_attempt_id = None
 
-        if managed.command_id:
-            self._finish_command(managed.command_id, MinerCommand.Status.SUCCEEDED)
-            managed.command_id = None
-        if managed.restart_attempt_id:
-            RestartAttempt.objects.filter(pk=managed.restart_attempt_id).update(
-                outcome=RestartAttempt.Outcome.SUCCEEDED,
-                finished_at=now,
-                error="",
-            )
-            managed.restart_attempt_id = None
-        MinerIncident.objects.filter(
-            account_id=managed.account_id,
-            status=MinerIncident.Status.OPEN,
-        ).update(status=MinerIncident.Status.RECOVERED, recovered_at=now)
-
-    def _close_incident_for_intentional_stop(self, account: MinerAccount) -> None:
+    def _close_incident_for_intentional_stop(
+        self,
+        account: MinerAccount,
+        *,
+        attempt_error: str = "Recovery was cancelled by an intentional stop.",
+        incident_details: str = "Recovery was cancelled by an intentional admin stop.",
+    ) -> None:
         now = self.now()
         incidents = MinerIncident.objects.filter(
             account=account,
@@ -1352,12 +1774,12 @@ class MinerSupervisor:
         RestartAttempt.objects.filter(pk__in=attempt_ids).update(
             outcome=RestartAttempt.Outcome.FAILED,
             finished_at=now,
-            error="Recovery was cancelled by an intentional stop.",
+            error=attempt_error,
         )
         incidents.update(
             status=MinerIncident.Status.RECOVERED,
             recovered_at=now,
-            details="Recovery was cancelled by an intentional admin stop.",
+            details=incident_details,
         )
 
     def _reconcile_required_cleanup(self, managed: ManagedProcess) -> None:
@@ -1427,6 +1849,16 @@ class MinerSupervisor:
         state.worker_id = ""
         state.stable_since = None
         state.last_error = managed.cleanup_error
+        state.save(
+            update_fields=(
+                "current_run",
+                "advisory_pid",
+                "worker_id",
+                "stable_since",
+                "last_error",
+                "updated_at",
+            )
+        )
         incident = MinerIncident.objects.filter(
             account=account,
             status=MinerIncident.Status.OPEN,
@@ -1496,38 +1928,168 @@ class MinerSupervisor:
                 self._schedule_recovery(state, incident)
                 continue
 
-            state.retry_count = max(state.retry_count, attempt.attempt_number)
-            state.next_retry_at = None
-            state.observed_state = MinerInstanceState.ObservedState.RESTARTING
-            state.save(
-                update_fields=("retry_count", "next_retry_at", "observed_state", "updated_at")
-            )
-            attempt.started_at = now
-            attempt.outcome = RestartAttempt.Outcome.STARTED
-            attempt.save(update_fields=("started_at", "outcome"))
+            try:
+                # Claim the due attempt and its account state together. A DB
+                # failure leaves both rows scheduled/due for a clean retry.
+                with transaction.atomic():
+                    state = (
+                        MinerInstanceState.objects.select_for_update()
+                        .select_related("account")
+                        .get(pk=state.pk)
+                    )
+                    attempt = RestartAttempt.objects.select_for_update().get(pk=attempt.pk)
+                    if (
+                        state.desired_state != MinerInstanceState.DesiredState.RUNNING
+                        or state.next_retry_at is None
+                        or state.next_retry_at > now
+                        or attempt.outcome != RestartAttempt.Outcome.SCHEDULED
+                        or attempt.scheduled_at > now
+                    ):
+                        continue
+                    state.retry_count += 1
+                    state.next_retry_at = None
+                    state.observed_state = MinerInstanceState.ObservedState.RESTARTING
+                    state.save(
+                        update_fields=(
+                            "retry_count",
+                            "next_retry_at",
+                            "observed_state",
+                            "updated_at",
+                        )
+                    )
+                    attempt.started_at = now
+                    attempt.outcome = RestartAttempt.Outcome.STARTED
+                    attempt.save(update_fields=("started_at", "outcome"))
+            except Exception:
+                logger.exception(
+                    "Could not claim recovery attempt for %s",
+                    state.account.config_key,
+                )
+                continue
+
+            run: MinerRun | None = None
             try:
                 run = services.create_launch_snapshot(state.account, worker_id=self.worker_id)
                 attempt.run = run
                 attempt.save(update_fields=("run",))
-                self._spawn_snapshot(run, restart_attempt_id=attempt.pk)
+                with transaction.atomic():
+                    # Linearize manual STOP against the actual Popen and its
+                    # ownership write. If STOP committed first, cancel this
+                    # unused snapshot. If this transaction owns SQLite's writer
+                    # slot first, STOP is ordered after the launch and the
+                    # queued command will stop that owned child next.
+                    locked_state = MinerInstanceState.objects.select_for_update().get(
+                        pk=state.pk
+                    )
+                    locked_attempt = RestartAttempt.objects.select_for_update().get(
+                        pk=attempt.pk
+                    )
+                    if (
+                        locked_state.desired_state
+                        != MinerInstanceState.DesiredState.RUNNING
+                        or locked_attempt.outcome != RestartAttempt.Outcome.STARTED
+                    ):
+                        cancellation_error = (
+                            "Recovery launch was cancelled because desired state or "
+                            "attempt ownership changed before spawn."
+                        )
+                        self._close_run(
+                            run.pk,
+                            returncode=None,
+                            reason=MinerRun.StopReason.START_FAILED,
+                            error=cancellation_error,
+                        )
+                        locked_attempt.outcome = RestartAttempt.Outcome.FAILED
+                        locked_attempt.finished_at = self.now()
+                        locked_attempt.error = cancellation_error
+                        locked_attempt.save(
+                            update_fields=("outcome", "finished_at", "error")
+                        )
+                        locked_state.current_run = None
+                        locked_state.advisory_pid = None
+                        locked_state.worker_id = ""
+                        locked_state.stable_since = None
+                        locked_state.next_retry_at = None
+                        locked_state.observed_state = (
+                            MinerInstanceState.ObservedState.STOPPED
+                            if locked_state.desired_state
+                            == MinerInstanceState.DesiredState.STOPPED
+                            else MinerInstanceState.ObservedState.UNKNOWN
+                        )
+                        locked_state.save(
+                            update_fields=(
+                                "current_run",
+                                "advisory_pid",
+                                "worker_id",
+                                "stable_since",
+                                "next_retry_at",
+                                "observed_state",
+                                "updated_at",
+                            )
+                        )
+                        continue
+                    self._spawn_snapshot(run, restart_attempt_id=attempt.pk)
                 recovered += 1
             except Exception as exc:
+                provisional_cleanup: ManagedProcess | None = None
+                if run is not None:
+                    owned = self.processes.get(state.account_id)
+                    if owned is None or owned.run_id != run.pk:
+                        self._finalize_or_remember(
+                            run_id=run.pk,
+                            account_id=run.account_id,
+                            returncode=None,
+                            reason=MinerRun.StopReason.START_FAILED,
+                            error=exc,
+                        )
+                    else:
+                        # _spawn_snapshot can return before the enclosing
+                        # state-lock transaction commits. If that commit (or
+                        # any later statement in the block) fails, its child is
+                        # provisional: never let health confirm ownership that
+                        # SQLite rolled back.
+                        if not owned.cleanup_required:
+                            owned.cleanup_required = True
+                            owned.cleanup_error = safe_error(
+                                f"Recovery spawn transaction did not commit: {exc}"
+                            )
+                        provisional_cleanup = owned
                 self._fail_restart_attempt(attempt.pk, exc)
                 state.refresh_from_db()
                 state.current_run = None
                 state.advisory_pid = None
                 state.worker_id = ""
                 state.last_error = safe_error(exc)
-                state.save(
-                    update_fields=(
-                        "current_run",
-                        "advisory_pid",
-                        "worker_id",
-                        "last_error",
-                        "updated_at",
+                if state.desired_state == MinerInstanceState.DesiredState.STOPPED:
+                    state.observed_state = MinerInstanceState.ObservedState.STOPPED
+                    state.next_retry_at = None
+                    state.save(
+                        update_fields=(
+                            "current_run",
+                            "advisory_pid",
+                            "worker_id",
+                            "last_error",
+                            "observed_state",
+                            "next_retry_at",
+                            "updated_at",
+                        )
                     )
-                )
-                self._schedule_recovery(state, incident)
+                else:
+                    state.save(
+                        update_fields=(
+                            "current_run",
+                            "advisory_pid",
+                            "worker_id",
+                            "last_error",
+                            "updated_at",
+                        )
+                    )
+                    self._schedule_recovery(state, incident)
+                if (
+                    provisional_cleanup is not None
+                    and self.processes.get(state.account_id) is provisional_cleanup
+                ):
+                    self._reconcile_required_cleanup(provisional_cleanup)
                 logger.exception("Recovery attempt failed for %s", state.account.config_key)
         return recovered
 
@@ -1538,6 +2100,24 @@ class MinerSupervisor:
                 self._reconcile_required_cleanup(managed)
                 continue
             state = MinerInstanceState.objects.get(account_id=account_id)
+            if managed.pending_stop_reason:
+                # The child was already stopped intentionally, but the durable
+                # run-ending write failed. Retry that exact planned reason;
+                # never reinterpret the retained dead handle as a crash.
+                preserve_desired = (
+                    state.desired_state == MinerInstanceState.DesiredState.RUNNING
+                )
+                self.stop_account(
+                    state.account,
+                    reason=managed.pending_stop_reason,
+                    preserve_desired=preserve_desired,
+                    final_observed=(
+                        MinerInstanceState.ObservedState.RESTARTING
+                        if preserve_desired
+                        else MinerInstanceState.ObservedState.STOPPED
+                    ),
+                )
+                continue
             if state.desired_state == MinerInstanceState.DesiredState.STOPPED:
                 self.stop_account(
                     state.account,
@@ -1577,20 +2157,51 @@ class MinerSupervisor:
             if state.desired_state == MinerInstanceState.DesiredState.STOPPED:
                 if managed is not None:
                     self.stop_account(state.account, preserve_desired=False)
-                elif state.observed_state != MinerInstanceState.ObservedState.STOPPED:
-                    state.observed_state = MinerInstanceState.ObservedState.STOPPED
-                    state.advisory_pid = None
-                    state.current_run = None
-                    state.worker_id = ""
-                    state.save(
-                        update_fields=(
-                            "observed_state",
-                            "advisory_pid",
-                            "current_run",
-                            "worker_id",
-                            "updated_at",
+                else:
+                    with transaction.atomic():
+                        locked_state = (
+                            MinerInstanceState.objects.select_for_update()
+                            .select_related("account")
+                            .get(pk=state.pk)
                         )
-                    )
+                        if (
+                            locked_state.desired_state
+                            != MinerInstanceState.DesiredState.STOPPED
+                        ):
+                            continue
+                        locked_state.observed_state = (
+                            MinerInstanceState.ObservedState.STOPPED
+                        )
+                        locked_state.advisory_pid = None
+                        locked_state.current_run = None
+                        locked_state.worker_id = ""
+                        locked_state.next_retry_at = None
+                        locked_state.save(
+                            update_fields=(
+                                "observed_state",
+                                "advisory_pid",
+                                "current_run",
+                                "worker_id",
+                                "next_retry_at",
+                                "updated_at",
+                            )
+                        )
+                        if locked_state.account.is_configured:
+                            self._close_incident_for_intentional_stop(
+                                locked_state.account
+                            )
+                        else:
+                            self._close_incident_for_intentional_stop(
+                                locked_state.account,
+                                attempt_error=(
+                                    "Recovery was cancelled because the account was removed "
+                                    "from config.yaml."
+                                ),
+                                incident_details=(
+                                    "Recovery was cancelled because this account is no longer "
+                                    "configured in config.yaml."
+                                ),
+                            )
                 continue
             if managed is not None or state.next_retry_at is not None:
                 continue

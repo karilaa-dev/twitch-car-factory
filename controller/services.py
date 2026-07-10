@@ -290,10 +290,11 @@ def enqueue_command(
 
     account = MinerAccount.objects.select_for_update().get(pk=account.pk)
     state, _ = MinerInstanceState.objects.select_for_update().get_or_create(account=account)
-    pending = MinerCommand.objects.select_for_update().filter(
+    active = MinerCommand.objects.select_for_update().filter(
         account=account,
-        status=MinerCommand.Status.QUEUED,
+        status__in=(MinerCommand.Status.QUEUED, MinerCommand.Status.LEASED),
     )
+    pending = active.filter(status=MinerCommand.Status.QUEUED)
 
     desired = (
         MinerInstanceState.DesiredState.STOPPED
@@ -301,13 +302,10 @@ def enqueue_command(
         else MinerInstanceState.DesiredState.RUNNING
     )
     state.desired_state = desired
-    if action == MinerCommand.Action.RESTART:
-        state.retry_count = 0
-        state.next_retry_at = None
-        state.last_error = ""
-    state.save(
-        update_fields=("desired_state", "retry_count", "next_retry_at", "last_error", "updated_at")
-    )
+    # Recovery retry state is taken over only after the worker validates the
+    # replacement launch snapshot. This keeps automatic recovery viable when
+    # a newly requested start/restart has invalid YAML or channel data.
+    state.save(update_fields=("desired_state", "updated_at"))
 
     if action == MinerCommand.Action.STOP:
         pending.filter(action__in=(MinerCommand.Action.START, MinerCommand.Action.RESTART)).update(
@@ -328,7 +326,10 @@ def enqueue_command(
                 error="Superseded by a restart command.",
             )
 
-    command = pending.filter(action=action).order_by("created_at", "id").first()
+    # A repeated action coalesces even while the singleton worker owns the
+    # first command. Creating a second RESTART during startup grace would stop
+    # the just-launched replacement and cause a needless second outage.
+    command = active.filter(action=action).order_by("created_at", "id").first()
     if command is None:
         command = MinerCommand.objects.create(
             account=account,
