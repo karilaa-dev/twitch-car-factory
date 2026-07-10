@@ -308,6 +308,66 @@ def test_launch_snapshot_is_exact_immutable_and_secret_free(tmp_path):
 
 
 @pytest.mark.django_db
+def test_import_missing_presets_file_imports_state_with_empty_preset_list(
+    tmp_path,
+    settings,
+):
+    config_path = make_config(tmp_path, autostart=True)
+    data_dir = tmp_path / "legacy"
+    data_dir.mkdir()
+    (data_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "states": [
+                    {
+                        "user_id": "primary",
+                        "assigned_preset": "__custom__",
+                        "custom_channels": ["second", "first"],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    settings.TWITCH_FARM_COOKIES_DIR = tmp_path / "cookies"
+    output = io.StringIO()
+
+    call_command(
+        "import_legacy_data",
+        config=str(config_path),
+        data_dir=str(data_dir),
+        stdout=output,
+        stderr=io.StringIO(),
+    )
+
+    account = MinerAccount.objects.get(config_key="primary")
+    assert "Imported 0 preset(s), 1 account state(s)" in output.getvalue()
+    assert ChannelPreset.objects.count() == 0
+    assert account.selection.mode == AccountChannelSelection.Mode.CUSTOM
+    assert list(account.custom_channels.values_list("name", flat=True)) == ["second", "first"]
+    assert account.runtime_state.desired_state == MinerInstanceState.DesiredState.RUNNING
+    import_log = ActionLog.objects.get(action="legacy_import")
+    assert import_log.details["preset_count"] == 0
+    assert import_log.details["state_count"] == 1
+
+
+@pytest.mark.django_db
+def test_import_missing_presets_file_still_requires_state_file(tmp_path):
+    config_path = make_config(tmp_path)
+    data_dir = tmp_path / "legacy"
+    data_dir.mkdir()
+
+    with pytest.raises(CommandError, match="Missing legacy state file"):
+        call_command(
+            "import_legacy_data",
+            config=str(config_path),
+            data_dir=str(data_dir),
+            stdout=io.StringIO(),
+            stderr=io.StringIO(),
+        )
+
+
+@pytest.mark.django_db
 def test_import_dry_run_idempotence_orphans_and_replace(tmp_path, settings):
     config_path = make_config(tmp_path, autostart=True)
     data_dir = tmp_path / "legacy"

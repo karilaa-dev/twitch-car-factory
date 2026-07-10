@@ -113,6 +113,8 @@ cp .env.example .env
 # Set PUID/PGID in .env to the output of `id -u` and `id -g`.
 install -d -m 700 data cookies runtime
 docker compose run --rm migrate
+# Create the first Django staff login before starting the web and worker services.
+docker compose run --rm --no-deps web python manage.py createsuperuser
 docker compose --profile tools run --rm importer \
   python manage.py import_legacy_data --config /app/config.yaml --data-dir /app/data --dry-run
 docker compose --profile tools run --rm importer

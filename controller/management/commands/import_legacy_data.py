@@ -48,11 +48,18 @@ class LegacyPayload:
     digest: str
 
 
-def _read_json(path: Path, label: str) -> dict[str, Any]:
+def _read_json(
+    path: Path,
+    label: str,
+    *,
+    missing_ok: bool = False,
+) -> dict[str, Any]:
     try:
         with path.open("r", encoding="utf-8") as handle:
             value = json.load(handle)
     except FileNotFoundError as exc:
+        if missing_ok:
+            return {}
         raise CommandError(f"Missing legacy {label} file: {path}") from exc
     except OSError as exc:
         raise CommandError(f"Could not read legacy {label} file: {path}") from exc
@@ -84,7 +91,14 @@ def _legacy_mode(raw: dict[str, Any]) -> tuple[str, str | None]:
 
 
 def _parse_payload(data_dir: Path, config: FarmConfig) -> LegacyPayload:
-    preset_document = _read_json(data_dir / "presets.json", "presets")
+    # Older installations may have state.json without ever creating a preset.
+    # Treat an absent presets.json exactly like {"presets": []}; malformed or
+    # unreadable files still fail validation below rather than being ignored.
+    preset_document = _read_json(
+        data_dir / "presets.json",
+        "presets",
+        missing_ok=True,
+    )
     state_document = _read_json(data_dir / "state.json", "state")
     raw_presets = preset_document.get("presets", [])
     raw_states = state_document.get("states", [])
