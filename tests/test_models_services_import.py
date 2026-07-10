@@ -13,6 +13,7 @@ from django.core.exceptions import ValidationError
 from django.core.management import call_command
 from django.core.management.base import CommandError
 
+from controller.apps import configure_sqlite_connection
 from controller.config import FarmConfig, TwitchUserConfig, get_account_credentials, load_config
 from controller.models import (
     AccountChannelSelection,
@@ -56,6 +57,35 @@ twitch_users:
         encoding="utf-8",
     )
     return path
+
+
+def test_sqlite_connection_pragmas_honor_configured_busy_timeout():
+    statements: list[str] = []
+
+    class RecordingCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def execute(self, statement):
+            statements.append(statement)
+
+    class FakeConnection:
+        vendor = "sqlite"
+        settings_dict = {"OPTIONS": {"timeout": 7.25}}
+
+        def cursor(self):
+            return RecordingCursor()
+
+    configure_sqlite_connection(sender=None, connection=FakeConnection())
+
+    assert statements == [
+        "PRAGMA journal_mode=WAL",
+        "PRAGMA synchronous=FULL",
+        "PRAGMA busy_timeout=7250",
+    ]
 
 
 @pytest.mark.django_db
