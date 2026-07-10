@@ -8,6 +8,7 @@ from django.urls import reverse
 from django.utils import timezone
 
 from controller.models import (
+    AccountCustomChannel,
     AccountChannelSelection,
     ActionLog,
     ChannelPreset,
@@ -312,6 +313,76 @@ class WebViewTests(TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertContains(response, "Add at least one channel", status_code=400)
+        self.account.refresh_from_db()
+        self.state.refresh_from_db()
+        self.assertEqual(self.account.channel_revision, old_revision)
+        self.assertEqual(self.state.current_run, current_run)
+        self.assertEqual(self.state.desired_state, MinerInstanceState.DesiredState.RUNNING)
+        self.assertEqual(MinerCommand.objects.count(), 0)
+
+    def test_default_and_preset_modes_ignore_invalid_unused_custom_draft(self):
+        self.login()
+        preset = self.create_preset(name="Weekend")
+        selection = self.account.selection
+        selection.mode = AccountChannelSelection.Mode.CUSTOM
+        selection.save(update_fields=("mode", "updated_at"))
+        AccountCustomChannel.objects.create(
+            account=self.account,
+            position=0,
+            name="saved_channel",
+        )
+        old_revision = self.account.channel_revision
+
+        cases = (
+            (AccountChannelSelection.Mode.DEFAULT, "", None),
+            (AccountChannelSelection.Mode.PRESET, str(preset.pk), preset.pk),
+        )
+        for mode, preset_value, expected_preset_id in cases:
+            with self.subTest(mode=mode):
+                selection.mode = AccountChannelSelection.Mode.CUSTOM
+                selection.preset = None
+                selection.save(update_fields=("mode", "preset", "updated_at"))
+
+                response = self.client.post(
+                    reverse("controller:account_channel_selection", args=[self.account.pk]),
+                    {
+                        "mode": mode,
+                        "preset": preset_value,
+                        "custom_channels": "invalid unused draft!",
+                    },
+                )
+
+                self.assertRedirects(
+                    response,
+                    reverse("controller:account_detail", args=[self.account.pk]),
+                )
+                selection.refresh_from_db()
+                self.assertEqual(selection.mode, mode)
+                self.assertEqual(selection.preset_id, expected_preset_id)
+                self.assertEqual(
+                    list(self.account.custom_channels.values_list("name", flat=True)),
+                    ["saved_channel"],
+                )
+
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.channel_revision, old_revision + len(cases))
+
+    def test_custom_mode_still_rejects_invalid_channel_names(self):
+        self.login()
+        current_run = self.create_run(channels=["known_good"])
+        old_revision = self.account.channel_revision
+
+        response = self.client.post(
+            reverse("controller:account_channel_selection", args=[self.account.pk]),
+            {
+                "mode": AccountChannelSelection.Mode.CUSTOM,
+                "preset": "",
+                "custom_channels": "valid_channel\ninvalid channel!",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertContains(response, "Invalid Twitch channel name", status_code=400)
         self.account.refresh_from_db()
         self.state.refresh_from_db()
         self.assertEqual(self.account.channel_revision, old_revision)

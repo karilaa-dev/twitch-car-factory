@@ -10,11 +10,13 @@ x-app: &app
     DJANGO_DEBUG: ${DJANGO_DEBUG:-0}
     DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1,[::1]}
     DJANGO_CSRF_TRUSTED_ORIGINS: ${DJANGO_CSRF_TRUSTED_ORIGINS:-}
-    DJANGO_SECURE_COOKIES: ${DJANGO_SECURE_COOKIES:-1}
-    DJANGO_SECURE_SSL_REDIRECT: ${DJANGO_SECURE_SSL_REDIRECT:-1}
-    DJANGO_SECURE_HSTS_SECONDS: ${DJANGO_SECURE_HSTS_SECONDS:-31536000}
-    DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS: ${DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS:-1}
-    DJANGO_SECURE_HSTS_PRELOAD: ${DJANGO_SECURE_HSTS_PRELOAD:-1}
+    # Gunicorn is published as loopback HTTP by this file. Enable these only
+    # when an external TLS proxy is configured as described in README.md.
+    DJANGO_SECURE_COOKIES: ${DJANGO_SECURE_COOKIES:-0}
+    DJANGO_SECURE_SSL_REDIRECT: ${DJANGO_SECURE_SSL_REDIRECT:-0}
+    DJANGO_SECURE_HSTS_SECONDS: ${DJANGO_SECURE_HSTS_SECONDS:-0}
+    DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS: ${DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS:-0}
+    DJANGO_SECURE_HSTS_PRELOAD: ${DJANGO_SECURE_HSTS_PRELOAD:-0}
     TWITCH_FARM_DB: /app/data/db.sqlite3
     TWITCH_FARM_CONFIG: /app/config.yaml
     TWITCH_FARM_COOKIES_DIR: /app/cookies
@@ -47,7 +49,10 @@ services:
           import os, urllib.request;
           allowed = [host.strip() for host in os.environ.get('DJANGO_ALLOWED_HOSTS', '').split(',') if host.strip()];
           host = next((candidate.lstrip('.') for candidate in allowed if candidate != '*'), 'localhost');
-          request = urllib.request.Request('http://127.0.0.1:8000/healthz/', headers={'Host': host, 'X-Forwarded-Proto': 'https'});
+          headers = {'Host': host};
+          secure_redirect = os.environ.get('DJANGO_SECURE_SSL_REDIRECT', '0').strip().lower() in {'1', 'true', 'yes', 'on'};
+          headers.update({'X-Forwarded-Proto': 'https'} if secure_redirect else {});
+          request = urllib.request.Request('http://127.0.0.1:8000/healthz/', headers=headers);
           urllib.request.urlopen(request, timeout=3)
       interval: 15s
       timeout: 5s

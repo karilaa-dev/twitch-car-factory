@@ -141,7 +141,9 @@ class AccountChannelSelectionForm(forms.Form):
         mode = cleaned_data.get("mode")
         preset = cleaned_data.get("preset")
         raw_custom = cleaned_data.get("custom_channels", "")
-        custom_channels = _normalize_channels(raw_custom, require_nonempty=False)
+        custom_channels = []
+        if mode == AccountChannelSelection.Mode.CUSTOM:
+            custom_channels = _normalize_channels(raw_custom, require_nonempty=False)
 
         if mode == AccountChannelSelection.Mode.PRESET and preset is None:
             self.add_error("preset", "Choose a preset for preset mode.")

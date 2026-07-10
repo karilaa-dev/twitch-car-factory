@@ -109,7 +109,7 @@ changed imported controller data.
 
 ```bash
 cp .env.example .env
-# Set a strong DJANGO_SECRET_KEY and the real hostname/origin.
+# Set a strong DJANGO_SECRET_KEY.
 # Set PUID/PGID in .env to the output of `id -u` and `id -g`.
 install -d -m 700 data cookies runtime
 docker compose run --rm migrate
@@ -120,6 +120,21 @@ docker compose --profile tools run --rm importer \
 docker compose --profile tools run --rm importer
 docker compose up -d web worker
 ```
+
+The shipped port is bound to loopback and serves direct HTTP. With the default
+`.env.example` values, open <http://127.0.0.1:8000/>; secure cookies, HTTPS
+redirects, and HSTS are deliberately disabled so login works without a TLS
+listener.
+
+For external access, put Gunicorn behind a TLS-terminating reverse proxy such
+as Caddy. Set `DJANGO_ALLOWED_HOSTS` to the public hostname,
+`DJANGO_CSRF_TRUSTED_ORIGINS` to its full `https://` origin, and set
+`DJANGO_SECURE_COOKIES=1` plus `DJANGO_SECURE_SSL_REDIRECT=1`. After HTTPS is
+working reliably, set `DJANGO_SECURE_HSTS_SECONDS` to the intended policy
+(commonly `31536000`). Enable HSTS subdomains or preload only when every
+affected hostname is permanently HTTPS. The proxy must replace
+`X-Forwarded-Proto` with the actual client scheme; Django trusts that header to
+identify secure requests.
 
 The services share `./data`, but only the worker/importer mount `config.yaml`
 and the original cookies; those secret-source mounts are read-only. Each miner
@@ -151,9 +166,8 @@ docker compose config --quiet
 
 ## Production notes
 
-- Set `DJANGO_DEBUG=0`, a strong `DJANGO_SECRET_KEY`, the external host, trusted
-  HTTPS origin, and secure cookies in `.env`.
-- Put Gunicorn behind Caddy or another TLS reverse proxy.
+- Keep the direct Compose port on loopback. For external access, use the TLS
+  proxy and explicit secure-setting opt-ins described above.
 - Back up `data/db.sqlite3` with SQLite's online backup mechanism or while the
   services are stopped; copying a live WAL database as one file is not safe.
 - Dashboard incidents replace Telegram alerts in this release. Email/webhook

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
@@ -20,21 +22,31 @@ class ComposeHealthcheckTests(SimpleTestCase):
         self.assertEqual(command[:3], ["CMD", "python", "-c"])
 
         cases = (
-            ("farm.example.com", "farm.example.com"),
-            (".example.com", "example.com"),
-            ("*", "localhost"),
-            ("*,.example.com", "example.com"),
-            ("[::1]", "[::1]"),
+            ("farm.example.com", "farm.example.com", "0", None),
+            (".example.com", "example.com", "0", None),
+            ("*", "localhost", "0", None),
+            ("*,.example.com", "example.com", "0", None),
+            ("[::1]", "[::1]", "0", None),
+            ("farm.example.com", "farm.example.com", "1", "https"),
         )
-        for allowed_hosts, expected_host in cases:
-            with self.subTest(allowed_hosts=allowed_hosts):
+        for allowed_hosts, expected_host, secure_redirect, expected_proto in cases:
+            with self.subTest(
+                allowed_hosts=allowed_hosts,
+                secure_redirect=secure_redirect,
+            ):
                 requests = []
 
                 def capture_request(request, *, timeout):
                     requests.append((request, timeout))
 
                 with (
-                    patch.dict(os.environ, {"DJANGO_ALLOWED_HOSTS": allowed_hosts}),
+                    patch.dict(
+                        os.environ,
+                        {
+                            "DJANGO_ALLOWED_HOSTS": allowed_hosts,
+                            "DJANGO_SECURE_SSL_REDIRECT": secure_redirect,
+                        },
+                    ),
                     patch("urllib.request.urlopen", side_effect=capture_request),
                 ):
                     exec(command[3], {})
@@ -43,8 +55,92 @@ class ComposeHealthcheckTests(SimpleTestCase):
                 request, timeout = requests[0]
                 self.assertEqual(request.full_url, "http://127.0.0.1:8000/healthz/")
                 self.assertEqual(request.get_header("Host"), expected_host)
-                self.assertEqual(request.get_header("X-forwarded-proto"), "https")
+                self.assertEqual(request.get_header("X-forwarded-proto"), expected_proto)
                 self.assertEqual(timeout, 3)
+
+
+class ComposeSecurityDefaultsTests(SimpleTestCase):
+    security_environment = {
+        "DJANGO_SECURE_COOKIES": "${DJANGO_SECURE_COOKIES:-0}",
+        "DJANGO_SECURE_SSL_REDIRECT": "${DJANGO_SECURE_SSL_REDIRECT:-0}",
+        "DJANGO_SECURE_HSTS_SECONDS": "${DJANGO_SECURE_HSTS_SECONDS:-0}",
+        "DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS": (
+            "${DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS:-0}"
+        ),
+        "DJANGO_SECURE_HSTS_PRELOAD": "${DJANGO_SECURE_HSTS_PRELOAD:-0}",
+    }
+
+    def test_compose_and_example_environment_default_to_direct_http(self):
+        compose = yaml.safe_load(
+            (Path(settings.BASE_DIR) / "docker-compose.yml").read_text(encoding="utf-8")
+        )
+        web_environment = compose["services"]["web"]["environment"]
+        self.assertEqual(
+            {name: web_environment[name] for name in self.security_environment},
+            self.security_environment,
+        )
+
+        example_values = {}
+        for line in (Path(settings.BASE_DIR) / ".env.example").read_text(
+            encoding="utf-8"
+        ).splitlines():
+            if line and not line.startswith("#") and "=" in line:
+                name, value = line.split("=", 1)
+                example_values[name] = value
+
+        self.assertEqual(example_values["DJANGO_ALLOWED_HOSTS"], "localhost,127.0.0.1,[::1]")
+        self.assertEqual(example_values["DJANGO_CSRF_TRUSTED_ORIGINS"], "")
+        self.assertEqual(
+            {name: example_values[name] for name in self.security_environment},
+            dict.fromkeys(self.security_environment, "0"),
+        )
+
+    def test_non_compose_production_defaults_remain_https_strict(self):
+        environment = os.environ.copy()
+        for name in self.security_environment:
+            environment.pop(name, None)
+        environment.update(
+            {
+                "DJANGO_SETTINGS_MODULE": "twitch_farm.settings",
+                "DJANGO_DEBUG": "0",
+                "DJANGO_SECRET_KEY": (
+                    "standalone-production-default-test-abcdefghijklmnopqrstuvwxyz-0123456789"
+                ),
+            }
+        )
+        script = """
+import json
+from django.conf import settings
+print(json.dumps({
+    "session_cookie_secure": settings.SESSION_COOKIE_SECURE,
+    "csrf_cookie_secure": settings.CSRF_COOKIE_SECURE,
+    "ssl_redirect": settings.SECURE_SSL_REDIRECT,
+    "hsts_seconds": settings.SECURE_HSTS_SECONDS,
+    "hsts_include_subdomains": settings.SECURE_HSTS_INCLUDE_SUBDOMAINS,
+    "hsts_preload": settings.SECURE_HSTS_PRELOAD,
+}))
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=settings.BASE_DIR,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "session_cookie_secure": True,
+                "csrf_cookie_secure": True,
+                "ssl_redirect": True,
+                "hsts_seconds": 31536000,
+                "hsts_include_subdomains": True,
+                "hsts_preload": True,
+            },
+        )
 
 
 class DockerWorkflowTests(SimpleTestCase):
@@ -83,26 +179,108 @@ class DockerWorkflowTests(SimpleTestCase):
             check=False,
         )
 
-    def test_arm64_emulation_is_installed_before_buildx(self):
+    def test_smoke_gate_runs_before_registry_login_and_multiarch_publish(self):
         workflow = self.workflow()
         steps = workflow["jobs"]["build-and-push"]["steps"]
         uses = [step.get("uses") for step in steps]
 
         qemu_index = uses.index("docker/setup-qemu-action@v4")
         buildx_index = uses.index("docker/setup-buildx-action@v3")
+        build_indexes = [
+            index
+            for index, value in enumerate(uses)
+            if value == "docker/build-push-action@v6"
+        ]
+        self.assertEqual(len(build_indexes), 2)
+        smoke_build_index, publish_build_index = build_indexes
+        smoke_run_index = next(
+            index
+            for index, step in enumerate(steps)
+            if step.get("name") == "Run fresh-volume crash/recovery smoke"
+        )
         tags_index = next(index for index, step in enumerate(steps) if step.get("id") == "tags")
         login_index = uses.index("docker/login-action@v3")
-        build_index = uses.index("docker/build-push-action@v6")
 
         self.assertLess(qemu_index, buildx_index)
         self.assertLess(buildx_index, tags_index)
-        self.assertLess(tags_index, login_index)
-        self.assertLess(login_index, build_index)
+        self.assertLess(tags_index, smoke_build_index)
+        self.assertLess(smoke_build_index, smoke_run_index)
+        self.assertLess(smoke_run_index, login_index)
+        self.assertLess(login_index, publish_build_index)
         self.assertEqual(steps[qemu_index]["with"]["platforms"], "arm64")
         self.assertEqual(
-            steps[build_index]["with"]["platforms"],
+            steps[smoke_build_index]["with"],
+            {
+                "context": ".",
+                "load": True,
+                "platforms": "linux/amd64",
+                "tags": "twitch-farm-smoke:${{ github.sha }}",
+                "provenance": False,
+                "sbom": False,
+            },
+        )
+        self.assertEqual(
+            steps[smoke_run_index]["env"],
+            {"SMOKE_IMAGE": "twitch-farm-smoke:${{ github.sha }}"},
+        )
+        self.assertEqual(steps[smoke_run_index]["timeout-minutes"], 5)
+        self.assertEqual(
+            steps[smoke_run_index]["run"],
+            'bash tests/docker_crash_recovery_smoke.sh "$SMOKE_IMAGE"',
+        )
+        self.assertTrue(steps[publish_build_index]["with"]["push"])
+        self.assertEqual(steps[publish_build_index]["with"]["context"], ".")
+        self.assertEqual(
+            steps[publish_build_index]["with"]["platforms"],
             "linux/amd64,linux/arm64",
         )
+
+    def test_smoke_gate_uses_dummy_config_and_disposable_state(self):
+        script = (
+            Path(settings.BASE_DIR) / "tests/docker_crash_recovery_smoke.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("config.yaml.example", script)
+        self.assertIn("TWITCH_FARM_FAKE_MINER=1", script)
+        self.assertIn('docker volume create "$DATA_VOLUME"', script)
+        self.assertIn("trap cleanup EXIT", script)
+        self.assertIn('docker volume rm "$DATA_VOLUME"', script)
+        self.assertIn("run_with_timeout()", script)
+        self.assertIn("TRACKED_CONTAINERS=(", script)
+        self.assertIn("cleanup_failed=0", script)
+        self.assertIn("status=1", script)
+        self.assertNotIn("docker run --rm", script)
+        lines = script.splitlines()
+        unbounded_docker_calls = [
+            line
+            for index, line in enumerate(lines)
+            if line.lstrip().startswith("docker ")
+            and not (
+                index > 0
+                and "run_with_timeout" in lines[index - 1]
+                and lines[index - 1].rstrip().endswith("\\")
+            )
+        ]
+        self.assertFalse(unbounded_docker_calls)
+        for container in (
+            "MIGRATE_CONTAINER",
+            "SYNC_CONTAINER",
+            "ENQUEUE_CONTAINER",
+            "WORKER",
+        ):
+            self.assertIn(f'--name "${container}"', script)
+        self.assertIn("'YOUR_PASSWORD_HERE' not in encoded", script)
+        self.assertIn("b'YOUR_PASSWORD_HERE' in part", script)
+        self.assertIn("part.startswith(b'--channel')", script)
+        self.assertNotIn("/app/cookies", script)
+
+        syntax = subprocess.run(
+            ["/bin/bash", "-n", str(Path(settings.BASE_DIR) / "tests/docker_crash_recovery_smoke.sh")],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
 
     def test_release_permissions_are_scoped_per_job(self):
         workflow = self.workflow()
@@ -116,6 +294,15 @@ class DockerWorkflowTests(SimpleTestCase):
             workflow["jobs"]["build-and-push"]["permissions"],
             {"contents": "read", "packages": "write"},
         )
+        checkout_steps = [
+            step
+            for job in workflow["jobs"].values()
+            for step in job["steps"]
+            if step.get("uses") == "actions/checkout@v4"
+        ]
+        self.assertEqual(len(checkout_steps), 2)
+        for step in checkout_steps:
+            self.assertEqual(step.get("with"), {"persist-credentials": False})
 
     def test_tag_step_keeps_github_expressions_out_of_shell_source(self):
         step = self.tag_step()
