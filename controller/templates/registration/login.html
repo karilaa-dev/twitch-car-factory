@@ -1,0 +1,45 @@
+{% load static %}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b0e0d">
+  <title>Operator sign in · Twitch Farm</title>
+  <link rel="stylesheet" href="{% static 'controller/css/control-room.css' %}">
+</head>
+<body class="login-body">
+  <main class="login-shell">
+    <section class="login-ident" aria-label="Twitch Farm control room">
+      <span class="brand-copy">
+        <strong>Twitch Farm</strong>
+        <small>Restricted process control</small>
+      </span>
+      <h1>Night shift control</h1>
+    </section>
+    <section class="login-form">
+      <p class="eyebrow">Operator checkpoint</p>
+      <h2>Staff access</h2>
+      <p class="lede">Sign in with a Django staff account. Every command is written to the shared audit ledger.</p>
+      <form class="form-grid" method="post" action="{% url 'controller:login' %}">
+        {% csrf_token %}
+        {% if form.non_field_errors %}
+          <div class="message error" role="alert">{{ form.non_field_errors }}</div>
+        {% endif %}
+        <div class="field">
+          <label for="{{ form.username.id_for_label }}">Operator ID</label>
+          {{ form.username }}
+          {{ form.username.errors }}
+        </div>
+        <div class="field">
+          <label for="{{ form.password.id_for_label }}">Passphrase</label>
+          {{ form.password }}
+          {{ form.password.errors }}
+        </div>
+        {% if next %}<input type="hidden" name="next" value="{{ next }}">{% endif %}
+        <button class="button button--primary" type="submit">Enter control room</button>
+      </form>
+    </section>
+  </main>
+</body>
+</html>

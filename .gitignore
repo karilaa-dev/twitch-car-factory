@@ -9,12 +9,22 @@ wheels/
 # Virtual environments
 .venv
 
-# Configuration (contains secrets)
+# Local deployment secrets and legacy migration inputs
 config.yaml
+.env
 
 # Data files
 data/presets.json
 data/state.json
+data/*.sqlite3
+data/*.sqlite3-*
+data/miner-worker.lock
+backups/
 
-# Cookies
+# Legacy and runtime Twitch sessions
 cookies/
+runtime/
+
+# Django generated files
+staticfiles/
+.pytest_cache/

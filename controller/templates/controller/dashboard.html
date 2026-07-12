@@ -1,0 +1,111 @@
+{% extends "controller/base.html" %}
+{% load static control_room %}
+
+{% block title %}Runtime board{% endblock %}
+
+{% block content %}
+  <header class="page-header">
+    <div class="page-heading">
+      <p class="eyebrow">Shared farm state</p>
+      <h1>Runtime board</h1>
+      <p class="lede">Desired state is the instruction. Observed state is what the supervisor can prove. A mismatch is visible here until the worker converges or records an incident.</p>
+    </div>
+    <div class="actions" aria-label="Global miner controls">
+      <form method="post" action="{% url 'controller:global_action' 'start' %}">
+        {% csrf_token %}
+        <button class="button button--safe button--icon" type="submit">Start all</button>
+      </form>
+      <form method="post" action="{% url 'controller:global_action' 'stop' %}">
+        {% csrf_token %}
+        <button class="button button--danger" type="submit">Stop all</button>
+      </form>
+    </div>
+  </header>
+
+  {% include "controller/_status.html" %}
+
+  <div class="section-grid" style="margin-top: 1rem;">
+    <section class="panel" aria-labelledby="incidents-title">
+      <header class="panel__header">
+        <h2 id="incidents-title">Incident ledger</h2>
+        <span class="status-chip" data-tone="{{ summary.open_incidents|yesno:'danger,good' }}">{{ summary.open_incidents }} open</span>
+      </header>
+      <div class="panel__body">
+        {% if recent_incidents %}
+          <ol class="incident-list">
+            {% for incident in recent_incidents %}
+              <li class="incident">
+                <span class="timeline-node {% if incident.status == 'recovered' %}timeline-node--good{% endif %}" aria-hidden="true"></span>
+                <div class="incident__body">
+                  <strong>
+                    {% if incident.account %}<a href="{% url 'controller:account_detail' incident.account.pk %}">{{ incident.account.config_key }}</a>{% else %}Supervisor{% endif %}
+                    · {{ incident.summary }}
+                  </strong>
+                  <p>
+                    {{ incident.get_kind_display }} · {{ incident.restart_attempts.all|length }} recovery attempt{{ incident.restart_attempts.all|length|pluralize }}
+                    {% if incident.details %} · {{ incident.details|truncatechars:120 }}{% endif %}
+                  </p>
+                </div>
+                <time class="timestamp" datetime="{{ incident.opened_at|date:'c' }}">{{ incident.opened_at|timesince }} ago</time>
+              </li>
+            {% endfor %}
+          </ol>
+        {% else %}
+          <div class="empty-state">
+            <div>
+              <div class="empty-state__mark"><span>✓</span></div>
+              <p>No runtime accidents have been recorded.</p>
+            </div>
+          </div>
+        {% endif %}
+      </div>
+    </section>
+
+    <div class="stack">
+      {% if failed_commands %}
+        <section class="panel panel--danger" aria-labelledby="failed-title">
+          <header class="panel__header"><h2 id="failed-title">Command faults</h2></header>
+          <div class="panel__body">
+            <ol class="activity-list">
+              {% for command in failed_commands %}
+                <li class="activity">
+                  <span class="timeline-node" aria-hidden="true"></span>
+                  <div class="activity__body">
+                    <strong>{{ command.account.config_key }} · {{ command.action }}</strong>
+                    <p>{{ command.error|default:"Worker rejected the command."|truncatechars:100 }}</p>
+                  </div>
+                </li>
+              {% endfor %}
+            </ol>
+          </div>
+        </section>
+      {% endif %}
+
+      <section class="panel" aria-labelledby="activity-title">
+        <header class="panel__header"><h2 id="activity-title">Operator log</h2></header>
+        <div class="panel__body">
+          {% if recent_actions %}
+            <ol class="activity-list">
+              {% for entry in recent_actions %}
+                <li class="activity">
+                  <span class="timeline-node timeline-node--neutral" aria-hidden="true"></span>
+                  <div class="activity__body">
+                    <strong>{{ entry.message|default:entry.action }}</strong>
+                    <p>{{ entry.actor.get_username|default:"system" }}{% if entry.account %} · {{ entry.account.config_key }}{% endif %}</p>
+                  </div>
+                  <time class="timestamp" datetime="{{ entry.created_at|date:'c' }}">{{ entry.created_at|timesince }}</time>
+                </li>
+              {% endfor %}
+            </ol>
+          {% else %}
+            <p class="muted">No operator actions yet.</p>
+          {% endif %}
+        </div>
+      </section>
+    </div>
+  </div>
+{% endblock %}
+
+{% block scripts %}
+  <script src="{% static 'controller/js/control-room.js' %}" defer></script>
+{% endblock %}

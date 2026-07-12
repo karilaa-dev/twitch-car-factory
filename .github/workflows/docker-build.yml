@@ -11,16 +11,115 @@ on:
         required: true
         type: string
 
-permissions:
-  contents: read
-  packages: write
-
 jobs:
-  build-and-push:
+  test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Validate Django and migrations
+        env:
+          DJANGO_DEBUG: "1"
+          TWITCH_FARM_DB: /tmp/twitch-farm-ci.sqlite3
+        run: |
+          uv run python manage.py check
+          uv run python manage.py makemigrations --check --dry-run
+
+      - name: Validate production security settings
+        env:
+          DJANGO_DEBUG: "0"
+          DJANGO_SECRET_KEY: "ci-only-security-check-abcdefghijklmnopqrstuvwxyz-0123456789"
+          TWITCH_FARM_CREDENTIAL_KEYS: "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="
+          DJANGO_SECURE_COOKIES: "1"
+        run: uv run python manage.py check --deploy
+
+      - name: Run tests
+        env:
+          DJANGO_DEBUG: "1"
+        run: uv run pytest -q
+
+      - name: Validate Compose
+        env:
+          DJANGO_SECRET_KEY: "ci-only-compose-validation-abcdefghijklmnopqrstuvwxyz-0123456789"
+          TWITCH_FARM_CREDENTIAL_KEYS: "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="
+        run: docker compose config --quiet
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Determine tags
+        id: tags
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          LC_ALL: C
+        run: |
+          set -euo pipefail
+          repository_lower="$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          image_name="ghcr.io/${repository_lower}"
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            image_tag="$REF_NAME"
+          else
+            image_tag="$INPUT_TAG"
+          fi
+          tag_pattern='^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'
+          if [[ ! "$image_tag" =~ $tag_pattern ]]; then
+            echo "Invalid Docker image tag." >&2
+            exit 1
+          fi
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            printf 'tags=%s:%s,%s:latest\n' "$image_name" "$image_tag" "$image_name" >> "$GITHUB_OUTPUT"
+          else
+            printf 'tags=%s:%s\n' "$image_name" "$image_tag" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build smoke image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          platforms: linux/amd64
+          tags: twitch-farm-smoke:${{ github.sha }}
+          provenance: false
+          sbom: false
+
+      - name: Run fresh-volume crash/recovery smoke
+        timeout-minutes: 5
+        env:
+          SMOKE_IMAGE: twitch-farm-smoke:${{ github.sha }}
+        run: bash tests/docker_crash_recovery_smoke.sh "$SMOKE_IMAGE"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -29,25 +128,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Determine tags
-        id: tags
-        run: |
-          if [[ "${{ github.event_name }}" == "push" ]]; then
-            echo "tags=ghcr.io/${{ github.repository }}:${{ github.ref_name }},ghcr.io/${{ github.repository }}:latest" >> $GITHUB_OUTPUT
-          else
-            echo "tags=ghcr.io/${{ github.repository }}:${{ inputs.tag }}" >> $GITHUB_OUTPUT
-          fi
-
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
+          context: .
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.tags.outputs.tags }}
           provenance: false
           sbom: false
-
-      

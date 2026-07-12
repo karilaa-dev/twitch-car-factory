@@ -1,0 +1,220 @@
+{% extends "controller/base.html" %}
+{% load control_room %}
+
+{% block title %}{{ account.display_username }}{% endblock %}
+
+{% block content %}
+  <ol class="breadcrumb" aria-label="Breadcrumb">
+    <li><a href="{% url 'controller:account_list' %}">Accounts</a></li>
+    <li aria-current="page">{{ account.config_key }}</li>
+  </ol>
+
+  <header class="page-header">
+    <div class="page-heading">
+      <p class="eyebrow">Process unit {{ account.pk|stringformat:'03d' }}</p>
+      <h1>{{ account.display_username }}</h1>
+      <p class="lede"><span class="mono">{{ account.config_key }}</span> · {% if not account.is_active %}archived and excluded from launch{% elif account.has_credentials %}credentials encrypted and ready{% else %}credentials required before launch{% endif %}</p>
+    </div>
+    <div class="actions" aria-label="Account lifecycle controls">
+      {% if account.is_active and telemetry.desired == 'running' %}
+        <form method="post" action="{% url 'controller:account_action' account.pk 'stop' %}">
+          {% csrf_token %}<button class="button button--danger" type="submit">Stop intentionally</button>
+        </form>
+      {% elif account.is_active and account.has_credentials %}
+        <form method="post" action="{% url 'controller:account_action' account.pk 'start' %}">
+          {% csrf_token %}<button class="button button--safe" type="submit">Start unit</button>
+        </form>
+      {% endif %}
+      {% if account.is_active and account.has_credentials %}
+        <form method="post" action="{% url 'controller:account_action' account.pk 'restart' %}">
+          {% csrf_token %}<button class="button" type="submit">Restart unit</button>
+        </form>
+      {% endif %}
+      <a class="button button--primary" href="{% url 'controller:account_edit' account.pk %}">Edit account</a>
+      {% if not account.is_active %}
+        <form method="post" action="{% url 'controller:account_reactivate' account.pk %}">
+          {% csrf_token %}<button class="button button--safe" type="submit">Reactivate account</button>
+        </form>
+      {% endif %}
+    </div>
+  </header>
+
+  <dl class="telemetry-grid">
+    <div class="telemetry">
+      <dt>Desired state</dt>
+      <dd><span class="status-chip" data-tone="{{ telemetry.desired|state_tone }}">{{ telemetry.desired }}</span></dd>
+    </div>
+    <div class="telemetry">
+      <dt>Observed state</dt>
+      <dd><span class="status-chip" data-tone="{{ telemetry.observed|state_tone }}">{{ telemetry.observed }}</span></dd>
+    </div>
+    <div class="telemetry">
+      <dt>Advisory process</dt>
+      <dd class="mono">{% if telemetry.pid %}pid {{ telemetry.pid }}{% else %}not assigned{% endif %}</dd>
+    </div>
+    <div class="telemetry">
+      <dt>Runtime heartbeat</dt>
+      <dd>{% if telemetry.last_heartbeat %}{{ telemetry.last_heartbeat|timesince }} ago{% else %}No heartbeat{% endif %}</dd>
+    </div>
+  </dl>
+
+  <div class="detail-layout" style="margin-top: 1rem;">
+    <div class="stack">
+      <section class="panel" aria-labelledby="manifest-title">
+        <header class="panel__header">
+          <h2 id="manifest-title">Active launch manifest</h2>
+          {% if telemetry.current_run and telemetry.current_run.startup_confirmed_at %}<span class="status-chip" data-tone="good">startup confirmed</span>{% else %}<span class="status-chip">no confirmed run</span>{% endif %}
+        </header>
+        <div class="panel__body">
+          {% if telemetry.current_run %}
+            <dl class="launch-manifest">
+              <div class="manifest-row"><dt>Run ID</dt><dd class="mono">{{ telemetry.current_run.pk }}</dd></div>
+              <div class="manifest-row"><dt>Source</dt><dd>{{ telemetry.current_run.source_mode }} / {{ telemetry.current_run.source_name }}</dd></div>
+              <div class="manifest-row">
+                <dt>Exact channels</dt>
+                <dd class="channel-trace">{% for channel in telemetry.channels %}<span class="channel-tag">{{ channel }}</span>{% endfor %}</dd>
+              </div>
+              <div class="manifest-row"><dt>Revision</dt><dd class="mono">{{ telemetry.current_run.channel_revision }}</dd></div>
+              <div class="manifest-row"><dt>Fingerprint</dt><dd class="mono" title="{{ telemetry.current_run.configuration_fingerprint }}">{{ telemetry.current_run.configuration_fingerprint }}</dd></div>
+              <div class="manifest-row"><dt>Launched</dt><dd>{{ telemetry.current_run.started_at|date:'Y-m-d H:i:s T' }}</dd></div>
+            </dl>
+          {% else %}
+            <div class="empty-state">
+              <div>
+                <div class="empty-state__mark"><span>—</span></div>
+                <p>No active run. The next successful start will create an immutable, ordered channel snapshot here.</p>
+              </div>
+            </div>
+          {% endif %}
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="incidents-title">
+        <header class="panel__header"><h2 id="incidents-title">Incident & recovery history</h2></header>
+        <div class="panel__body">
+          {% if incidents %}
+            <ol class="incident-list">
+              {% for incident in incidents %}
+                <li class="incident">
+                  <span class="timeline-node {% if incident.status == 'recovered' %}timeline-node--good{% endif %}" aria-hidden="true"></span>
+                  <div class="incident__body">
+                    <strong>{{ incident.summary }} <span class="status-chip" data-tone="{{ incident.status|state_tone }}">{{ incident.status }}</span></strong>
+                    <p>{{ incident.get_kind_display }}{% if incident.details %} · {{ incident.details|truncatechars:180 }}{% endif %}</p>
+                    {% if incident.restart_attempts.all %}
+                      <p>
+                        {% for attempt in incident.restart_attempts.all %}
+                          <span class="status-chip" data-tone="{{ attempt.outcome|state_tone }}">#{{ attempt.attempt_number }} {{ attempt.outcome }}</span>
+                        {% endfor %}
+                      </p>
+                    {% endif %}
+                  </div>
+                  <time class="timestamp" datetime="{{ incident.opened_at|date:'c' }}">{{ incident.opened_at|timesince }} ago</time>
+                </li>
+              {% endfor %}
+            </ol>
+          {% else %}
+            <p class="muted">No accidents recorded for this account.</p>
+          {% endif %}
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="runs-title">
+        <header class="panel__header"><h2 id="runs-title">Recent process runs</h2></header>
+        <div class="panel__body">
+          {% if runs %}
+            <ol class="run-list">
+              {% for run in runs %}
+                <li class="run-record">
+                  <span class="timeline-node {% if not run.ended_at %}timeline-node--good{% else %}timeline-node--neutral{% endif %}" aria-hidden="true"></span>
+                  <div class="run-record__body">
+                    <strong>Run {{ run.pk }} · {{ run.source_mode }} / {{ run.source_name }}</strong>
+                    <p>{{ run.channels|channel_list }} · {% if run.ended_at %}{{ run.get_stop_reason_display|default:'ended' }}{% else %}active{% endif %}{% if run.exit_code != None %} · exit {{ run.exit_code }}{% endif %}</p>
+                  </div>
+                  <time class="timestamp" datetime="{{ run.started_at|date:'c' }}">{{ run.started_at|date:'M j, H:i' }}</time>
+                </li>
+              {% endfor %}
+            </ol>
+          {% else %}
+            <p class="muted">No launch records yet.</p>
+          {% endif %}
+        </div>
+      </section>
+    </div>
+
+    <aside class="stack">
+      <section class="panel" aria-labelledby="source-title">
+        <header class="panel__header"><h2 id="source-title">Next launch source</h2></header>
+        <div class="panel__body">
+          <p><span class="status-chip">{{ planned_source.mode }}</span> <strong>{{ planned_source.name }}</strong></p>
+          {% if planned_source.managed_externally %}
+            <p class="muted">Default channels are managed in Settings. The exact list is snapshotted when the worker validates the next launch.</p>
+          {% elif planned_source.channels %}
+            <div class="channel-trace">{% for channel in planned_source.channels %}<span class="channel-tag">{{ channel }}</span>{% endfor %}</div>
+          {% endif %}
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="selection-title">
+        <header class="panel__header"><h2 id="selection-title">Change channel source</h2></header>
+        <div class="panel__body">
+          <form class="form-grid" method="post" action="{% url 'controller:account_channel_selection' account.pk %}">
+            {% csrf_token %}
+            {% if selection_form.non_field_errors %}<div class="message error">{{ selection_form.non_field_errors }}</div>{% endif %}
+            <fieldset class="field">
+              <legend>Source mode</legend>
+              <div class="choice-grid">{{ selection_form.mode }}</div>
+              {{ selection_form.mode.errors }}
+            </fieldset>
+            <div class="field">
+              <label for="{{ selection_form.preset.id_for_label }}">Preset</label>
+              {{ selection_form.preset }}
+              {{ selection_form.preset.errors }}
+            </div>
+            <div class="field">
+              <label for="{{ selection_form.custom_channels.id_for_label }}">Custom channels</label>
+              {{ selection_form.custom_channels }}
+              {% if selection_form.custom_channels.help_text %}<span class="field-help">{{ selection_form.custom_channels.help_text }}</span>{% endif %}
+              {{ selection_form.custom_channels.errors }}
+            </div>
+            <button class="button button--primary" type="submit">Commit source</button>
+          </form>
+        </div>
+        <footer class="panel__footer">A desired-running unit restarts only after the new channel list validates.</footer>
+      </section>
+
+      <section class="panel" aria-labelledby="commands-title">
+        <header class="panel__header"><h2 id="commands-title">Command queue</h2></header>
+        <div class="panel__body">
+          {% if commands %}
+            <ol class="activity-list">
+              {% for command in commands %}
+                <li class="activity">
+                  <span class="timeline-node timeline-node--neutral" aria-hidden="true"></span>
+                  <div class="activity__body">
+                    <strong>{{ command.action }} <span class="status-chip" data-tone="{{ command.status|state_tone }}">{{ command.status }}</span></strong>
+                    <p>{{ command.actor.get_username|default:'system' }}{% if command.error %} · {{ command.error|truncatechars:90 }}{% endif %}</p>
+                  </div>
+                </li>
+              {% endfor %}
+            </ol>
+          {% else %}
+            <p class="muted">No queued commands.</p>
+          {% endif %}
+        </div>
+      </section>
+
+      {% if account.is_active %}
+        <section class="panel panel--danger" aria-labelledby="archive-title">
+          <header class="panel__header"><h2 id="archive-title">Archive account</h2></header>
+          <div class="panel__body">
+            <p class="muted">Archiving queues an intentional stop, removes this account from global actions and preset assignment, and preserves its complete runtime history.</p>
+            <form method="post" action="{% url 'controller:account_archive' account.pk %}">
+              {% csrf_token %}
+              <button class="button button--danger" type="submit">Archive {{ account.display_username }}</button>
+            </form>
+          </div>
+        </section>
+      {% endif %}
+    </aside>
+  </div>
+{% endblock %}

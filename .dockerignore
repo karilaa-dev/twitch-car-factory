@@ -20,18 +20,14 @@ ENV/
 *.swo
 .cursor/
 
-# Data (mounted as volumes)
+# Runtime state and local legacy inputs (never image content)
 data/
 cookies/
+runtime/
+backups/
 config.yaml
-
-# Docker
-Dockerfile
-docker-compose.yml
-.dockerignore
+.env
 
 # Other
-*.md
 *.log
 .DS_Store
-

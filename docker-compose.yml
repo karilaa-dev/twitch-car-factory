@@ -1,13 +1,76 @@
-services:
-  twitch-car-factory:
-    build: .
-    image: ghcr.io/karilaa/twitch-car-factory:latest
-    container_name: twitch-car-factory
-    restart: unless-stopped
-    volumes:
-      - ./config.yaml:/app/config.yaml:ro
-      - ./data:/app/data
-      - ./cookies:/app/cookies
-    environment:
-      - TZ=UTC
+x-app: &app
+  build: .
+  image: ghcr.io/karilaa-dev/twitch-car-factory:${TWITCH_FARM_IMAGE_TAG:-latest}
+  # Match the owner of the bind-mounted data/runtime directories. The defaults
+  # are the conventional first Linux user; set PUID/PGID to `id -u`/`id -g`
+  # on hosts that use different IDs (macOS commonly uses 501/20).
+  user: "${PUID:-1000}:${PGID:-1000}"
+  environment: &app-environment
+    DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?Set DJANGO_SECRET_KEY in .env}
+    DJANGO_DEBUG: ${DJANGO_DEBUG:-0}
+    DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1,[::1]}
+    DJANGO_CSRF_TRUSTED_ORIGINS: ${DJANGO_CSRF_TRUSTED_ORIGINS:-}
+    # Gunicorn is published as loopback HTTP by this file. Enable these only
+    # when an external TLS proxy is configured as described in README.md.
+    DJANGO_SECURE_COOKIES: ${DJANGO_SECURE_COOKIES:-0}
+    DJANGO_SECURE_SSL_REDIRECT: ${DJANGO_SECURE_SSL_REDIRECT:-0}
+    DJANGO_SECURE_HSTS_SECONDS: ${DJANGO_SECURE_HSTS_SECONDS:-0}
+    DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS: ${DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS:-0}
+    DJANGO_SECURE_HSTS_PRELOAD: ${DJANGO_SECURE_HSTS_PRELOAD:-0}
+    TWITCH_FARM_CREDENTIAL_KEYS: ${TWITCH_FARM_CREDENTIAL_KEYS:?Set TWITCH_FARM_CREDENTIAL_KEYS in .env}
+    TWITCH_FARM_DB: /app/data/db.sqlite3
+    TWITCH_FARM_WORKER_LOCK: /app/data/miner-worker.lock
+    TZ: UTC
+  volumes:
+    - ./data:/app/data
 
+services:
+  migrate:
+    <<: *app
+    command: ["python", "manage.py", "migrate", "--noinput"]
+    restart: "no"
+
+  web:
+    <<: *app
+    command: ["gunicorn", "twitch_farm.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "2", "--access-logfile", "-"]
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:${TWITCH_FARM_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import os, urllib.request;
+          allowed = [host.strip() for host in os.environ.get('DJANGO_ALLOWED_HOSTS', '').split(',') if host.strip()];
+          host = next((candidate.lstrip('.') for candidate in allowed if candidate != '*'), 'localhost');
+          headers = {'Host': host};
+          secure_redirect = os.environ.get('DJANGO_SECURE_SSL_REDIRECT', '0').strip().lower() in {'1', 'true', 'yes', 'on'};
+          headers.update({'X-Forwarded-Proto': 'https'} if secure_redirect else {});
+          request = urllib.request.Request('http://127.0.0.1:8000/healthz/', headers=headers);
+          urllib.request.urlopen(request, timeout=3)
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    <<: *app
+    command: ["python", "manage.py", "run_miner_worker"]
+    restart: unless-stopped
+    # The supervisor stops owned miners sequentially and may wait up to ten
+    # seconds per child before forcing it down. Leave enough time for several
+    # miners plus durable run/state/lease finalization before Docker sends KILL.
+    stop_grace_period: 2m
+    environment:
+      <<: *app-environment
+      TWITCH_FARM_RUNTIME_DIR: /app/runtime
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - ./data:/app/data
+      - ./runtime:/app/runtime

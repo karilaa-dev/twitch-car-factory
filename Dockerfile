@@ -4,32 +4,34 @@ FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
 
 WORKDIR /app
 
-# Install git (required for git dependencies)
-RUN apt-get update && apt-get install -y --no-install-recommends git \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 twitchfarm
 
-# Enable bytecode compilation
-ENV UV_COMPILE_BYTECODE=1
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    DJANGO_DEBUG=0
 
-# Copy from the cache instead of linking since it's a mounted volume
-ENV UV_LINK_MODE=copy
-
-# Install dependencies first (cached layer)
-COPY pyproject.toml uv.lock ./
+COPY pyproject.toml uv.lock README.md ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-project
+    uv sync --frozen --no-dev --no-install-project
 
-# Copy application code
-COPY bot/ bot/
-COPY main.py instance.py ./
+COPY manage.py ./
+COPY twitch_farm/ twitch_farm/
+COPY controller/ controller/
 
-# Sync the project
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen
+RUN mkdir -p /app/data /app/runtime /app/staticfiles \
+    && DJANGO_DEBUG=0 \
+       DJANGO_SECRET_KEY=container-build-only-not-for-runtime-0123456789-abcdef \
+       TWITCH_FARM_CREDENTIAL_KEYS=MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA= \
+       .venv/bin/python manage.py collectstatic --noinput \
+    && chown -R twitchfarm:twitchfarm /app
 
-# Create directories for mounted volumes
-RUN mkdir -p /app/data /app/cookies
+USER twitchfarm
 
-# Run the bot
-CMD ["uv", "run", "python", "main.py"]
-
+EXPOSE 8000
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["gunicorn", "twitch_farm.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "2", "--access-logfile", "-"]

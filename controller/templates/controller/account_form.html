@@ -1,0 +1,95 @@
+{% extends "controller/base.html" %}
+
+{% block title %}{% if account %}Edit {{ account.display_username }}{% else %}Add account{% endif %}{% endblock %}
+
+{% block content %}
+  <ol class="breadcrumb" aria-label="Breadcrumb">
+    <li><a href="{% url 'controller:account_list' %}">Accounts</a></li>
+    {% if account %}<li><a href="{% url 'controller:account_detail' account.pk %}">{{ account.display_username }}</a></li>{% endif %}
+    <li aria-current="page">{% if account %}Edit{% else %}Add{% endif %}</li>
+  </ol>
+
+  <header class="page-header">
+    <div class="page-heading">
+      <p class="eyebrow">Account registry</p>
+      <h1>{% if account %}Edit account{% else %}Add account{% endif %}</h1>
+      <p class="lede">
+        {% if account %}
+          Update the public Twitch username or encrypted credential. The internal key <span class="mono">{{ account.config_key }}</span> cannot be changed; channel sources remain on the account detail page.
+        {% else %}
+          Register a Twitch identity and choose where its first launch gets channels. You remain in control of when it starts.
+        {% endif %}
+      </p>
+    </div>
+  </header>
+
+  <div class="detail-layout detail-layout--editor">
+    <section class="panel" aria-labelledby="account-editor-title">
+      <header class="panel__header">
+        <h2 id="account-editor-title">Account specification</h2>
+        {% if account %}<span class="status-chip">Unit {{ account.pk|stringformat:'03d' }}</span>{% endif %}
+      </header>
+      <div class="panel__body">
+        <form class="form-grid" method="post" autocomplete="off">
+          {% csrf_token %}
+          {% if form.non_field_errors %}<div class="message error" role="alert">{{ form.non_field_errors }}</div>{% endif %}
+
+          {% for field in form %}
+            {% if field.field.widget.input_type == 'checkbox' %}
+              <div class="field field--choice">
+                <label class="toggle-field" for="{{ field.id_for_label }}">
+                  {{ field }}
+                  <span>
+                    <strong>{{ field.label }}</strong>
+                    {% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}
+                  </span>
+                </label>
+                {{ field.errors }}
+              </div>
+            {% elif field.field.widget.input_type == 'radio' %}
+              <fieldset class="field">
+                <legend>{{ field.label }}</legend>
+                <div class="choice-grid">{{ field }}</div>
+                {% if field.help_text %}<span class="field-help">{{ field.help_text }}</span>{% endif %}
+                {{ field.errors }}
+              </fieldset>
+            {% else %}
+              <div class="field">
+                <label for="{{ field.id_for_label }}">{{ field.label }}</label>
+                {{ field }}
+                {% if field.help_text %}<span class="field-help">{{ field.help_text }}</span>{% endif %}
+                {{ field.errors }}
+              </div>
+            {% endif %}
+          {% endfor %}
+
+          <div class="button-row">
+            <button class="button button--primary" type="submit">{% if account %}Save changes{% else %}Add account{% endif %}</button>
+            <a class="button button--quiet" href="{% if account %}{% url 'controller:account_detail' account.pk %}{% else %}{% url 'controller:account_list' %}{% endif %}">Cancel</a>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <aside class="stack">
+      <section class="panel" aria-labelledby="security-contract-title">
+        <header class="panel__header"><h2 id="security-contract-title">Credential contract</h2></header>
+        <div class="panel__body">
+          <dl class="launch-manifest">
+            <div class="manifest-row"><dt>Storage</dt><dd>Application-encrypted in the control database</dd></div>
+            <div class="manifest-row"><dt>Display</dt><dd>Never returned to an operator page</dd></div>
+            <div class="manifest-row"><dt>Editing</dt><dd>{% if account %}Leave the password field empty to keep the current credential{% else %}A credential is required before the account can launch{% endif %}</dd></div>
+            <div class="manifest-row"><dt>Runtime</dt><dd>Read by the process-owning worker only when launching</dd></div>
+          </dl>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="launch-contract-title">
+        <header class="panel__header"><h2 id="launch-contract-title">Launch behavior</h2></header>
+        <div class="panel__body">
+          <p class="muted">Saving a desired-running account queues a controlled restart when its launch identity or channels change. New accounts start only when the form explicitly requests it.</p>
+        </div>
+      </section>
+    </aside>
+  </div>
+{% endblock %}

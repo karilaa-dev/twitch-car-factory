@@ -1,16 +1,31 @@
 [project]
 name = "twitch-cat-factory"
-version = "0.1.0"
-description = "Telegram bot for controlling Twitch Channel Points Miner"
+version = "2.0.0"
+description = "Django control plane for reliable Twitch Channel Points Miner instances"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "aiogram>=3.4.0",
     "colorama>=0.4.6",
+    "cryptography>=44.0.0",
+    "django>=5.2,<5.3",
+    "gunicorn>=23.0.0",
     "pyyaml>=6.0.1",
     "twitch-channel-points-miner-v2",
     "validators>=0.35.0",
+    "whitenoise>=6.9.0",
 ]
 
 [tool.uv.sources]
 twitch-channel-points-miner-v2 = { git = "https://github.com/rdavydov/Twitch-Channel-Points-Miner-v2.git" }
+
+[dependency-groups]
+dev = [
+    "playwright>=1.60.0",
+    "pytest>=8.3.0",
+    "pytest-django>=4.11.0",
+]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "twitch_farm.settings"
+python_files = ["test_*.py", "tests.py"]
+addopts = "-ra"

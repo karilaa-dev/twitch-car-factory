@@ -1,0 +1,47 @@
+{% extends "controller/base.html" %}
+
+{% block title %}Channel presets{% endblock %}
+
+{% block content %}
+  <header class="page-header">
+    <div class="page-heading">
+      <p class="eyebrow">Ordered channel plans</p>
+      <h1>Preset library</h1>
+      <p class="lede">Presets are normalized, ordered launch inputs. Editing an assigned preset queues a configuration restart for every desired-running account that uses it.</p>
+    </div>
+    <a class="button button--primary" href="{% url 'controller:preset_create' %}">Create preset</a>
+  </header>
+
+  {% if presets %}
+    <div class="preset-grid">
+      {% for preset in presets %}
+        <article class="preset-card">
+          <header class="preset-card__header">
+            <h2><a href="{% url 'controller:preset_detail' preset.pk %}">{{ preset.name }}</a></h2>
+            <span class="status-chip">{{ preset.channels.all|length }} channel{{ preset.channels.all|length|pluralize }}</span>
+          </header>
+          <div class="preset-card__body">
+            <div class="channel-trace">
+              {% for channel in preset.channels.all %}
+                <span class="channel-tag">{{ channel.name }}</span>
+              {% empty %}
+                <span class="faint">No channels configured</span>
+              {% endfor %}
+            </div>
+          </div>
+          <footer class="preset-card__footer">
+            <span>{{ preset.account_selections.all|length }} assignment{{ preset.account_selections.all|length|pluralize }}</span>
+            <a href="{% url 'controller:preset_detail' preset.pk %}">Open plan →</a>
+          </footer>
+        </article>
+      {% endfor %}
+    </div>
+  {% else %}
+    <div class="empty-state">
+      <div>
+        <div class="empty-state__mark"><span>+</span></div>
+        <p>No reusable channel plans yet. Create a preset to assign one ordered channel list across accounts.</p>
+      </div>
+    </div>
+  {% endif %}
+{% endblock %}

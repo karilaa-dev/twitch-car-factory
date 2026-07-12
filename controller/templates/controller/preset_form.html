@@ -1,0 +1,58 @@
+{% extends "controller/base.html" %}
+
+{% block title %}{% if preset %}Edit {{ preset.name }}{% else %}New preset{% endif %}{% endblock %}
+
+{% block content %}
+  <ol class="breadcrumb" aria-label="Breadcrumb">
+    <li><a href="{% url 'controller:preset_list' %}">Presets</a></li>
+    {% if preset %}<li><a href="{% url 'controller:preset_detail' preset.pk %}">{{ preset.name }}</a></li>{% endif %}
+    <li aria-current="page">{% if preset %}Edit{% else %}New{% endif %}</li>
+  </ol>
+
+  <header class="page-header">
+    <div class="page-heading">
+      <p class="eyebrow">Launch plan editor</p>
+      <h1>{% if preset %}Edit preset{% else %}New preset{% endif %}</h1>
+      <p class="lede">Channel order is preserved. Case-insensitive duplicates are removed when the plan is committed.</p>
+    </div>
+  </header>
+
+  <div class="detail-layout">
+    <section class="panel" aria-labelledby="editor-title">
+      <header class="panel__header"><h2 id="editor-title">Preset specification</h2></header>
+      <div class="panel__body">
+        <form class="form-grid" method="post">
+          {% csrf_token %}
+          {% if form.non_field_errors %}<div class="message error" role="alert">{{ form.non_field_errors }}</div>{% endif %}
+          <div class="field">
+            <label for="{{ form.name.id_for_label }}">Plan name</label>
+            {{ form.name }}
+            {{ form.name.errors }}
+          </div>
+          <div class="field">
+            <label for="{{ form.channels.id_for_label }}">Ordered channels</label>
+            {{ form.channels }}
+            {% if form.channels.help_text %}<span class="field-help">{{ form.channels.help_text }}</span>{% endif %}
+            {{ form.channels.errors }}
+          </div>
+          <div class="button-row">
+            <button class="button button--primary" type="submit">{% if preset %}Commit revision{% else %}Create plan{% endif %}</button>
+            <a class="button button--quiet" href="{% if preset %}{% url 'controller:preset_detail' preset.pk %}{% else %}{% url 'controller:preset_list' %}{% endif %}">Cancel</a>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <aside class="panel">
+      <header class="panel__header"><h2>Reliability contract</h2></header>
+      <div class="panel__body">
+        <dl class="launch-manifest">
+          <div class="manifest-row"><dt>Validation</dt><dd>At least one valid Twitch channel</dd></div>
+          <div class="manifest-row"><dt>Ordering</dt><dd>Input order remains stable</dd></div>
+          <div class="manifest-row"><dt>Duplicates</dt><dd>Removed case-insensitively</dd></div>
+          <div class="manifest-row"><dt>Live accounts</dt><dd>Restart queued after commit</dd></div>
+        </dl>
+      </div>
+    </aside>
+  </div>
+{% endblock %}
