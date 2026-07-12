@@ -43,6 +43,7 @@ jobs:
         env:
           DJANGO_DEBUG: "0"
           DJANGO_SECRET_KEY: "ci-only-security-check-abcdefghijklmnopqrstuvwxyz-0123456789"
+          TWITCH_FARM_CREDENTIAL_KEYS: "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="
           DJANGO_SECURE_COOKIES: "1"
         run: uv run python manage.py check --deploy
 
@@ -54,6 +55,7 @@ jobs:
       - name: Validate Compose
         env:
           DJANGO_SECRET_KEY: "ci-only-compose-validation-abcdefghijklmnopqrstuvwxyz-0123456789"
+          TWITCH_FARM_CREDENTIAL_KEYS: "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="
         run: docker compose config --quiet
 
   build-and-push:

@@ -242,6 +242,7 @@ class MinerSupervisor:
         ] = {}
         self._lock_handle: IO[str] | None = None
         self._started = False
+        self._shutdown_incomplete = False
         self._last_health = float("-inf")
         self._last_fingerprint = float("-inf")
         self._last_heartbeat = float("-inf")
@@ -359,7 +360,7 @@ class MinerSupervisor:
         self._acquire_file_lock()
         try:
             self._acquire_database_lease()
-            services.sync_config_accounts()
+            services.purge_expired_legacy_import_drafts(at=self.now())
             self.reconcile_startup()
             self.heartbeat(force=True)
             self._started = True
@@ -677,14 +678,14 @@ class MinerSupervisor:
                 str(Path(settings.BASE_DIR) / "manage.py"),
                 "run_fake_miner",
                 str(run.pk),
-                run.account.config_key,
+                str(run.account_id),
             ]
         return [
             sys.executable,
             "-m",
             "controller.miner_runner",
             str(run.pk),
-            run.account.config_key,
+            str(run.account_id),
         ]
 
     def _terminate_owned_process(self, process: ProcessLike) -> tuple[int, bool]:
@@ -796,8 +797,8 @@ class MinerSupervisor:
             )
             popen_options = {
                 # The upstream miner hardcodes ./cookies. Running children from
-                # the worker-only runtime directory lets it refresh sessions
-                # while the original cookie backup remains read-only.
+                # the worker-only runtime directory keeps every refreshable
+                # session outside the web service's filesystem view.
                 "cwd": runtime_dir,
                 "env": child_environment,
                 "close_fds": True,
@@ -1038,8 +1039,12 @@ class MinerSupervisor:
                 )
 
         state, _ = MinerInstanceState.objects.get_or_create(account=account)
-        if not account.is_configured:
-            error = "Account is not present in the current config.yaml."
+        if not account.is_active or not account.has_credentials:
+            error = (
+                "Account is archived."
+                if not account.is_active
+                else "Account has no stored Twitch password."
+            )
             state.observed_state = MinerInstanceState.ObservedState.DEGRADED
             state.last_error = error
             state.next_retry_at = self.now() + timedelta(
@@ -1895,9 +1900,11 @@ class MinerSupervisor:
     def _perform_due_recoveries(self) -> int:
         now = self.now()
         recovered = 0
-        states = MinerInstanceState.objects.select_related("account").filter(
+        states = MinerInstanceState.objects.select_related("account", "account__credential").filter(
             desired_state=MinerInstanceState.DesiredState.RUNNING,
             next_retry_at__lte=now,
+            account__is_active=True,
+            account__credential__isnull=False,
         )
         for state in states:
             if state.account_id in self.processes:
@@ -2151,7 +2158,7 @@ class MinerSupervisor:
     def reconcile_desired_state(self) -> None:
         """Converge missing processes without trusting persisted PID values."""
 
-        states = MinerInstanceState.objects.select_related("account").all()
+        states = MinerInstanceState.objects.select_related("account", "account__credential").all()
         for state in states:
             managed = self.processes.get(state.account_id)
             if state.desired_state == MinerInstanceState.DesiredState.STOPPED:
@@ -2186,7 +2193,7 @@ class MinerSupervisor:
                                 "updated_at",
                             )
                         )
-                        if locked_state.account.is_configured:
+                        if locked_state.account.is_active:
                             self._close_incident_for_intentional_stop(
                                 locked_state.account
                             )
@@ -2194,14 +2201,35 @@ class MinerSupervisor:
                             self._close_incident_for_intentional_stop(
                                 locked_state.account,
                                 attempt_error=(
-                                    "Recovery was cancelled because the account was removed "
-                                    "from config.yaml."
+                                    "Recovery was cancelled because the account is archived."
                                 ),
                                 incident_details=(
-                                    "Recovery was cancelled because this account is no longer "
-                                    "configured in config.yaml."
+                                    "Recovery was cancelled because this account is archived."
                                 ),
                             )
+                continue
+            if not state.account.is_active or not state.account.has_credentials:
+                with transaction.atomic():
+                    locked_state = MinerInstanceState.objects.select_for_update().get(pk=state.pk)
+                    locked_state.desired_state = MinerInstanceState.DesiredState.STOPPED
+                    locked_state.observed_state = MinerInstanceState.ObservedState.STOPPED
+                    locked_state.next_retry_at = None
+                    locked_state.last_error = (
+                        "Account is archived."
+                        if not state.account.is_active
+                        else "Account has no stored Twitch password."
+                    )
+                    locked_state.save(
+                        update_fields=(
+                            "desired_state",
+                            "observed_state",
+                            "next_retry_at",
+                            "last_error",
+                            "updated_at",
+                        )
+                    )
+                if managed is not None:
+                    self.stop_account(state.account, preserve_desired=False)
                 continue
             if managed is not None or state.next_retry_at is not None:
                 continue
@@ -2213,19 +2241,6 @@ class MinerSupervisor:
     def reconcile_fingerprints(self) -> None:
         """Restart only when a newly validated launch specification differs."""
 
-        try:
-            services.sync_config_accounts()
-        except Exception as exc:
-            error = safe_error(f"Configuration sync failed: {exc}")
-            MinerInstanceState.objects.filter(
-                desired_state=MinerInstanceState.DesiredState.RUNNING
-            ).update(last_error=error)
-            logger.exception("Configuration synchronization failed")
-            return
-
-        # Account additions and removals are part of configuration convergence,
-        # not just channel fingerprint changes.  A newly autostarted account is
-        # launched here; a removed account is intentionally stopped here.
         self.reconcile_desired_state()
         for managed in list(self.processes.values()):
             if not managed.confirmed or managed.process.poll() is not None:
@@ -2245,7 +2260,7 @@ class MinerSupervisor:
                     reason=MinerRun.StopReason.CONFIG_RESTART,
                 )
             except Exception as exc:
-                # A bad new preset/YAML must never take down the healthy old run.
+                # A bad new preset/default must never take down the healthy old run.
                 MinerInstanceState.objects.filter(account_id=managed.account_id).update(
                     last_error=safe_error(f"Configuration check failed: {exc}")
                 )
@@ -2268,6 +2283,7 @@ class MinerSupervisor:
             force_checks
             or current - self._last_fingerprint >= self.options.fingerprint_poll_seconds
         ):
+            services.purge_expired_legacy_import_drafts(at=self.now())
             self.reconcile_fingerprints()
             self._last_fingerprint = current
 
@@ -2277,25 +2293,104 @@ class MinerSupervisor:
             self.run_once()
             self.sleep(self.options.command_poll_seconds)
 
+    def _cleanup_released_shutdown_process(self, managed: ManagedProcess) -> None:
+        """Finish an old child without rewriting a newer supervisor's state."""
+
+        returncode, forced_now = self._terminate_owned_process(managed.process)
+        forced = managed.pending_stop_forced or forced_now
+        reason = managed.pending_stop_reason or MinerRun.StopReason.SUPERVISOR_SHUTDOWN
+        managed.pending_stop_reason = reason
+        managed.pending_stop_forced = forced
+        self._fail_restart_attempt(
+            managed.restart_attempt_id,
+            f"Recovery attempt was superseded by planned stop reason {reason}.",
+        )
+        self._close_run(
+            managed.run_id,
+            returncode=returncode,
+            reason=reason,
+            error="Forced kill after graceful-stop timeout." if forced else "",
+        )
+        # A newer singleton may already have reconciled this old run and started
+        # a replacement. Clear state only while it still names our exact worker
+        # and run; the process handle and historical run row remain safe to
+        # finalize independently after singleton ownership has been released.
+        now = self.now()
+        MinerInstanceState.objects.filter(
+            account_id=managed.account_id,
+            worker_id=self.worker_id,
+            current_run_id=managed.run_id,
+        ).update(
+            current_run=None,
+            advisory_pid=None,
+            worker_id="",
+            observed_state=MinerInstanceState.ObservedState.UNKNOWN,
+            next_retry_at=None,
+            stable_since=None,
+            last_heartbeat=now,
+            last_error="",
+            updated_at=now,
+        )
+        if self.processes.get(managed.account_id) is managed:
+            self.processes.pop(managed.account_id, None)
+
     def shutdown(self) -> None:
-        if not self._started and self._lock_handle is None:
+        if (
+            not self._started
+            and self._lock_handle is None
+            and not self.processes
+            and not self._shutdown_incomplete
+        ):
             return
+
+        self._shutdown_incomplete = True
+        owns_singleton = self._started
+        errors: list[BaseException] = []
         try:
-            for account_id in list(self.processes):
-                account = MinerAccount.objects.get(pk=account_id)
-                self.stop_account(
-                    account,
-                    reason=MinerRun.StopReason.SUPERVISOR_SHUTDOWN,
-                    preserve_desired=True,
-                    final_observed=MinerInstanceState.ObservedState.UNKNOWN,
-                )
-            WorkerLease.objects.filter(
-                name=self.lease_name,
-                owner_id=self.worker_id,
-            ).delete()
+            try:
+                account_ids = list(self.processes)
+            except BaseException as exc:
+                errors.append(exc)
+                account_ids = []
+
+            for account_id in account_ids:
+                try:
+                    if owns_singleton:
+                        account = MinerAccount.objects.get(pk=account_id)
+                        self.stop_account(
+                            account,
+                            reason=MinerRun.StopReason.SUPERVISOR_SHUTDOWN,
+                            preserve_desired=True,
+                            final_observed=MinerInstanceState.ObservedState.UNKNOWN,
+                        )
+                    else:
+                        managed = self.processes.get(account_id)
+                        if managed is not None:
+                            self._cleanup_released_shutdown_process(managed)
+                except BaseException as exc:
+                    errors.append(exc)
         finally:
-            self._started = False
-            self._release_file_lock()
+            try:
+                try:
+                    WorkerLease.objects.filter(
+                        name=self.lease_name,
+                        owner_id=self.worker_id,
+                    ).delete()
+                except BaseException as exc:
+                    errors.append(exc)
+            finally:
+                try:
+                    self._release_file_lock()
+                except BaseException as exc:
+                    errors.append(exc)
+                finally:
+                    self._started = False
+
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup("Miner supervisor shutdown failed.", errors)
+        self._shutdown_incomplete = False
 
     cleanup = shutdown
 

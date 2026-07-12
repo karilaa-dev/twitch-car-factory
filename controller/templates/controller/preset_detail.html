@@ -43,13 +43,41 @@
             {% if assignment_form.non_field_errors %}<div class="message error">{{ assignment_form.non_field_errors }}</div>{% endif %}
             <fieldset class="field">
               <legend>Use this preset for</legend>
-              <div class="checkbox-grid">{{ assignment_form.accounts }}</div>
+              <p class="field-help">Only the public Twitch username is shown here. Open account information when you need operational details.</p>
+              <div class="account-choice-grid">
+                {% for row in assignment_rows %}
+                  <div class="account-choice">
+                    <label class="account-choice__label" for="{{ row.input_id }}">
+                      <input type="checkbox" name="accounts" value="{{ row.account.pk }}" id="{{ row.input_id }}" {% if row.checked %}checked{% endif %}>
+                      <span class="account-choice__identity">
+                        <strong>{{ row.account.display_username }}</strong>
+                        <small>Use this preset</small>
+                      </span>
+                    </label>
+                    <button
+                      class="info-button"
+                      type="button"
+                      aria-label="Show account information for {{ row.account.display_username }}"
+                      aria-haspopup="dialog"
+                      data-account-info-trigger
+                      data-account-info-url="{% url 'controller:account_info_fragment' row.account.pk %}"
+                    >i</button>
+                  </div>
+                {% empty %}
+                  <div class="empty-state empty-state--compact">
+                    <div>
+                      <div class="empty-state__mark"><span>0</span></div>
+                      <p>No active accounts are available for assignment.</p>
+                    </div>
+                  </div>
+                {% endfor %}
+              </div>
               {{ assignment_form.accounts.errors }}
             </fieldset>
             <button class="button button--primary" type="submit">Commit assignments</button>
           </form>
         </div>
-        <footer class="panel__footer">Deselected accounts that currently use this plan return to config.yaml defaults. Desired-running accounts restart onto the validated change.</footer>
+        <footer class="panel__footer">Deselected accounts return to the default channels managed in Settings. Desired-running accounts restart onto the validated change.</footer>
       </section>
     </div>
 
@@ -77,4 +105,22 @@
       </section>
     </aside>
   </div>
+
+  <dialog class="account-dialog" data-account-info-dialog aria-labelledby="account-dialog-title">
+    <div class="account-dialog__frame">
+      <header class="account-dialog__header">
+        <div>
+          <p class="eyebrow">Account information</p>
+          <h2 id="account-dialog-title">Operational record</h2>
+        </div>
+        <button class="dialog-close" type="button" data-dialog-close aria-label="Close account information">×</button>
+      </header>
+      <div class="account-dialog__content" data-account-info-content aria-live="polite">
+        <div class="dialog-loading" role="status">
+          <span class="status-light" data-tone="pending" aria-hidden="true"></span>
+          Select an account to load its operational record.
+        </div>
+      </div>
+    </div>
+  </dialog>
 {% endblock %}

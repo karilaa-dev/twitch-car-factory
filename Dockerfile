@@ -23,9 +23,10 @@ COPY manage.py ./
 COPY twitch_farm/ twitch_farm/
 COPY controller/ controller/
 
-RUN mkdir -p /app/data /app/cookies /app/staticfiles \
+RUN mkdir -p /app/data /app/runtime /app/staticfiles \
     && DJANGO_DEBUG=0 \
        DJANGO_SECRET_KEY=container-build-only-not-for-runtime-0123456789-abcdef \
+       TWITCH_FARM_CREDENTIAL_KEYS=MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA= \
        .venv/bin/python manage.py collectstatic --noinput \
     && chown -R twitchfarm:twitchfarm /app
 

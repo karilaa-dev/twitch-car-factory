@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
-from pathlib import Path
 import re
 from typing import Iterable, Sequence
 
@@ -13,13 +12,18 @@ from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.db.models import F
 from django.utils import timezone
+from django.views.decorators.debug import sensitive_variables
 
-from .config import CHANNEL_RE, ConfigError, FarmConfig, load_config
+from .crypto import decrypt_text, encrypt_text
 from .models import (
+    AccountCredential,
     AccountChannelSelection,
     AccountCustomChannel,
+    AccountSessionSeed,
     ActionLog,
     ChannelPreset,
+    FarmConfiguration,
+    LegacyImportDraft,
     MinerAccount,
     MinerCommand,
     MinerInstanceState,
@@ -28,19 +32,24 @@ from .models import (
 )
 
 
+CHANNEL_RE = re.compile(r"^[A-Za-z0-9_]{1,100}$")
+
+
+def purge_expired_legacy_import_drafts(*, at=None) -> int:
+    """Delete expired encrypted drafts; safe for web and worker maintenance."""
+
+    deleted, _ = LegacyImportDraft.objects.filter(
+        expires_at__lte=at or timezone.now()
+    ).delete()
+    return deleted
+
+
 @dataclass(frozen=True, slots=True)
 class ChannelResolution:
     mode: str
     source_name: str
     channels: tuple[str, ...]
     fingerprint: str
-
-
-@dataclass(frozen=True, slots=True)
-class SyncResult:
-    created: tuple[str, ...]
-    updated: tuple[str, ...]
-    disabled: tuple[str, ...]
 
 
 def normalize_channels(
@@ -100,25 +109,13 @@ def compute_configuration_fingerprint(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _coerce_config(config: FarmConfig | str | Path | None) -> FarmConfig:
-    return config if isinstance(config, FarmConfig) else load_config(config)
-
-
-def resolve_channels(
-    account: MinerAccount,
-    config: FarmConfig | str | Path | None = None,
-) -> ChannelResolution:
+def resolve_channels(account: MinerAccount) -> ChannelResolution:
     """Resolve and validate the exact channels that a fresh launch must use."""
 
-    farm_config = _coerce_config(config)
-    if not account.is_configured:
-        raise ValidationError(f"Account {account.config_key!r} is not configured.")
-    try:
-        account_config = farm_config.twitch_users[account.config_key]
-    except KeyError as exc:
-        raise ValidationError(
-            f"Account {account.config_key!r} is missing from config.yaml."
-        ) from exc
+    if not account.is_active:
+        raise ValidationError(f"Account {account.config_key!r} is archived.")
+    if not AccountCredential.objects.filter(account=account).exists():
+        raise ValidationError(f"Account {account.config_key!r} has no stored credentials.")
 
     try:
         selection = account.selection
@@ -126,8 +123,8 @@ def resolve_channels(
         selection = AccountChannelSelection(account=account, mode=AccountChannelSelection.Mode.DEFAULT)
 
     if selection.mode == AccountChannelSelection.Mode.DEFAULT:
-        channels = normalize_channels(farm_config.default_channels)
-        source_name = "config.yaml"
+        channels = normalize_channels(FarmConfiguration.load().default_channels)
+        source_name = "farm defaults"
     elif selection.mode == AccountChannelSelection.Mode.CUSTOM:
         channels = normalize_channels(
             account.custom_channels.order_by("position", "id").values_list("name", flat=True)
@@ -145,7 +142,7 @@ def resolve_channels(
 
     fingerprint = compute_configuration_fingerprint(
         account_key=account.config_key,
-        username=account_config.username,
+        username=account.display_username,
         mode=selection.mode,
         source_name=source_name,
         channels=channels,
@@ -161,86 +158,8 @@ def resolve_channels(
 resolve_effective_channels = resolve_channels
 
 
-@transaction.atomic
-def sync_config_accounts(
-    config: FarmConfig | str | Path | None = None,
-) -> SyncResult:
-    """Mirror YAML accounts while preserving existing users' desired state."""
-
-    farm_config = _coerce_config(config)
-    now = timezone.now()
-    configured_keys = set(farm_config.twitch_users)
-    existing = {
-        account.config_key: account
-        for account in MinerAccount.objects.select_for_update().all()
-    }
-    created: list[str] = []
-    updated: list[str] = []
-    disabled: list[str] = []
-
-    for key, account_config in farm_config.twitch_users.items():
-        account = existing.get(key)
-        if account is None:
-            account = MinerAccount.objects.create(
-                config_key=key,
-                display_username=account_config.username,
-                is_configured=True,
-                config_synced_at=now,
-            )
-            AccountChannelSelection.objects.create(account=account)
-            MinerInstanceState.objects.create(
-                account=account,
-                desired_state=(
-                    MinerInstanceState.DesiredState.RUNNING
-                    if farm_config.autostart_instances
-                    else MinerInstanceState.DesiredState.STOPPED
-                ),
-                observed_state=MinerInstanceState.ObservedState.UNKNOWN,
-            )
-            created.append(key)
-        else:
-            account.display_username = account_config.username
-            account.is_configured = True
-            account.config_synced_at = now
-            account.save(
-                update_fields=("display_username", "is_configured", "config_synced_at", "updated_at")
-            )
-            AccountChannelSelection.objects.get_or_create(account=account)
-            MinerInstanceState.objects.get_or_create(account=account)
-            updated.append(key)
-
-        try:
-            fingerprint = resolve_channels(account, farm_config).fingerprint
-        except ValidationError:
-            fingerprint = ""
-        if account.configuration_fingerprint != fingerprint:
-            account.configuration_fingerprint = fingerprint
-            account.save(update_fields=("configuration_fingerprint", "updated_at"))
-
-    missing_accounts = [account for key, account in existing.items() if key not in configured_keys]
-    for account in missing_accounts:
-        if account.is_configured:
-            account.is_configured = False
-            account.configuration_fingerprint = ""
-            account.config_synced_at = now
-            account.save(
-                update_fields=(
-                    "is_configured",
-                    "configuration_fingerprint",
-                    "config_synced_at",
-                    "updated_at",
-                )
-            )
-            state, _ = MinerInstanceState.objects.get_or_create(account=account)
-            state.desired_state = MinerInstanceState.DesiredState.STOPPED
-            state.save(update_fields=("desired_state", "updated_at"))
-            disabled.append(account.config_key)
-
-    return SyncResult(tuple(created), tuple(updated), tuple(disabled))
-
-
-def _fingerprint_without_yaml(account: MinerAccount) -> str:
-    """Best-effort fingerprint for web services that cannot read secrets/YAML."""
+def _best_effort_fingerprint(account: MinerAccount) -> str:
+    """Return a fingerprint when possible without making an invalid account runnable."""
 
     selection = account.selection
     if selection.mode == AccountChannelSelection.Mode.CUSTOM:
@@ -267,10 +186,257 @@ def _fingerprint_without_yaml(account: MinerAccount) -> str:
 def _refresh_account_fingerprint(account: MinerAccount) -> None:
     try:
         fingerprint = resolve_channels(account).fingerprint
-    except (ConfigError, ValidationError):
-        fingerprint = _fingerprint_without_yaml(account)
+    except ValidationError:
+        try:
+            fingerprint = _best_effort_fingerprint(account)
+        except (AccountChannelSelection.DoesNotExist, ValidationError):
+            fingerprint = ""
     account.configuration_fingerprint = fingerprint
     account.save(update_fields=("configuration_fingerprint", "updated_at"))
+
+
+@sensitive_variables()
+def get_account_password(account: MinerAccount | int) -> str:
+    account_id = account if isinstance(account, int) else account.pk
+    try:
+        credential = AccountCredential.objects.get(account_id=account_id)
+    except AccountCredential.DoesNotExist as exc:
+        raise ValidationError("This account has no stored Twitch password.") from exc
+    return decrypt_text(credential.password_ciphertext)
+
+
+def _normalize_account_identity(config_key: str, username: str) -> tuple[str, str]:
+    key = config_key.strip()
+    clean_username = username.strip()
+    if not key or len(key) > 150:
+        raise ValidationError("Account key must be between 1 and 150 characters.")
+    if not CHANNEL_RE.fullmatch(clean_username):
+        raise ValidationError("Enter a valid Twitch username.")
+    return key, clean_username
+
+
+@sensitive_variables()
+def _validate_password(password: str) -> str:
+    if not isinstance(password, str) or not password.strip():
+        raise ValidationError("Twitch password cannot be empty.")
+    if len(password) > 4096:
+        raise ValidationError("Twitch password is too long.")
+    return password
+
+
+@transaction.atomic
+@sensitive_variables()
+def create_account(
+    *,
+    config_key: str,
+    username: str,
+    password: str,
+    mode: str = AccountChannelSelection.Mode.DEFAULT,
+    channels: str | Iterable[str] | None = None,
+    preset: ChannelPreset | int | str | None = None,
+    start_after_save: bool = False,
+    actor=None,
+) -> MinerAccount:
+    key, clean_username = _normalize_account_identity(config_key, username)
+    secret = _validate_password(password)
+    if MinerAccount.objects.filter(config_key__iexact=key).exists():
+        raise ValidationError("An account with this key already exists.")
+    if MinerAccount.objects.filter(display_username__iexact=clean_username).exists():
+        raise ValidationError("This Twitch username is already managed.")
+
+    account = MinerAccount.objects.create(
+        config_key=key,
+        display_username=clean_username,
+        is_active=True,
+    )
+    AccountCredential.objects.create(
+        account=account,
+        password_ciphertext=encrypt_text(secret),
+    )
+    AccountChannelSelection.objects.create(account=account)
+    MinerInstanceState.objects.create(
+        account=account,
+        desired_state=MinerInstanceState.DesiredState.STOPPED,
+        observed_state=MinerInstanceState.ObservedState.UNKNOWN,
+    )
+    if mode != AccountChannelSelection.Mode.DEFAULT or channels is not None or preset is not None:
+        set_account_channel_selection(
+            account,
+            mode,
+            channels=channels,
+            preset=preset,
+            actor=actor,
+            enqueue_restart=False,
+        )
+    else:
+        _refresh_account_fingerprint(account)
+
+    ActionLog.objects.create(
+        actor=actor,
+        account=account,
+        action="account_created",
+        message=f"Created account {account.config_key}.",
+        details={"username": account.display_username},
+    )
+    if start_after_save:
+        # Validate the complete launch source before durable running intent is set.
+        resolve_channels(account)
+        enqueue_command(
+            account,
+            MinerCommand.Action.START,
+            actor=actor,
+            reason="Start requested while creating the account.",
+        )
+    return account
+
+
+@transaction.atomic
+@sensitive_variables()
+def update_account(
+    account: MinerAccount,
+    *,
+    username: str,
+    password: str | None = None,
+    actor=None,
+) -> MinerAccount:
+    account = MinerAccount.objects.select_for_update().get(pk=account.pk)
+    _, clean_username = _normalize_account_identity(account.config_key, username)
+    duplicate = MinerAccount.objects.filter(display_username__iexact=clean_username).exclude(
+        pk=account.pk
+    )
+    if duplicate.exists():
+        raise ValidationError("This Twitch username is already managed.")
+
+    username_changed = account.display_username != clean_username
+    credential_changed = password is not None and password != ""
+    if username_changed:
+        account.display_username = clean_username
+        account.save(update_fields=("display_username", "updated_at"))
+        AccountSessionSeed.objects.filter(account=account).delete()
+    if credential_changed:
+        secret = _validate_password(password or "")
+        AccountCredential.objects.update_or_create(
+            account=account,
+            defaults={"password_ciphertext": encrypt_text(secret)},
+        )
+    _refresh_account_fingerprint(account)
+
+    ActionLog.objects.create(
+        actor=actor,
+        account=account,
+        action="account_updated",
+        message=f"Updated account {account.config_key}.",
+        details={
+            "username_changed": username_changed,
+            "credential_changed": credential_changed,
+        },
+    )
+    state, _ = MinerInstanceState.objects.get_or_create(account=account)
+    if (
+        account.is_active
+        and (username_changed or credential_changed)
+        and state.desired_state == MinerInstanceState.DesiredState.RUNNING
+    ):
+        enqueue_command(
+            account,
+            MinerCommand.Action.RESTART,
+            actor=actor,
+            reason="Account credentials changed.",
+        )
+    return account
+
+
+@transaction.atomic
+def archive_account(account: MinerAccount, *, actor=None) -> MinerAccount:
+    account = MinerAccount.objects.select_for_update().get(pk=account.pk)
+    state, _ = MinerInstanceState.objects.get_or_create(account=account)
+    if state.desired_state == MinerInstanceState.DesiredState.RUNNING or state.current_run_id:
+        enqueue_command(
+            account,
+            MinerCommand.Action.STOP,
+            actor=actor,
+            reason="Account archived from the web control room.",
+        )
+    account.is_active = False
+    account.configuration_fingerprint = ""
+    account.save(update_fields=("is_active", "configuration_fingerprint", "updated_at"))
+    ActionLog.objects.create(
+        actor=actor,
+        account=account,
+        action="account_archived",
+        message=f"Archived account {account.config_key}.",
+    )
+    return account
+
+
+@transaction.atomic
+def reactivate_account(account: MinerAccount, *, actor=None) -> MinerAccount:
+    account = MinerAccount.objects.select_for_update().get(pk=account.pk)
+    if not AccountCredential.objects.filter(account=account).exists():
+        raise ValidationError("Add a Twitch password before reactivating this account.")
+    account.is_active = True
+    account.save(update_fields=("is_active", "updated_at"))
+    resolve_channels(account)
+    _refresh_account_fingerprint(account)
+    ActionLog.objects.create(
+        actor=actor,
+        account=account,
+        action="account_reactivated",
+        message=f"Reactivated account {account.config_key}.",
+    )
+    return account
+
+
+@transaction.atomic
+def update_farm_configuration(
+    *,
+    default_channels: str | Iterable[str],
+    autostart_new_accounts: bool,
+    actor=None,
+) -> FarmConfiguration:
+    channels = normalize_channels(default_channels)
+    configuration = FarmConfiguration.objects.select_for_update().filter(pk=1).first()
+    if configuration is None:
+        configuration = FarmConfiguration(pk=1)
+    channels_changed = list(configuration.default_channels) != channels
+    preference_changed = (
+        configuration.autostart_new_accounts != bool(autostart_new_accounts)
+    )
+    changed = channels_changed or preference_changed
+    configuration.default_channels = channels
+    configuration.autostart_new_accounts = bool(autostart_new_accounts)
+    configuration.save()
+    if changed:
+        if channels_changed:
+            accounts = list(
+                MinerAccount.objects.select_for_update()
+                .filter(is_active=True, selection__mode=AccountChannelSelection.Mode.DEFAULT)
+                .order_by("pk")
+            )
+            for account in accounts:
+                MinerAccount.objects.filter(pk=account.pk).update(
+                    channel_revision=F("channel_revision") + 1
+                )
+                account.refresh_from_db(fields=("channel_revision", "updated_at"))
+                _refresh_account_fingerprint(account)
+                state, _ = MinerInstanceState.objects.get_or_create(account=account)
+                if state.desired_state == MinerInstanceState.DesiredState.RUNNING:
+                    enqueue_command(
+                        account,
+                        MinerCommand.Action.RESTART,
+                        actor=actor,
+                        reason="Farm default channels changed.",
+                    )
+        ActionLog.objects.create(
+            actor=actor,
+            action="farm_settings_updated",
+            message="Updated farm defaults.",
+            details={
+                "default_channels": channels,
+                "autostart_new_accounts": bool(autostart_new_accounts),
+            },
+        )
+    return configuration
 
 
 @transaction.atomic
@@ -289,6 +455,12 @@ def enqueue_command(
         raise ValidationError(f"Unknown miner command: {action!r}.") from exc
 
     account = MinerAccount.objects.select_for_update().get(pk=account.pk)
+    if action != MinerCommand.Action.STOP:
+        if not account.is_active:
+            raise ValidationError("Archived accounts cannot be started or restarted.")
+        if not AccountCredential.objects.filter(account=account).exists():
+            raise ValidationError("Add a Twitch password before starting this account.")
+        resolve_channels(account)
     state, _ = MinerInstanceState.objects.select_for_update().get_or_create(account=account)
     active = MinerCommand.objects.select_for_update().filter(
         account=account,
@@ -303,8 +475,7 @@ def enqueue_command(
     )
     state.desired_state = desired
     # Recovery retry state is taken over only after the worker validates the
-    # replacement launch snapshot. This keeps automatic recovery viable when
-    # a newly requested start/restart has invalid YAML or channel data.
+    # replacement launch snapshot.
     state.save(update_fields=("desired_state", "updated_at"))
 
     if action == MinerCommand.Action.STOP:
@@ -356,7 +527,10 @@ def enqueue_all(
     reason: str = "",
 ) -> list[MinerCommand]:
     commands = []
-    for account in MinerAccount.objects.filter(is_configured=True).order_by("config_key"):
+    for account in MinerAccount.objects.filter(
+        is_active=True,
+        credential__isnull=False,
+    ).order_by("config_key"):
         commands.append(enqueue_command(account, action, actor=actor, reason=reason))
     return commands
 
@@ -515,14 +689,11 @@ def delete_preset(preset: ChannelPreset, *, actor=None) -> None:
 def create_launch_snapshot(
     account: MinerAccount,
     worker_id: str = "",
-    *,
-    config: FarmConfig | str | Path | None = None,
 ) -> MinerRun:
-    """Validate YAML + DB state and persist an immutable, secret-free launch spec."""
+    """Validate DB state and persist an immutable, secret-free launch spec."""
 
     account = MinerAccount.objects.select_for_update().get(pk=account.pk)
-    farm_config = _coerce_config(config)
-    resolution = resolve_channels(account, farm_config)
+    resolution = resolve_channels(account)
     run = MinerRun(
         account=account,
         source_mode=resolution.mode,

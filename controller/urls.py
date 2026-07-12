@@ -15,7 +15,20 @@ urlpatterns = [
     path("status/", views.status_fragment, name="status_fragment"),
     path("actions/<str:action>/", views.global_action, name="global_action"),
     path("accounts/", views.account_list, name="account_list"),
+    path("accounts/new/", views.account_create, name="account_create"),
     path("accounts/<int:pk>/", views.account_detail, name="account_detail"),
+    path("accounts/<int:pk>/edit/", views.account_edit, name="account_edit"),
+    path("accounts/<int:pk>/archive/", views.account_archive, name="account_archive"),
+    path(
+        "accounts/<int:pk>/reactivate/",
+        views.account_reactivate,
+        name="account_reactivate",
+    ),
+    path(
+        "accounts/<int:pk>/info/",
+        views.account_info_fragment,
+        name="account_info_fragment",
+    ),
     path(
         "accounts/<int:pk>/actions/<str:action>/",
         views.account_action,
@@ -32,4 +45,16 @@ urlpatterns = [
     path("presets/<int:pk>/edit/", views.preset_edit, name="preset_edit"),
     path("presets/<int:pk>/delete/", views.preset_delete, name="preset_delete"),
     path("presets/<int:pk>/assign/", views.preset_assign, name="preset_assign"),
+    path("settings/", views.settings_general, name="settings_general"),
+    path("settings/import/", views.settings_import, name="settings_import"),
+    path(
+        "settings/import/confirm/",
+        views.settings_import_confirm,
+        name="settings_import_confirm",
+    ),
+    path(
+        "settings/import/cancel/",
+        views.settings_import_cancel,
+        name="settings_import_cancel",
+    ),
 ]

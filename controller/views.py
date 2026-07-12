@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import logging
 
 from django.contrib import messages
 from django.contrib.admin.views.decorators import staff_member_required
@@ -16,10 +17,17 @@ from django.http import HttpRequest, HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse_lazy
 from django.utils import timezone
+from django.views.decorators.cache import never_cache
+from django.views.decorators.debug import sensitive_post_parameters
 from django.views.decorators.http import require_POST, require_safe
 
 from .forms import (
+    AccountCreateForm,
+    AccountEditForm,
     AccountChannelSelectionForm,
+    FarmConfigurationForm,
+    LegacyImportConfirmForm,
+    LegacyImportUploadForm,
     PresetAssignmentForm,
     PresetForm,
     StaffAuthenticationForm,
@@ -28,6 +36,8 @@ from .models import (
     AccountChannelSelection,
     ActionLog,
     ChannelPreset,
+    FarmConfiguration,
+    LegacyImportDraft,
     MinerAccount,
     MinerCommand,
     MinerIncident,
@@ -36,15 +46,31 @@ from .models import (
     WorkerLease,
 )
 from .services import (
+    archive_account,
+    create_account,
     delete_preset,
     enqueue_all,
     enqueue_command,
+    reactivate_account,
     save_preset,
     set_account_channel_selection,
+    update_account,
+    update_farm_configuration,
 )
 
 
 CONTROL_LOGIN_URL = "controller:login"
+logger = logging.getLogger(__name__)
+
+
+def _log_sensitive_failure(operation: str, exc: Exception) -> None:
+    """Record only the exception class; messages may contain credentials."""
+
+    logger.error(
+        "%s failed with %s; sensitive details were suppressed.",
+        operation,
+        type(exc).__name__,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +121,7 @@ def _account_queryset():
             "runtime_state__current_run",
             "selection",
             "selection__preset",
+            "credential",
         )
         .prefetch_related(
             "custom_channels",
@@ -216,8 +243,117 @@ def account_list(request: HttpRequest) -> HttpResponse:
     return render(
         request,
         "controller/accounts.html",
-        {"account_rows": [_as_telemetry(account) for account in _account_queryset()]},
+        {
+            "account_rows": [_as_telemetry(account) for account in _account_queryset()],
+            "active_count": MinerAccount.objects.filter(is_active=True).count(),
+        },
     )
+
+
+@staff_member_required(login_url=CONTROL_LOGIN_URL)
+@sensitive_post_parameters("password")
+def account_create(request: HttpRequest) -> HttpResponse:
+    form = AccountCreateForm(request.POST or None)
+    if request.method == "POST" and form.is_valid():
+        mode = form.cleaned_data["mode"]
+        try:
+            account = create_account(
+                config_key=form.cleaned_data["config_key"],
+                username=form.cleaned_data["username"],
+                password=form.cleaned_data["password"],
+                mode=mode,
+                channels=(
+                    form.cleaned_data["custom_channel_names"]
+                    if mode == AccountChannelSelection.Mode.CUSTOM
+                    else None
+                ),
+                preset=form.cleaned_data.get("preset"),
+                start_after_save=form.cleaned_data["start_after_save"],
+                actor=request.user,
+            )
+        except ValidationError as exc:
+            form.add_error(None, "; ".join(exc.messages))
+        except Exception as exc:
+            _log_sensitive_failure("Account creation", exc)
+            form.add_error(
+                None,
+                "The account could not be saved. Sensitive details were suppressed.",
+            )
+            return render(
+                request,
+                "controller/account_form.html",
+                {"form": form, "account": None},
+                status=500,
+            )
+        else:
+            messages.success(request, f"Account {account.config_key} created.")
+            return redirect("controller:account_detail", pk=account.pk)
+    return render(
+        request,
+        "controller/account_form.html",
+        {"form": form, "account": None},
+        status=400 if request.method == "POST" else 200,
+    )
+
+
+@staff_member_required(login_url=CONTROL_LOGIN_URL)
+@sensitive_post_parameters("password")
+def account_edit(request: HttpRequest, pk: int) -> HttpResponse:
+    account = get_object_or_404(MinerAccount, pk=pk)
+    form = AccountEditForm(request.POST or None, account=account)
+    if request.method == "POST" and form.is_valid():
+        try:
+            account = update_account(
+                account,
+                username=form.cleaned_data["username"],
+                password=form.cleaned_data["password"] or None,
+                actor=request.user,
+            )
+        except ValidationError as exc:
+            form.add_error(None, "; ".join(exc.messages))
+        except Exception as exc:
+            _log_sensitive_failure("Account update", exc)
+            form.add_error(
+                None,
+                "The account could not be updated. Sensitive details were suppressed.",
+            )
+            return render(
+                request,
+                "controller/account_form.html",
+                {"form": form, "account": account},
+                status=500,
+            )
+        else:
+            messages.success(request, f"Account {account.config_key} updated.")
+            return redirect("controller:account_detail", pk=account.pk)
+    return render(
+        request,
+        "controller/account_form.html",
+        {"form": form, "account": account},
+        status=400 if request.method == "POST" else 200,
+    )
+
+
+@staff_member_required(login_url=CONTROL_LOGIN_URL)
+@require_POST
+def account_archive(request: HttpRequest, pk: int) -> HttpResponse:
+    account = get_object_or_404(MinerAccount, pk=pk)
+    archive_account(account, actor=request.user)
+    messages.success(request, f"Account {account.config_key} archived.")
+    return redirect("controller:account_detail", pk=account.pk)
+
+
+@staff_member_required(login_url=CONTROL_LOGIN_URL)
+@require_POST
+def account_reactivate(request: HttpRequest, pk: int) -> HttpResponse:
+    account = get_object_or_404(MinerAccount, pk=pk)
+    try:
+        reactivate_account(account, actor=request.user)
+    except ValidationError as exc:
+        messages.error(request, "; ".join(exc.messages))
+    else:
+        messages.success(request, f"Account {account.config_key} reactivated.")
+    return redirect("controller:account_detail", pk=account.pk)
 
 
 def _planned_channel_source(account: MinerAccount) -> dict:
@@ -227,11 +363,12 @@ def _planned_channel_source(account: MinerAccount) -> dict:
         selection = None
 
     if selection is None or selection.mode == AccountChannelSelection.Mode.DEFAULT:
+        configuration = FarmConfiguration.load()
         return {
             "mode": AccountChannelSelection.Mode.DEFAULT,
-            "name": "config.yaml defaults",
-            "channels": (),
-            "managed_externally": True,
+            "name": "Farm defaults",
+            "channels": tuple(configuration.default_channels),
+            "managed_externally": False,
         }
     if selection.mode == AccountChannelSelection.Mode.PRESET:
         return {
@@ -279,6 +416,24 @@ def account_detail(request: HttpRequest, pk: int) -> HttpResponse:
 
 
 @staff_member_required(login_url=CONTROL_LOGIN_URL)
+@never_cache
+@require_safe
+def account_info_fragment(request: HttpRequest, pk: int) -> HttpResponse:
+    account = get_object_or_404(_account_queryset(), pk=pk)
+    response = render(
+        request,
+        "controller/account_info_fragment.html",
+        {
+            "account": account,
+            "telemetry": _as_telemetry(account),
+            "planned_source": _planned_channel_source(account),
+        },
+    )
+    response["Cache-Control"] = "private, no-store, max-age=0"
+    return response
+
+
+@staff_member_required(login_url=CONTROL_LOGIN_URL)
 @require_POST
 def account_action(request: HttpRequest, pk: int, action: str) -> HttpResponse:
     account = get_object_or_404(MinerAccount, pk=pk)
@@ -286,8 +441,10 @@ def account_action(request: HttpRequest, pk: int, action: str) -> HttpResponse:
     if action not in valid_actions:
         messages.error(request, "Unknown lifecycle command.")
         return redirect("controller:account_detail", pk=account.pk)
-    if action != MinerCommand.Action.STOP and not account.is_configured:
-        messages.error(request, "This account is not present in config.yaml and cannot start.")
+    if action != MinerCommand.Action.STOP and (
+        not account.is_active or not account.has_credentials
+    ):
+        messages.error(request, "This account is archived or has no stored credentials.")
         return redirect("controller:account_detail", pk=account.pk)
 
     enqueue_command(
@@ -386,6 +543,41 @@ def preset_create(request: HttpRequest) -> HttpResponse:
     )
 
 
+def _assignment_rows(preset: ChannelPreset, form: PresetAssignmentForm) -> list[dict]:
+    if form.is_bound:
+        selected_ids = {
+            int(value)
+            for value in form.data.getlist("accounts")
+            if str(value).isdigit()
+        }
+    else:
+        selected_ids = set(
+            preset.account_selections.values_list("account_id", flat=True)
+        )
+    accounts = form.fields["accounts"].queryset
+    return [
+        {
+            "account": account,
+            "checked": account.pk in selected_ids,
+            "input_id": f"id_accounts_{index}",
+        }
+        for index, account in enumerate(accounts)
+    ]
+
+
+def _preset_detail_context(
+    preset: ChannelPreset,
+    *,
+    assignment_form: PresetAssignmentForm | None = None,
+) -> dict:
+    form = assignment_form or PresetAssignmentForm(preset=preset)
+    return {
+        "preset": preset,
+        "assignment_form": form,
+        "assignment_rows": _assignment_rows(preset, form),
+    }
+
+
 @staff_member_required(login_url=CONTROL_LOGIN_URL)
 def preset_detail(request: HttpRequest, pk: int) -> HttpResponse:
     preset = get_object_or_404(
@@ -395,10 +587,7 @@ def preset_detail(request: HttpRequest, pk: int) -> HttpResponse:
     return render(
         request,
         "controller/preset_detail.html",
-        {
-            "preset": preset,
-            "assignment_form": PresetAssignmentForm(preset=preset),
-        },
+        _preset_detail_context(preset),
     )
 
 
@@ -451,7 +640,7 @@ def preset_assign(request: HttpRequest, pk: int) -> HttpResponse:
         return render(
             request,
             "controller/preset_detail.html",
-            {"preset": preset, "assignment_form": form},
+            _preset_detail_context(preset, assignment_form=form),
             status=400,
         )
 
@@ -459,7 +648,8 @@ def preset_assign(request: HttpRequest, pk: int) -> HttpResponse:
     currently_selected = {
         selection.account_id: selection.account
         for selection in AccountChannelSelection.objects.select_related("account").filter(
-            preset=preset
+            preset=preset,
+            account__is_active=True,
         )
     }
 
@@ -481,6 +671,138 @@ def preset_assign(request: HttpRequest, pk: int) -> HttpResponse:
 
     messages.success(request, f"Assignments for {preset.name} updated.")
     return redirect("controller:preset_detail", pk=preset.pk)
+
+
+@staff_member_required(login_url=CONTROL_LOGIN_URL)
+def settings_general(request: HttpRequest) -> HttpResponse:
+    configuration = FarmConfiguration.load()
+    form = FarmConfigurationForm(request.POST or None, configuration=configuration)
+    if request.method == "POST" and form.is_valid():
+        try:
+            update_farm_configuration(
+                default_channels=form.cleaned_channel_names,
+                autostart_new_accounts=form.cleaned_data["autostart_new_accounts"],
+                actor=request.user,
+            )
+        except ValidationError as exc:
+            form.add_error(None, "; ".join(exc.messages))
+        else:
+            messages.success(request, "Farm settings updated.")
+            return redirect("controller:settings_general")
+    return render(
+        request,
+        "controller/settings_general.html",
+        {
+            "form": form,
+            "configuration": configuration,
+            "settings_section": "general",
+        },
+        status=400 if request.method == "POST" else 200,
+    )
+
+
+@staff_member_required(login_url=CONTROL_LOGIN_URL)
+def settings_import(request: HttpRequest) -> HttpResponse:
+    form = LegacyImportUploadForm(request.POST or None, request.FILES or None)
+    context = {
+        "form": form,
+        "settings_section": "import",
+        "draft": None,
+        "preview": None,
+        "result": None,
+    }
+    if request.method == "POST" and form.is_valid():
+        from .legacy_import import LegacyImportError, prepare_legacy_import
+
+        try:
+            draft = prepare_legacy_import(form.cleaned_data["archive"], request.user)
+        except LegacyImportError as exc:
+            form.add_error("archive", str(exc))
+        except Exception as exc:
+            _log_sensitive_failure("Legacy import preview", exc)
+            form.add_error(
+                "archive",
+                "The archive could not be inspected. Sensitive details were suppressed.",
+            )
+            return render(
+                request,
+                "controller/settings_import.html",
+                context,
+                status=500,
+            )
+        else:
+            context.update({"draft": draft, "preview": draft.preview})
+            return render(request, "controller/settings_import.html", context)
+    return render(
+        request,
+        "controller/settings_import.html",
+        context,
+        status=400 if request.method == "POST" else 200,
+    )
+
+
+@staff_member_required(login_url=CONTROL_LOGIN_URL)
+@require_POST
+def settings_import_confirm(request: HttpRequest) -> HttpResponse:
+    form = LegacyImportConfirmForm(request.POST)
+    context = {
+        "form": LegacyImportUploadForm(),
+        "settings_section": "import",
+        "draft": None,
+        "preview": None,
+        "result": None,
+    }
+    if not form.is_valid():
+        draft_id = form.cleaned_data.get("draft_id")
+        draft = (
+            LegacyImportDraft.objects.filter(pk=draft_id, actor=request.user).first()
+            if draft_id is not None
+            else None
+        )
+        context.update(
+            {
+                "confirm_form": form,
+                "draft": draft,
+                "preview": draft.preview if draft else None,
+            }
+        )
+        return render(request, "controller/settings_import.html", context, status=400)
+
+    from .legacy_import import LegacyImportError, confirm_legacy_import
+
+    try:
+        result = confirm_legacy_import(
+            form.cleaned_data["draft_id"],
+            request.user,
+            replace=form.cleaned_data["replace"],
+            acknowledged=form.cleaned_data["acknowledged"],
+            confirmation=form.cleaned_data["confirmation"],
+        )
+    except LegacyImportError as exc:
+        messages.error(request, str(exc))
+        return redirect("controller:settings_import")
+    except Exception as exc:
+        _log_sensitive_failure("Legacy import confirmation", exc)
+        messages.error(
+            request,
+            "The import could not be completed. Sensitive details were suppressed.",
+        )
+        return redirect("controller:settings_import")
+    context["result"] = result
+    messages.success(request, "Legacy import completed.")
+    return render(request, "controller/settings_import.html", context)
+
+
+@staff_member_required(login_url=CONTROL_LOGIN_URL)
+@require_POST
+def settings_import_cancel(request: HttpRequest) -> HttpResponse:
+    draft_id = request.POST.get("draft_id")
+    try:
+        LegacyImportDraft.objects.filter(pk=draft_id, actor=request.user).delete()
+    except (ValidationError, ValueError):
+        pass
+    messages.success(request, "Legacy import draft discarded.")
+    return redirect("controller:settings_import")
 
 
 @require_POST

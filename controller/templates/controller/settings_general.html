@@ -1,0 +1,64 @@
+{% extends "controller/settings_base.html" %}
+
+{% block settings_title %}General settings{% endblock %}
+
+{% block settings_content %}
+  <section class="panel" aria-labelledby="general-settings-title">
+    <header class="panel__header">
+      <div>
+        <p class="panel-kicker">Farm defaults</p>
+        <h2 id="general-settings-title">General</h2>
+      </div>
+      {% if configuration.updated_at %}<span class="status-chip">Updated {{ configuration.updated_at|timesince }} ago</span>{% endif %}
+    </header>
+    <div class="panel__body">
+      <form class="form-grid" method="post">
+        {% csrf_token %}
+        {% if form.non_field_errors %}<div class="message error" role="alert">{{ form.non_field_errors }}</div>{% endif %}
+
+        {% for field in form %}
+          {% if field.field.widget.input_type == 'checkbox' %}
+            <div class="field field--choice">
+              <label class="toggle-field" for="{{ field.id_for_label }}">
+                {{ field }}
+                <span>
+                  <strong>{{ field.label }}</strong>
+                  {% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}
+                </span>
+              </label>
+              {{ field.errors }}
+            </div>
+          {% else %}
+            <div class="field">
+              <label for="{{ field.id_for_label }}">{{ field.label }}</label>
+              {{ field }}
+              {% if field.help_text %}<span class="field-help">{{ field.help_text }}</span>{% endif %}
+              {{ field.errors }}
+            </div>
+          {% endif %}
+        {% endfor %}
+
+        <div class="button-row">
+          <button class="button button--primary" type="submit">Save general settings</button>
+        </div>
+      </form>
+    </div>
+    <footer class="panel__footer">Changing the default channel list queues a controlled restart only for desired-running accounts that use the default source.</footer>
+  </section>
+
+  <section class="panel settings-assurance" aria-labelledby="general-behavior-title">
+    <header class="panel__header"><h2 id="general-behavior-title">What these settings control</h2></header>
+    <div class="panel__body assurance-grid">
+      <div>
+        <span class="assurance-grid__number">01</span>
+        <h3>Default channels</h3>
+        <p>Ordered launch inputs for accounts that are not assigned to a preset or custom list.</p>
+      </div>
+      <div>
+        <span class="assurance-grid__number">02</span>
+        <h3>New-account preference</h3>
+        <p>The default state offered when adding an account. Every account form still makes its launch choice explicit.</p>
+      </div>
+    </div>
+  </section>
+{% endblock %}

@@ -106,6 +106,9 @@ class ComposeSecurityDefaultsTests(SimpleTestCase):
                 "DJANGO_SECRET_KEY": (
                     "standalone-production-default-test-abcdefghijklmnopqrstuvwxyz-0123456789"
                 ),
+                "TWITCH_FARM_CREDENTIAL_KEYS": (
+                    "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+                ),
             }
         )
         script = """
@@ -141,6 +144,87 @@ print(json.dumps({
                 "hsts_preload": True,
             },
         )
+
+
+class ComposeDeploymentContractTests(SimpleTestCase):
+    def compose(self):
+        return yaml.safe_load(
+            (Path(settings.BASE_DIR) / "docker-compose.yml").read_text(encoding="utf-8")
+        )
+
+    def test_worker_has_time_to_finalize_sequential_miner_shutdown(self):
+        compose = self.compose()
+
+        self.assertEqual(compose["services"]["worker"]["stop_grace_period"], "2m")
+
+    def test_compose_uses_database_credentials_without_legacy_mounts(self):
+        compose = self.compose()
+        services = compose["services"]
+
+        self.assertEqual(set(services), {"migrate", "web", "worker"})
+        for name, service in services.items():
+            with self.subTest(service=name):
+                environment = service["environment"]
+                self.assertEqual(
+                    environment["TWITCH_FARM_CREDENTIAL_KEYS"],
+                    "${TWITCH_FARM_CREDENTIAL_KEYS:?Set TWITCH_FARM_CREDENTIAL_KEYS in .env}",
+                )
+                self.assertNotIn("TWITCH_FARM_CONFIG", environment)
+                self.assertNotIn("TWITCH_FARM_COOKIES_DIR", environment)
+
+                command = " ".join(service.get("command", ()))
+                self.assertNotIn("sync_config_accounts", command)
+                self.assertNotIn("import_legacy_data", command)
+
+                volumes = "\n".join(service.get("volumes", ()))
+                self.assertNotIn("config.yaml", volumes)
+                self.assertNotIn("/app/cookies", volumes)
+
+        self.assertNotIn("profiles", compose)
+        self.assertEqual(
+            services["worker"]["volumes"],
+            ["./data:/app/data", "./runtime:/app/runtime"],
+        )
+        self.assertEqual(services["web"]["volumes"], ["./data:/app/data"])
+
+    def test_docker_context_excludes_runtime_env_but_keeps_example(self):
+        patterns = {
+            line.strip()
+            for line in (Path(settings.BASE_DIR) / ".dockerignore")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+
+        self.assertIn(".env", patterns)
+        self.assertNotIn(".env.example", patterns)
+        self.assertTrue({"config.yaml", "cookies/", "runtime/"}.issubset(patterns))
+
+    def test_readme_documents_ui_only_account_setup_and_legacy_import(self):
+        readme = (Path(settings.BASE_DIR) / "README.md").read_text(encoding="utf-8")
+        docker_section = readme.split("## Docker Compose", 1)[1].split(
+            "## Safe validation", 1
+        )[0]
+
+        self.assertIn("Settings → General", readme)
+        self.assertIn("Settings → Import legacy data", readme)
+        self.assertIn("The only supported legacy migration path", readme)
+        self.assertIn("TWITCH_FARM_CREDENTIAL_KEYS", readme)
+        self.assertIn("docker compose up -d web worker", docker_section)
+        self.assertNotIn("config.yaml", docker_section)
+        self.assertNotIn("/app/cookies", docker_section)
+        self.assertNotIn("./cookies", docker_section)
+        self.assertNotIn("--profile", readme)
+        self.assertNotIn("sync_config_accounts", readme)
+        self.assertNotIn("import_legacy_data", readme)
+
+    def test_legacy_runtime_entrypoints_are_removed(self):
+        command_dir = Path(settings.BASE_DIR) / "controller" / "management" / "commands"
+
+        self.assertFalse((command_dir / "sync_config_accounts.py").exists())
+        self.assertFalse((command_dir / "import_legacy_data.py").exists())
+        self.assertFalse((Path(settings.BASE_DIR) / "controller" / "config.py").exists())
+        self.assertFalse((Path(settings.BASE_DIR) / "config.yaml.example").exists())
 
 
 class DockerWorkflowTests(SimpleTestCase):
@@ -235,12 +319,13 @@ class DockerWorkflowTests(SimpleTestCase):
             "linux/amd64,linux/arm64",
         )
 
-    def test_smoke_gate_uses_dummy_config_and_disposable_state(self):
+    def test_smoke_gate_seeds_the_database_and_uses_disposable_state(self):
         script = (
             Path(settings.BASE_DIR) / "tests/docker_crash_recovery_smoke.sh"
         ).read_text(encoding="utf-8")
 
-        self.assertIn("config.yaml.example", script)
+        self.assertIn("TWITCH_FARM_CREDENTIAL_KEYS", script)
+        self.assertIn("create_account", script)
         self.assertIn("TWITCH_FARM_FAKE_MINER=1", script)
         self.assertIn('docker volume create "$DATA_VOLUME"', script)
         self.assertIn("trap cleanup EXIT", script)
@@ -264,14 +349,16 @@ class DockerWorkflowTests(SimpleTestCase):
         self.assertFalse(unbounded_docker_calls)
         for container in (
             "MIGRATE_CONTAINER",
-            "SYNC_CONTAINER",
-            "ENQUEUE_CONTAINER",
+            "SEED_CONTAINER",
             "WORKER",
         ):
             self.assertIn(f'--name "${container}"', script)
-        self.assertIn("'YOUR_PASSWORD_HERE' not in encoded", script)
-        self.assertIn("b'YOUR_PASSWORD_HERE' in part", script)
+        self.assertIn("'smoke-password-not-in-output' not in encoded", script)
+        self.assertIn("b'smoke-password-not-in-output' in part", script)
         self.assertIn("part.startswith(b'--channel')", script)
+        self.assertNotIn("config.yaml.example", script)
+        self.assertNotIn("sync_config_accounts", script)
+        self.assertNotIn("TWITCH_FARM_CONFIG", script)
         self.assertNotIn("/app/cookies", script)
 
         syntax = subprocess.run(

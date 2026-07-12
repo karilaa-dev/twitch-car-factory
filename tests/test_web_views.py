@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.test import Client, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
+from controller.crypto import decrypt_text, encrypt_text
 from controller.models import (
+    AccountCredential,
     AccountCustomChannel,
     AccountChannelSelection,
     ActionLog,
     ChannelPreset,
+    FarmConfiguration,
     MinerAccount,
     MinerCommand,
     MinerIncident,
@@ -35,9 +39,18 @@ class WebViewTests(TestCase):
         self.account = MinerAccount.objects.create(
             config_key="primary",
             display_username="primary_twitch",
-            is_configured=True,
+            is_active=True,
+        )
+        self.twitch_password = "primary-twitch-password"
+        self.credential = AccountCredential.objects.create(
+            account=self.account,
+            password_ciphertext=encrypt_text(self.twitch_password),
         )
         AccountChannelSelection.objects.create(account=self.account)
+        self.configuration = FarmConfiguration.load()
+        self.configuration.default_channels = ["warframe", "twitch"]
+        self.configuration.autostart_new_accounts = False
+        self.configuration.save()
         self.state = MinerInstanceState.objects.create(
             account=self.account,
             desired_state=MinerInstanceState.DesiredState.STOPPED,
@@ -51,7 +64,7 @@ class WebViewTests(TestCase):
         run = MinerRun.objects.create(
             account=self.account,
             source_mode=AccountChannelSelection.Mode.DEFAULT,
-            source_name="config.yaml",
+            source_name="farm defaults",
             channels=channels or ["warframe", "twitch"],
             configuration_fingerprint="a" * 64,
             channel_revision=self.account.channel_revision,
@@ -105,11 +118,18 @@ class WebViewTests(TestCase):
             reverse("controller:dashboard"),
             reverse("controller:status_fragment"),
             reverse("controller:account_list"),
+            reverse("controller:account_create"),
             reverse("controller:account_detail", args=[self.account.pk]),
+            reverse("controller:account_edit", args=[self.account.pk]),
+            reverse("controller:account_info_fragment", args=[self.account.pk]),
+            reverse("controller:account_archive", args=[self.account.pk]),
+            reverse("controller:account_reactivate", args=[self.account.pk]),
             reverse("controller:preset_list"),
             reverse("controller:preset_create"),
             reverse("controller:preset_detail", args=[preset.pk]),
             reverse("controller:preset_edit", args=[preset.pk]),
+            reverse("controller:settings_general"),
+            reverse("controller:settings_import"),
         ]
 
         for url in protected_urls:
@@ -194,6 +214,251 @@ class WebViewTests(TestCase):
         self.assertContains(response, "Supervisor heartbeat stale")
         self.assertContains(response, "no live supervisor currently owns process reconciliation")
 
+    def test_account_create_persists_encrypted_credentials_and_explicit_start(self):
+        self.login()
+        twitch_password = "new-account-secret"
+
+        response = self.client.post(
+            reverse("controller:account_create"),
+            {
+                "config_key": "secondary",
+                "username": "secondary_twitch",
+                "password": twitch_password,
+                "mode": AccountChannelSelection.Mode.DEFAULT,
+                "preset": "",
+                "custom_channels": "",
+                "start_after_save": "on",
+            },
+        )
+
+        account = MinerAccount.objects.get(config_key="secondary")
+        self.assertRedirects(
+            response,
+            reverse("controller:account_detail", args=[account.pk]),
+        )
+        self.assertTrue(account.is_active)
+        self.assertEqual(account.display_username, "secondary_twitch")
+        self.assertEqual(account.selection.mode, AccountChannelSelection.Mode.DEFAULT)
+        self.assertNotEqual(account.credential.password_ciphertext, twitch_password)
+        self.assertEqual(
+            decrypt_text(account.credential.password_ciphertext),
+            twitch_password,
+        )
+        self.assertEqual(
+            account.runtime_state.desired_state,
+            MinerInstanceState.DesiredState.RUNNING,
+        )
+        command = MinerCommand.objects.get(
+            account=account,
+            action=MinerCommand.Action.START,
+        )
+        self.assertEqual(command.actor, self.staff)
+        action = ActionLog.objects.get(account=account, action="account_created")
+        self.assertEqual(action.actor, self.staff)
+        self.assertNotIn(twitch_password, str(action.details))
+
+    def test_account_create_get_uses_general_settings_as_explicit_defaults(self):
+        self.login()
+        self.configuration.autostart_new_accounts = True
+        self.configuration.save(update_fields=("autostart_new_accounts", "updated_at"))
+
+        response = self.client.get(reverse("controller:account_create"))
+
+        self.assertEqual(response.status_code, 200)
+        form = response.context["form"]
+        self.assertEqual(form["mode"].value(), AccountChannelSelection.Mode.DEFAULT)
+        self.assertTrue(form["start_after_save"].value())
+
+    def test_invalid_account_form_never_echoes_submitted_password(self):
+        self.login()
+        submitted_password = "never-echo-invalid-form-secret"
+
+        response = self.client.post(
+            reverse("controller:account_create"),
+            {
+                "config_key": "invalid-account",
+                "username": "",
+                "password": submitted_password,
+                "mode": AccountChannelSelection.Mode.DEFAULT,
+                "preset": "",
+                "custom_channels": "",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertNotContains(response, submitted_password, status_code=400)
+
+    @override_settings(DEBUG=True)
+    def test_debug_error_report_redacts_account_password(self):
+        submitted_password = "never-show-in-debug-report-secret"
+        client = Client(raise_request_exception=False)
+        client.force_login(self.staff)
+
+        with patch(
+            "controller.services.encrypt_text",
+            side_effect=RuntimeError("forced credential storage failure"),
+        ):
+            response = client.post(
+                reverse("controller:account_create"),
+                {
+                    "config_key": "debug-failure",
+                    "username": "debug_failure_user",
+                    "password": submitted_password,
+                    "mode": AccountChannelSelection.Mode.DEFAULT,
+                    "preset": "",
+                    "custom_channels": "",
+                },
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertNotContains(response, submitted_password, status_code=500)
+
+    def test_account_edit_keeps_key_replaces_secret_and_restarts_running_account(self):
+        self.login()
+        self.state.desired_state = MinerInstanceState.DesiredState.RUNNING
+        self.state.save(update_fields=("desired_state", "updated_at"))
+        replacement_password = "replacement-account-secret"
+
+        response = self.client.post(
+            reverse("controller:account_edit", args=[self.account.pk]),
+            {
+                "username": "renamed_twitch",
+                "password": replacement_password,
+                # A forged key must be ignored because it is not part of the edit form.
+                "config_key": "forged-key",
+            },
+        )
+
+        self.assertRedirects(
+            response,
+            reverse("controller:account_detail", args=[self.account.pk]),
+        )
+        self.account.refresh_from_db()
+        self.credential.refresh_from_db()
+        self.assertEqual(self.account.config_key, "primary")
+        self.assertEqual(self.account.display_username, "renamed_twitch")
+        self.assertEqual(
+            decrypt_text(self.credential.password_ciphertext),
+            replacement_password,
+        )
+        self.assertNotEqual(self.credential.password_ciphertext, replacement_password)
+        self.assertTrue(
+            MinerCommand.objects.filter(
+                account=self.account,
+                action=MinerCommand.Action.RESTART,
+                actor=self.staff,
+            ).exists()
+        )
+        action = ActionLog.objects.get(account=self.account, action="account_updated")
+        self.assertEqual(
+            action.details,
+            {"username_changed": True, "credential_changed": True},
+        )
+        self.assertNotIn(replacement_password, str(action.details))
+
+        edit_page = self.client.get(
+            reverse("controller:account_edit", args=[self.account.pk])
+        )
+        self.assertNotContains(edit_page, self.twitch_password)
+        self.assertNotContains(edit_page, replacement_password)
+        self.assertNotContains(edit_page, self.credential.password_ciphertext)
+
+    def test_account_archive_and_reactivate_are_post_only_and_audited(self):
+        self.login()
+        self.state.desired_state = MinerInstanceState.DesiredState.RUNNING
+        self.state.save(update_fields=("desired_state", "updated_at"))
+        archive_url = reverse("controller:account_archive", args=[self.account.pk])
+        reactivate_url = reverse("controller:account_reactivate", args=[self.account.pk])
+
+        self.assertEqual(self.client.get(archive_url).status_code, 405)
+        response = self.client.post(archive_url)
+
+        self.assertRedirects(
+            response,
+            reverse("controller:account_detail", args=[self.account.pk]),
+        )
+        self.account.refresh_from_db()
+        self.state.refresh_from_db()
+        self.assertFalse(self.account.is_active)
+        self.assertEqual(
+            self.state.desired_state,
+            MinerInstanceState.DesiredState.STOPPED,
+        )
+        self.assertTrue(
+            MinerCommand.objects.filter(
+                account=self.account,
+                action=MinerCommand.Action.STOP,
+                actor=self.staff,
+            ).exists()
+        )
+        self.assertTrue(
+            ActionLog.objects.filter(
+                account=self.account,
+                actor=self.staff,
+                action="account_archived",
+            ).exists()
+        )
+
+        self.assertEqual(self.client.get(reactivate_url).status_code, 405)
+        response = self.client.post(reactivate_url)
+
+        self.assertRedirects(
+            response,
+            reverse("controller:account_detail", args=[self.account.pk]),
+        )
+        self.account.refresh_from_db()
+        self.assertTrue(self.account.is_active)
+        self.assertTrue(
+            ActionLog.objects.filter(
+                account=self.account,
+                actor=self.staff,
+                action="account_reactivated",
+            ).exists()
+        )
+
+    def test_account_reactivation_requires_a_stored_credential(self):
+        self.login()
+        self.account.is_active = False
+        self.account.save(update_fields=("is_active", "updated_at"))
+        self.credential.delete()
+
+        response = self.client.post(
+            reverse("controller:account_reactivate", args=[self.account.pk]),
+            follow=True,
+        )
+
+        self.account.refresh_from_db()
+        self.assertFalse(self.account.is_active)
+        self.assertContains(response, "Add a Twitch password before reactivating")
+        self.assertFalse(
+            ActionLog.objects.filter(
+                account=self.account,
+                action="account_reactivated",
+            ).exists()
+        )
+
+    def test_account_info_fragment_is_no_store_and_never_discloses_secrets(self):
+        self.login()
+
+        response = self.client.get(
+            reverse("controller:account_info_fragment", args=[self.account.pk])
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("no-store", response.headers["Cache-Control"])
+        self.assertContains(response, self.account.display_username)
+        self.assertContains(response, self.account.config_key)
+        self.assertContains(response, "Credential")
+        self.assertContains(response, "Present")
+        self.assertContains(response, "Desired state")
+        self.assertContains(response, "Observed state")
+        self.assertContains(
+            response,
+            reverse("controller:account_edit", args=[self.account.pk]),
+        )
+        self.assertNotContains(response, self.twitch_password)
+        self.assertNotContains(response, self.credential.password_ciphertext)
+
     def test_lifecycle_mutations_are_post_only_and_audit_the_actor(self):
         self.login()
         start_url = reverse(
@@ -242,7 +507,7 @@ class WebViewTests(TestCase):
         disabled = MinerAccount.objects.create(
             config_key="orphaned",
             display_username="old_account",
-            is_configured=False,
+            is_active=False,
         )
         AccountChannelSelection.objects.create(account=disabled)
         MinerInstanceState.objects.create(account=disabled)
@@ -265,6 +530,58 @@ class WebViewTests(TestCase):
 
         self.assertEqual(response.status_code, 403)
         self.assertEqual(MinerCommand.objects.count(), 0)
+
+    def test_general_settings_update_database_defaults_and_restart_users(self):
+        self.login()
+        self.state.desired_state = MinerInstanceState.DesiredState.RUNNING
+        self.state.save(update_fields=("desired_state", "updated_at"))
+        old_revision = self.account.channel_revision
+
+        response = self.client.post(
+            reverse("controller:settings_general"),
+            {
+                "default_channels": "Warframe, warframe\nTwitchDrops",
+                "autostart_new_accounts": "on",
+            },
+        )
+
+        self.assertRedirects(response, reverse("controller:settings_general"))
+        self.configuration.refresh_from_db()
+        self.account.refresh_from_db()
+        self.assertEqual(
+            self.configuration.default_channels,
+            ["Warframe", "TwitchDrops"],
+        )
+        self.assertTrue(self.configuration.autostart_new_accounts)
+        self.assertEqual(self.account.channel_revision, old_revision + 1)
+        self.assertTrue(
+            MinerCommand.objects.filter(
+                account=self.account,
+                action=MinerCommand.Action.RESTART,
+                actor=self.staff,
+            ).exists()
+        )
+        action = ActionLog.objects.get(action="farm_settings_updated")
+        self.assertEqual(action.actor, self.staff)
+        self.assertEqual(action.details["default_channels"], ["Warframe", "TwitchDrops"])
+
+    def test_general_settings_requires_csrf_for_staff_mutation(self):
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.staff)
+
+        response = client.post(
+            reverse("controller:settings_general"),
+            {
+                "default_channels": "replacement",
+                "autostart_new_accounts": "on",
+            },
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.configuration.refresh_from_db()
+        self.assertEqual(self.configuration.default_channels, ["warframe", "twitch"])
+        self.assertFalse(self.configuration.autostart_new_accounts)
+        self.assertFalse(ActionLog.objects.filter(action="farm_settings_updated").exists())
 
     def test_custom_channel_change_normalizes_and_queues_restart(self):
         self.login()
@@ -435,13 +752,70 @@ class WebViewTests(TestCase):
             ).exists()
         )
 
+    def test_preset_page_initial_html_shows_only_assignable_public_usernames(self):
+        self.login()
+        preset = self.create_preset()
+        private_key = "private-ledger-key"
+        public_username = "visible_twitch_user"
+        twitch_password = "visible-account-secret"
+        visible = MinerAccount.objects.create(
+            config_key=private_key,
+            display_username=public_username,
+            is_active=True,
+        )
+        visible_credential = AccountCredential.objects.create(
+            account=visible,
+            password_ciphertext=encrypt_text(twitch_password),
+        )
+        AccountChannelSelection.objects.create(account=visible)
+        MinerInstanceState.objects.create(account=visible)
+        archived = MinerAccount.objects.create(
+            config_key="archived-private-key",
+            display_username="archived_public_user",
+            is_active=False,
+        )
+        AccountCredential.objects.create(
+            account=archived,
+            password_ciphertext=encrypt_text("archived-account-secret"),
+        )
+        AccountChannelSelection.objects.create(account=archived)
+        MinerInstanceState.objects.create(account=archived)
+        credentialless = MinerAccount.objects.create(
+            config_key="credentialless-private-key",
+            display_username="credentialless_public_user",
+            is_active=True,
+        )
+        AccountChannelSelection.objects.create(account=credentialless)
+        MinerInstanceState.objects.create(account=credentialless)
+
+        response = self.client.get(
+            reverse("controller:preset_detail", args=[preset.pk])
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, public_username)
+        self.assertContains(
+            response,
+            reverse("controller:account_info_fragment", args=[visible.pk]),
+        )
+        self.assertNotContains(response, private_key)
+        self.assertNotContains(response, twitch_password)
+        self.assertNotContains(response, visible_credential.password_ciphertext)
+        self.assertNotContains(response, archived.display_username)
+        self.assertNotContains(response, credentialless.display_username)
+        self.assertNotContains(response, "Internal account key")
+
     def test_preset_assignment_updates_both_selected_and_deselected_accounts(self):
         self.login()
         preset = self.create_preset()
         second = MinerAccount.objects.create(
             config_key="second",
             display_username="second_twitch",
-            is_configured=True,
+            is_active=True,
+        )
+        AccountCredential.objects.create(
+            account=second,
+            password_ciphertext=encrypt_text("second-twitch-password"),
         )
         second_selection = AccountChannelSelection.objects.create(
             account=second,
@@ -496,10 +870,19 @@ class WebViewTests(TestCase):
         self.assertFalse(ChannelPreset.objects.filter(pk=preset.pk).exists())
         self.assertTrue(ActionLog.objects.filter(action="preset_deleted").exists())
 
-    def test_pages_never_render_credentials(self):
+    def test_account_pages_never_render_stored_credentials(self):
         self.login()
-        response = self.client.get(
-            reverse("controller:account_detail", args=[self.account.pk])
+        preset = self.create_preset()
+        urls = (
+            reverse("controller:account_list"),
+            reverse("controller:account_detail", args=[self.account.pk]),
+            reverse("controller:account_edit", args=[self.account.pk]),
+            reverse("controller:preset_detail", args=[preset.pk]),
         )
 
-        self.assertNotContains(response, "operator-test-password")
+        for url in urls:
+            with self.subTest(url=url):
+                response = self.client.get(url)
+                self.assertEqual(response.status_code, 200)
+                self.assertNotContains(response, self.twitch_password)
+                self.assertNotContains(response, self.credential.password_ciphertext)

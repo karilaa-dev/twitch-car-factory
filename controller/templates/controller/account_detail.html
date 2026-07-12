@@ -1,7 +1,7 @@
 {% extends "controller/base.html" %}
 {% load control_room %}
 
-{% block title %}{{ account.config_key }}{% endblock %}
+{% block title %}{{ account.display_username }}{% endblock %}
 
 {% block content %}
   <ol class="breadcrumb" aria-label="Breadcrumb">
@@ -12,22 +12,28 @@
   <header class="page-header">
     <div class="page-heading">
       <p class="eyebrow">Process unit {{ account.pk|stringformat:'03d' }}</p>
-      <h1>{{ account.config_key }}</h1>
-      <p class="lede">{{ account.display_username }} · {% if account.is_configured %}credential source synchronized{% else %}missing from config.yaml — start is interlocked{% endif %}</p>
+      <h1>{{ account.display_username }}</h1>
+      <p class="lede"><span class="mono">{{ account.config_key }}</span> · {% if not account.is_active %}archived and excluded from launch{% elif account.has_credentials %}credentials encrypted and ready{% else %}credentials required before launch{% endif %}</p>
     </div>
     <div class="actions" aria-label="Account lifecycle controls">
-      {% if telemetry.desired == 'running' %}
+      {% if account.is_active and telemetry.desired == 'running' %}
         <form method="post" action="{% url 'controller:account_action' account.pk 'stop' %}">
           {% csrf_token %}<button class="button button--danger" type="submit">Stop intentionally</button>
         </form>
-      {% elif account.is_configured %}
+      {% elif account.is_active and account.has_credentials %}
         <form method="post" action="{% url 'controller:account_action' account.pk 'start' %}">
           {% csrf_token %}<button class="button button--safe" type="submit">Start unit</button>
         </form>
       {% endif %}
-      {% if account.is_configured %}
+      {% if account.is_active and account.has_credentials %}
         <form method="post" action="{% url 'controller:account_action' account.pk 'restart' %}">
           {% csrf_token %}<button class="button" type="submit">Restart unit</button>
+        </form>
+      {% endif %}
+      <a class="button button--primary" href="{% url 'controller:account_edit' account.pk %}">Edit account</a>
+      {% if not account.is_active %}
+        <form method="post" action="{% url 'controller:account_reactivate' account.pk %}">
+          {% csrf_token %}<button class="button button--safe" type="submit">Reactivate account</button>
         </form>
       {% endif %}
     </div>
@@ -141,7 +147,7 @@
         <div class="panel__body">
           <p><span class="status-chip">{{ planned_source.mode }}</span> <strong>{{ planned_source.name }}</strong></p>
           {% if planned_source.managed_externally %}
-            <p class="muted">Default channels remain read-only in config.yaml. The exact list will be snapshotted when the worker validates the next launch.</p>
+            <p class="muted">Default channels are managed in Settings. The exact list is snapshotted when the worker validates the next launch.</p>
           {% elif planned_source.channels %}
             <div class="channel-trace">{% for channel in planned_source.channels %}<span class="channel-tag">{{ channel }}</span>{% endfor %}</div>
           {% endif %}
@@ -196,6 +202,19 @@
           {% endif %}
         </div>
       </section>
+
+      {% if account.is_active %}
+        <section class="panel panel--danger" aria-labelledby="archive-title">
+          <header class="panel__header"><h2 id="archive-title">Archive account</h2></header>
+          <div class="panel__body">
+            <p class="muted">Archiving queues an intentional stop, removes this account from global actions and preset assignment, and preserves its complete runtime history.</p>
+            <form method="post" action="{% url 'controller:account_archive' account.pk %}">
+              {% csrf_token %}
+              <button class="button button--danger" type="submit">Archive {{ account.display_username }}</button>
+            </form>
+          </div>
+        </section>
+      {% endif %}
     </aside>
   </div>
 {% endblock %}

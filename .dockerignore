@@ -20,12 +20,13 @@ ENV/
 *.swo
 .cursor/
 
-# Data (mounted as volumes)
+# Runtime state and local legacy inputs (never image content)
 data/
 cookies/
 runtime/
 backups/
 config.yaml
+.env
 
 # Other
 *.log

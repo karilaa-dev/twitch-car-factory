@@ -1,0 +1,39 @@
+{% extends "controller/base.html" %}
+
+{% block title %}{% block settings_title %}Settings{% endblock %}{% endblock %}
+
+{% block content %}
+  <header class="page-header settings-header">
+    <div class="page-heading">
+      <p class="eyebrow">Control configuration</p>
+      <h1>Settings</h1>
+      <p class="lede">Manage database-backed farm defaults and migrate data from an older Twitch Farm installation.</p>
+    </div>
+  </header>
+
+  {% with current=request.resolver_match.url_name %}
+    <div class="settings-layout">
+      <aside class="settings-rail" aria-label="Settings navigation">
+        <nav class="settings-nav">
+          <a href="{% url 'controller:settings_general' %}" {% if current == 'settings_general' %}aria-current="page"{% endif %}>
+            <span class="settings-nav__index">01</span>
+            <span><strong>General</strong><small>Default channels and account startup</small></span>
+          </a>
+          <a href="{% url 'controller:settings_import' %}" {% if current == 'settings_import' or current == 'settings_import_confirm' or current == 'settings_import_cancel' %}aria-current="page"{% endif %}>
+            <span class="settings-nav__index">02</span>
+            <span><strong>Import legacy data</strong><small>Review a ZIP from an older installation</small></span>
+          </a>
+        </nav>
+
+        <div class="settings-rail__note">
+          <span class="status-light" data-tone="good" aria-hidden="true"></span>
+          <p><strong>Database authority</strong><br>Saved changes become the worker’s next validated launch inputs.</p>
+        </div>
+      </aside>
+
+      <div class="settings-content">
+        {% block settings_content %}{% endblock %}
+      </div>
+    </div>
+  {% endwith %}
+{% endblock %}

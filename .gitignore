@@ -9,7 +9,7 @@ wheels/
 # Virtual environments
 .venv
 
-# Configuration (contains secrets)
+# Local deployment secrets and legacy migration inputs
 config.yaml
 .env
 
@@ -21,7 +21,7 @@ data/*.sqlite3-*
 data/miner-worker.lock
 backups/
 
-# Cookies
+# Legacy and runtime Twitch sessions
 cookies/
 runtime/
 

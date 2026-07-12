@@ -1,11 +1,13 @@
 """Durable controller state for the Twitch farm.
 
-Secrets deliberately do not belong in these models.  Twitch credentials stay in
-``config.yaml`` and are loaded by the process-owning worker at launch time.
+Runtime configuration is database-backed.  Sensitive values are stored only as
+application-encrypted ciphertext and are never copied into launch snapshots or
+audit records.
 """
 
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 from django.conf import settings
@@ -25,14 +27,13 @@ def validate_channel_snapshot(value: Any) -> None:
 
 
 class MinerAccount(models.Model):
-    """A non-secret mirror of an account defined in ``config.yaml``."""
+    """A UI-managed Twitch account with an immutable internal key."""
 
     config_key = models.CharField(max_length=150, unique=True)
     display_username = models.CharField(max_length=150)
-    is_configured = models.BooleanField(default=True, db_index=True)
+    is_active = models.BooleanField(default=True, db_index=True)
     channel_revision = models.PositiveBigIntegerField(default=1)
     configuration_fingerprint = models.CharField(max_length=64, blank=True)
-    config_synced_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -41,6 +42,102 @@ class MinerAccount(models.Model):
 
     def __str__(self) -> str:
         return self.display_username or self.config_key
+
+    def save(self, *args: Any, **kwargs: Any) -> None:
+        if self.pk:
+            original_key = type(self).objects.filter(pk=self.pk).values_list(
+                "config_key", flat=True
+            ).first()
+            if original_key is not None and original_key != self.config_key:
+                raise ValidationError("An account's internal key is immutable.")
+        super().save(*args, **kwargs)
+
+    @property
+    def has_credentials(self) -> bool:
+        try:
+            self.credential
+        except AccountCredential.DoesNotExist:
+            return False
+        return True
+
+
+class AccountCredential(models.Model):
+    """Encrypted launch credential for one account."""
+
+    account = models.OneToOneField(
+        MinerAccount,
+        on_delete=models.CASCADE,
+        related_name="credential",
+    )
+    password_ciphertext = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self) -> str:
+        return f"Credential for {self.account.config_key}"
+
+
+class AccountSessionSeed(models.Model):
+    """Encrypted, normalized legacy cookies awaiting worker-only placement."""
+
+    account = models.OneToOneField(
+        MinerAccount,
+        on_delete=models.CASCADE,
+        related_name="session_seed",
+    )
+    payload_ciphertext = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self) -> str:
+        return f"Session seed for {self.account.config_key}"
+
+
+class FarmConfiguration(models.Model):
+    """Singleton UI-managed global launch defaults."""
+
+    default_channels = models.JSONField(default=list, blank=True)
+    autostart_new_accounts = models.BooleanField(default=False)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    @classmethod
+    def load(cls) -> "FarmConfiguration":
+        configuration, _ = cls.objects.get_or_create(pk=1)
+        return configuration
+
+    def save(self, *args: Any, **kwargs: Any) -> None:
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    def __str__(self) -> str:
+        return "Farm configuration"
+
+
+class LegacyImportDraft(models.Model):
+    """Short-lived encrypted payload reviewed before a legacy import commit."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="legacy_import_drafts",
+    )
+    payload_ciphertext = models.TextField()
+    preview = models.JSONField(default=dict, blank=True)
+    source_digest = models.CharField(max_length=64)
+    baseline_digest = models.CharField(max_length=64)
+    expires_at = models.DateTimeField(db_index=True)
+    consumed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-created_at",)
+
+    @property
+    def is_expired(self) -> bool:
+        return self.expires_at <= timezone.now()
+
+    def __str__(self) -> str:
+        return f"Legacy import draft {self.pk}"
 
 
 class ChannelPreset(models.Model):

@@ -3,19 +3,15 @@
 set -Eeuo pipefail
 
 IMAGE="${1:?usage: docker_crash_recovery_smoke.sh IMAGE}"
-ROOT_DIR="${GITHUB_WORKSPACE:-$(pwd)}"
-CONFIG_PATH="$ROOT_DIR/config.yaml.example"
 SUFFIX="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-$$"
 RESOURCE_PREFIX="twitch-farm-smoke-$SUFFIX"
 DATA_VOLUME="$RESOURCE_PREFIX-data"
 MIGRATE_CONTAINER="$RESOURCE_PREFIX-migrate"
-SYNC_CONTAINER="$RESOURCE_PREFIX-sync"
-ENQUEUE_CONTAINER="$RESOURCE_PREFIX-enqueue"
+SEED_CONTAINER="$RESOURCE_PREFIX-seed"
 WORKER="$RESOURCE_PREFIX-worker"
 TRACKED_CONTAINERS=(
   "$WORKER"
-  "$ENQUEUE_CONTAINER"
-  "$SYNC_CONTAINER"
+  "$SEED_CONTAINER"
   "$MIGRATE_CONTAINER"
 )
 DOCKER_TIMEOUT_SECONDS="${SMOKE_DOCKER_TIMEOUT_SECONDS:-20}"
@@ -24,11 +20,6 @@ DOCKER_CLEANUP_TIMEOUT_SECONDS="${SMOKE_DOCKER_CLEANUP_TIMEOUT_SECONDS:-10}"
 if [[ ! "$DOCKER_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] \
   || [[ ! "$DOCKER_CLEANUP_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
   echo "Smoke Docker timeouts must be positive whole seconds." >&2
-  exit 1
-fi
-
-if [[ ! -f "$CONFIG_PATH" ]]; then
-  echo "Smoke configuration does not exist: $CONFIG_PATH" >&2
   exit 1
 fi
 
@@ -170,12 +161,11 @@ run_with_timeout "$DOCKER_TIMEOUT_SECONDS" "create smoke data volume" \
 COMMON_ARGS=(
   --env DJANGO_SECRET_KEY=smoke-only-secret-abcdefghijklmnopqrstuvwxyz-0123456789
   --env DJANGO_DEBUG=0
+  --env TWITCH_FARM_CREDENTIAL_KEYS=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=
   --env TWITCH_FARM_DB=/app/data/db.sqlite3
-  --env TWITCH_FARM_CONFIG=/app/config.yaml
   --env TWITCH_FARM_RUNTIME_DIR=/app/runtime
   --env TWITCH_FARM_WORKER_LOCK=/app/data/miner-worker.lock
   --volume "$DATA_VOLUME:/app/data"
-  --mount "type=bind,src=$CONFIG_PATH,dst=/app/config.yaml,readonly"
 )
 
 wait_for_state() {
@@ -208,13 +198,10 @@ wait_for_state() {
 run_with_timeout "$DOCKER_TIMEOUT_SECONDS" "run migrations" \
   docker run --name "$MIGRATE_CONTAINER" "${COMMON_ARGS[@]}" \
   "$IMAGE" python manage.py migrate --noinput >/dev/null
-run_with_timeout "$DOCKER_TIMEOUT_SECONDS" "synchronize config accounts" \
-  docker run --name "$SYNC_CONTAINER" "${COMMON_ARGS[@]}" \
-  "$IMAGE" python manage.py sync_config_accounts >/dev/null
-run_with_timeout "$DOCKER_TIMEOUT_SECONDS" "enqueue initial start" \
-  docker run --name "$ENQUEUE_CONTAINER" "${COMMON_ARGS[@]}" \
+run_with_timeout "$DOCKER_TIMEOUT_SECONDS" "seed database account and enqueue start" \
+  docker run --name "$SEED_CONTAINER" "${COMMON_ARGS[@]}" \
   "$IMAGE" python manage.py shell -c \
-  "from controller.models import MinerAccount; from controller.services import enqueue_command; enqueue_command(MinerAccount.objects.get(config_key='primary'),'start',reason='built-image smoke')" \
+  "from controller.services import create_account,enqueue_command,update_farm_configuration; update_farm_configuration(default_channels=['channel_one','channel_two'],autostart_new_accounts=False); account=create_account(config_key='primary',username='smoke_twitch_user',password='smoke-password-not-in-output',mode='default',start_after_save=False); enqueue_command(account,'start',reason='built-image smoke')" \
   >/dev/null
 
 run_with_timeout "$DOCKER_TIMEOUT_SECONDS" "start miner worker" \
@@ -256,11 +243,11 @@ wait_for_state "incident recovery and the replacement launch" 45 \
 
 run_with_timeout "$DOCKER_TIMEOUT_SECONDS" "verify fake-miner launch records" \
   docker exec "$WORKER" python -c \
-  "import json; from pathlib import Path; rows=[json.loads(line) for line in Path('/app/runtime/fake-miner.jsonl').read_text().splitlines()]; encoded=json.dumps(rows); assert len(rows)==2, rows; assert all(row['account_key']=='primary' and row['channels']==['channel_one','channel_two'] and not any('password' in key.casefold() for key in row) for row in rows); assert 'YOUR_PASSWORD_HERE' not in encoded; assert rows[0]['run_id'] != rows[1]['run_id']" \
+  "import json; from pathlib import Path; rows=[json.loads(line) for line in Path('/app/runtime/fake-miner.jsonl').read_text().splitlines()]; encoded=json.dumps(rows); assert len(rows)==2, rows; assert all(row['account_key']=='primary' and row['channels']==['channel_one','channel_two'] and not any('password' in key.casefold() for key in row) for row in rows); assert 'smoke-password-not-in-output' not in encoded; assert rows[0]['run_id'] != rows[1]['run_id']" \
   >/dev/null
 run_with_timeout "$DOCKER_TIMEOUT_SECONDS" "verify fake-miner argv" \
   docker exec "$WORKER" python manage.py shell -c \
-  "from pathlib import Path; from controller.models import MinerInstanceState; state=MinerInstanceState.objects.get(account__config_key='primary'); argv=[part for part in Path(f'/proc/{state.advisory_pid}/cmdline').read_bytes().split(b'\\0') if part]; assert argv[-3]==b'run_fake_miner' and argv[-1]==b'primary'; assert not any(b'channel_one' in part or b'channel_two' in part or b'YOUR_PASSWORD_HERE' in part or part.startswith(b'--channel') or part.startswith(b'--password') for part in argv)" \
+  "from pathlib import Path; from controller.models import MinerInstanceState; state=MinerInstanceState.objects.get(account__config_key='primary'); argv=[part for part in Path(f'/proc/{state.advisory_pid}/cmdline').read_bytes().split(b'\\0') if part]; assert argv[-3]==b'run_fake_miner' and argv[-1]==str(state.account_id).encode(); assert not any(b'channel_one' in part or b'channel_two' in part or b'smoke-password-not-in-output' in part or part.startswith(b'--channel') or part.startswith(b'--password') for part in argv)" \
   >/dev/null
 
 run_with_timeout "$DOCKER_TIMEOUT_SECONDS" "enqueue manual stop" \

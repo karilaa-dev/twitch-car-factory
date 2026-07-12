@@ -29,7 +29,7 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser) -> None:
         parser.add_argument("run_id", type=int)
-        parser.add_argument("account_key")
+        parser.add_argument("account_id", type=int)
         parser.add_argument(
             "--mode",
             choices=("normal", "exit-immediately", "crash-after", "ignore-term"),
@@ -62,7 +62,7 @@ class Command(BaseCommand):
             MinerRun.objects.select_related("account")
             .filter(
                 pk=options["run_id"],
-                account__config_key=options["account_key"],
+                account_id=options["account_id"],
                 ended_at__isnull=True,
             )
             .first()

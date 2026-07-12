@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 import json
 import os
 from pathlib import Path
@@ -10,53 +9,49 @@ import textwrap
 
 import pytest
 from django.core.exceptions import ValidationError
-from django.core.management import call_command
-from django.core.management.base import CommandError
 
 from controller.apps import configure_sqlite_connection
-from controller.config import FarmConfig, TwitchUserConfig, get_account_credentials, load_config
 from controller.models import (
     AccountChannelSelection,
+    AccountCredential,
     ActionLog,
-    ChannelPreset,
+    FarmConfiguration,
     MinerAccount,
     MinerCommand,
     MinerInstanceState,
     MinerRun,
 )
 from controller.services import (
+    archive_account,
+    create_account,
     create_launch_snapshot,
     enqueue_command,
+    get_account_password,
     normalize_channels,
+    reactivate_account,
     resolve_channels,
     save_preset,
     set_account_channel_selection,
-    sync_config_accounts,
+    update_account,
+    update_farm_configuration,
 )
 
 
-def make_config(tmp_path: Path, *, autostart: bool = False, include_second: bool = False) -> Path:
-    second = """
-  second:
-    username: SecondUser
-    password: second-secret
-""" if include_second else ""
-    path = tmp_path / "config.yaml"
-    path.write_text(
-        f"""settings:
-  autostart_instances: {str(autostart).lower()}
-twitch_users:
-  primary:
-    username: PrimaryUser
-    password: super-secret
-{second}default_channels:
-  - Alpha
-  - beta
-  - ALPHA
-""",
-        encoding="utf-8",
+@pytest.fixture
+def farm_configuration(db) -> FarmConfiguration:
+    return update_farm_configuration(
+        default_channels=["Alpha", "beta", "ALPHA"],
+        autostart_new_accounts=False,
     )
-    return path
+
+
+@pytest.fixture
+def db_account(farm_configuration: FarmConfiguration) -> MinerAccount:
+    return create_account(
+        config_key="primary",
+        username="PrimaryUser",
+        password="super-secret",
+    )
 
 
 def test_sqlite_connection_pragmas_honor_configured_busy_timeout():
@@ -89,49 +84,133 @@ def test_sqlite_connection_pragmas_honor_configured_busy_timeout():
 
 
 @pytest.mark.django_db
-def test_sync_uses_yaml_without_persisting_secrets_and_preserves_manual_stop(tmp_path):
-    config_path = make_config(tmp_path, autostart=True)
-    result = sync_config_accounts(config_path)
-
-    assert result.created == ("primary",)
-    account = MinerAccount.objects.get(config_key="primary")
-    assert account.display_username == "PrimaryUser"
-    assert account.runtime_state.desired_state == MinerInstanceState.DesiredState.RUNNING
-    assert "password" not in {field.name for field in MinerAccount._meta.get_fields()}
-    assert "super-secret" not in repr(load_config(config_path))
-    assert get_account_credentials("primary", config_path).password == "super-secret"
-
-    account.runtime_state.desired_state = MinerInstanceState.DesiredState.STOPPED
-    account.runtime_state.save(update_fields=("desired_state", "updated_at"))
-    result = sync_config_accounts(config_path)
-    account.runtime_state.refresh_from_db()
-    assert result.created == ()
-    assert account.runtime_state.desired_state == MinerInstanceState.DesiredState.STOPPED
-
-    empty_config = FarmConfig(
-        twitch_users={},
-        default_channels=("alpha",),
-        autostart_instances=True,
-        path=config_path,
+def test_create_account_encrypts_credentials_and_sets_durable_start_intent():
+    FarmConfiguration.objects.update_or_create(
+        pk=1,
+        defaults={
+            "default_channels": ["Alpha", "beta"],
+            "autostart_new_accounts": False,
+        },
     )
-    result = sync_config_accounts(empty_config)
+    password = "never-store-this-in-plaintext"
+
+    account = create_account(
+        config_key="primary",
+        username="PrimaryUser",
+        password=password,
+        start_after_save=True,
+    )
+
     account.refresh_from_db()
-    assert result.disabled == ("primary",)
-    assert account.is_configured is False
-    assert account.runtime_state.desired_state == MinerInstanceState.DesiredState.STOPPED
+    credential = AccountCredential.objects.get(account=account)
+    state = MinerInstanceState.objects.get(account=account)
+    assert account.config_key == "primary"
+    assert account.display_username == "PrimaryUser"
+    assert account.is_active is True
+    assert account.selection.mode == AccountChannelSelection.Mode.DEFAULT
+    assert credential.password_ciphertext != password
+    assert password not in credential.password_ciphertext
+    assert get_account_password(account) == password
+    assert state.desired_state == MinerInstanceState.DesiredState.RUNNING
+    assert MinerCommand.objects.get(account=account).action == MinerCommand.Action.START
+
+    persisted_values = json.dumps(
+        {
+            "accounts": list(MinerAccount.objects.values()),
+            "credentials": list(AccountCredential.objects.values()),
+            "actions": list(ActionLog.objects.values()),
+        },
+        default=str,
+        sort_keys=True,
+    )
+    assert password not in persisted_values
+    assert "password" not in {field.name for field in MinerAccount._meta.get_fields()}
 
 
 @pytest.mark.django_db
-def test_channel_resolution_selection_restart_and_command_coalescing(tmp_path, settings):
-    config_path = make_config(tmp_path)
-    settings.TWITCH_FARM_CONFIG = config_path
-    sync_config_accounts(config_path)
-    account = MinerAccount.objects.get(config_key="primary")
+def test_update_account_preserves_key_reencrypts_password_and_restarts_running_account(
+    db_account: MinerAccount,
+):
+    account = db_account
+    state = account.runtime_state
+    state.desired_state = MinerInstanceState.DesiredState.RUNNING
+    state.save(update_fields=("desired_state", "updated_at"))
+    old_ciphertext = account.credential.password_ciphertext
+    replacement = "replacement-secret"
+
+    updated = update_account(
+        account,
+        username="RenamedUser",
+        password=replacement,
+    )
+
+    updated.refresh_from_db()
+    updated.credential.refresh_from_db()
+    assert updated.config_key == "primary"
+    assert updated.display_username == "RenamedUser"
+    assert updated.credential.password_ciphertext != old_ciphertext
+    assert replacement not in updated.credential.password_ciphertext
+    assert get_account_password(updated) == replacement
+    assert MinerCommand.objects.get(account=updated).action == MinerCommand.Action.RESTART
+    update_log = ActionLog.objects.get(account=updated, action="account_updated")
+    assert update_log.details == {
+        "username_changed": True,
+        "credential_changed": True,
+    }
+    assert replacement not in json.dumps(update_log.details, sort_keys=True)
+
+    updated.config_key = "renamed-key"
+    with pytest.raises(ValidationError, match="internal key is immutable"):
+        updated.save()
+    updated.refresh_from_db()
+    assert updated.config_key == "primary"
+
+
+@pytest.mark.django_db
+def test_archive_and_reactivate_preserve_history_and_require_credentials(
+    db_account: MinerAccount,
+):
+    account = db_account
+    run = create_launch_snapshot(account, "worker-before-archive")
+    state = account.runtime_state
+    state.desired_state = MinerInstanceState.DesiredState.RUNNING
+    state.save(update_fields=("desired_state", "updated_at"))
+
+    archived = archive_account(account)
+
+    archived.refresh_from_db()
+    archived.runtime_state.refresh_from_db()
+    assert archived.is_active is False
+    assert archived.configuration_fingerprint == ""
+    assert archived.runtime_state.desired_state == MinerInstanceState.DesiredState.STOPPED
+    assert MinerCommand.objects.get(account=archived).action == MinerCommand.Action.STOP
+    assert MinerRun.objects.filter(pk=run.pk, account=archived).exists()
+
+    reactivated = reactivate_account(archived)
+    reactivated.refresh_from_db()
+    assert reactivated.is_active is True
+    assert reactivated.configuration_fingerprint
+    assert reactivated.runtime_state.desired_state == MinerInstanceState.DesiredState.STOPPED
+
+    archive_account(reactivated)
+    AccountCredential.objects.filter(account=reactivated).delete()
+    with pytest.raises(ValidationError, match="password"):
+        reactivate_account(reactivated)
+    reactivated.refresh_from_db()
+    assert reactivated.is_active is False
+
+
+@pytest.mark.django_db
+def test_channel_resolution_selection_restart_and_command_coalescing(
+    db_account: MinerAccount,
+):
+    account = db_account
 
     assert normalize_channels(" Alpha, beta\nALPHA ") == ["Alpha", "beta"]
-    default = resolve_channels(account, config_path)
+    default = resolve_channels(account)
     assert default.channels == ("Alpha", "beta")
     assert default.mode == AccountChannelSelection.Mode.DEFAULT
+    assert default.source_name == "farm defaults"
 
     account.runtime_state.desired_state = MinerInstanceState.DesiredState.RUNNING
     account.runtime_state.save(update_fields=("desired_state", "updated_at"))
@@ -156,10 +235,69 @@ def test_channel_resolution_selection_restart_and_command_coalescing(tmp_path, s
     assert account.runtime_state.desired_state == MinerInstanceState.DesiredState.STOPPED
 
 
+@pytest.mark.django_db
+def test_database_default_changes_restart_only_running_default_accounts(
+    farm_configuration: FarmConfiguration,
+):
+    default_account = create_account(
+        config_key="default",
+        username="DefaultUser",
+        password="default-secret",
+    )
+    custom_account = create_account(
+        config_key="custom",
+        username="CustomUser",
+        password="custom-secret",
+        mode=AccountChannelSelection.Mode.CUSTOM,
+        channels=["custom_channel"],
+    )
+    for account in (default_account, custom_account):
+        account.runtime_state.desired_state = MinerInstanceState.DesiredState.RUNNING
+        account.runtime_state.save(update_fields=("desired_state", "updated_at"))
+
+    configuration = update_farm_configuration(
+        default_channels=["NewOne", "new_two", "newone"],
+        autostart_new_accounts=True,
+    )
+
+    assert configuration.pk == farm_configuration.pk == 1
+    assert configuration.default_channels == ["NewOne", "new_two"]
+    assert configuration.autostart_new_accounts is True
+    default_account.refresh_from_db()
+    custom_account.refresh_from_db()
+    assert resolve_channels(default_account).channels == ("NewOne", "new_two")
+    assert resolve_channels(custom_account).channels == ("custom_channel",)
+    assert list(
+        MinerCommand.objects.values_list("account__config_key", "action")
+    ) == [("default", MinerCommand.Action.RESTART)]
+
+
+@pytest.mark.django_db
+def test_autostart_preference_change_does_not_restart_accounts(
+    farm_configuration: FarmConfiguration,
+):
+    account = create_account(
+        config_key="default",
+        username="DefaultUser",
+        password="default-secret",
+    )
+    account.runtime_state.desired_state = MinerInstanceState.DesiredState.RUNNING
+    account.runtime_state.save(update_fields=("desired_state", "updated_at"))
+    old_revision = account.channel_revision
+
+    update_farm_configuration(
+        default_channels=farm_configuration.default_channels,
+        autostart_new_accounts=True,
+    )
+
+    account.refresh_from_db()
+    assert account.channel_revision == old_revision
+    assert not MinerCommand.objects.filter(account=account).exists()
+
+
 def test_sqlite_immediate_transactions_preserve_latest_concurrent_command(
     tmp_path,
 ):
-    config_path = make_config(tmp_path)
     database_path = tmp_path / "concurrent.sqlite3"
     project_root = Path(__file__).resolve().parents[1]
     environment = os.environ.copy()
@@ -167,7 +305,9 @@ def test_sqlite_immediate_transactions_preserve_latest_concurrent_command(
         {
             "DJANGO_DEBUG": "1",
             "DJANGO_SECRET_KEY": "concurrency-test-only",
-            "TWITCH_FARM_CONFIG": str(config_path),
+            "TWITCH_FARM_CREDENTIAL_KEYS": (
+                "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+            ),
             "TWITCH_FARM_DB": str(database_path),
         }
     )
@@ -196,11 +336,19 @@ def test_sqlite_immediate_transactions_preserve_latest_concurrent_command(
 
         from django.db import close_old_connections, transaction
 
-        from controller.models import MinerAccount, MinerCommand, MinerInstanceState
-        from controller.services import enqueue_command, sync_config_accounts
+        from controller.models import MinerCommand, MinerInstanceState
+        from controller.services import create_account, enqueue_command, update_farm_configuration
 
-        sync_config_accounts()
-        account_id = MinerAccount.objects.get(config_key="primary").pk
+        update_farm_configuration(
+            default_channels=["Alpha", "beta"],
+            autostart_new_accounts=False,
+        )
+        account = create_account(
+            config_key="primary",
+            username="PrimaryUser",
+            password="concurrency-secret",
+        )
+        account_id = account.pk
         first_has_written = Event()
         release_first = Event()
         second_started = Event()
@@ -211,7 +359,6 @@ def test_sqlite_immediate_transactions_preserve_latest_concurrent_command(
             close_old_connections()
             try:
                 with transaction.atomic():
-                    account = MinerAccount.objects.get(pk=account_id)
                     enqueue_command(account, MinerCommand.Action.START)
                     first_has_written.set()
                     if not release_first.wait(timeout=5):
@@ -225,7 +372,6 @@ def test_sqlite_immediate_transactions_preserve_latest_concurrent_command(
             close_old_connections()
             second_started.set()
             try:
-                account = MinerAccount.objects.get(pk=account_id)
                 enqueue_command(account, MinerCommand.Action.STOP)
             except BaseException as exc:
                 errors.append(repr(exc))
@@ -241,6 +387,7 @@ def test_sqlite_immediate_transactions_preserve_latest_concurrent_command(
         second.start()
         if not second_started.wait(timeout=5):
             raise AssertionError("second request did not start")
+
         serialized = not second_finished.wait(timeout=0.1)
         release_first.set()
         first.join(timeout=5)
@@ -279,10 +426,10 @@ def test_sqlite_immediate_transactions_preserve_latest_concurrent_command(
 
 
 @pytest.mark.django_db
-def test_launch_snapshot_is_exact_immutable_and_secret_free(tmp_path):
-    config_path = make_config(tmp_path)
-    sync_config_accounts(config_path)
-    account = MinerAccount.objects.get(config_key="primary")
+def test_launch_snapshot_is_exact_immutable_database_backed_and_secret_free(
+    db_account: MinerAccount,
+):
+    account = db_account
     preset = save_preset(name="Ordered", channels=["Three", "two", "one"])
     set_account_channel_selection(
         account,
@@ -291,10 +438,13 @@ def test_launch_snapshot_is_exact_immutable_and_secret_free(tmp_path):
         enqueue_restart=False,
     )
 
-    run = create_launch_snapshot(account, "worker-a", config=config_path)
+    run = create_launch_snapshot(account, "worker-a")
     assert run.channels == ["Three", "two", "one"]
     assert run.source_name == "Ordered"
+    assert run.source_mode == AccountChannelSelection.Mode.PRESET
     assert run.worker_id == "worker-a"
+    account.refresh_from_db()
+    assert run.configuration_fingerprint == account.configuration_fingerprint
     persisted_values = json.dumps(
         list(MinerRun.objects.values()),
         default=str,
@@ -302,164 +452,11 @@ def test_launch_snapshot_is_exact_immutable_and_secret_free(tmp_path):
     )
     assert "super-secret" not in persisted_values
 
+    save_preset(name="Ordered", channels=["replacement"], preset=preset)
+    run.refresh_from_db()
+    assert run.channels == ["Three", "two", "one"]
+    assert create_launch_snapshot(account, "worker-b").channels == ["replacement"]
+
     run.channels = ["different"]
     with pytest.raises(ValidationError, match="immutable"):
         run.save()
-
-
-@pytest.mark.django_db
-def test_import_missing_presets_file_imports_state_with_empty_preset_list(
-    tmp_path,
-    settings,
-):
-    config_path = make_config(tmp_path, autostart=True)
-    data_dir = tmp_path / "legacy"
-    data_dir.mkdir()
-    (data_dir / "state.json").write_text(
-        json.dumps(
-            {
-                "states": [
-                    {
-                        "user_id": "primary",
-                        "assigned_preset": "__custom__",
-                        "custom_channels": ["second", "first"],
-                    }
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-    settings.TWITCH_FARM_COOKIES_DIR = tmp_path / "cookies"
-    output = io.StringIO()
-
-    call_command(
-        "import_legacy_data",
-        config=str(config_path),
-        data_dir=str(data_dir),
-        stdout=output,
-        stderr=io.StringIO(),
-    )
-
-    account = MinerAccount.objects.get(config_key="primary")
-    assert "Imported 0 preset(s), 1 account state(s)" in output.getvalue()
-    assert ChannelPreset.objects.count() == 0
-    assert account.selection.mode == AccountChannelSelection.Mode.CUSTOM
-    assert list(account.custom_channels.values_list("name", flat=True)) == ["second", "first"]
-    assert account.runtime_state.desired_state == MinerInstanceState.DesiredState.RUNNING
-    import_log = ActionLog.objects.get(action="legacy_import")
-    assert import_log.details["preset_count"] == 0
-    assert import_log.details["state_count"] == 1
-
-
-@pytest.mark.django_db
-def test_import_missing_presets_file_still_requires_state_file(tmp_path):
-    config_path = make_config(tmp_path)
-    data_dir = tmp_path / "legacy"
-    data_dir.mkdir()
-
-    with pytest.raises(CommandError, match="Missing legacy state file"):
-        call_command(
-            "import_legacy_data",
-            config=str(config_path),
-            data_dir=str(data_dir),
-            stdout=io.StringIO(),
-            stderr=io.StringIO(),
-        )
-
-
-@pytest.mark.django_db
-def test_import_dry_run_idempotence_orphans_and_replace(tmp_path, settings):
-    config_path = make_config(tmp_path, autostart=True)
-    data_dir = tmp_path / "legacy"
-    data_dir.mkdir()
-    presets_path = data_dir / "presets.json"
-    presets_path.write_text(
-        json.dumps({"presets": [{"name": "Games", "channels": ["one", "two"]}]}),
-        encoding="utf-8",
-    )
-    (data_dir / "state.json").write_text(
-        json.dumps(
-            {
-                "states": [
-                    {
-                        "user_id": "primary",
-                        "is_running": False,
-                        "pid": 12345,
-                        "assigned_preset": "Games",
-                        "custom_channels": ["saved_for_later"],
-                    },
-                    {
-                        "user_id": "orphan",
-                        "is_running": True,
-                        "pid": 99999,
-                        "assigned_preset": "__custom__",
-                        "custom_channels": ["orphan_channel"],
-                    },
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-    settings.TWITCH_FARM_COOKIES_DIR = tmp_path / "cookies"
-
-    call_command(
-        "import_legacy_data",
-        config=str(config_path),
-        data_dir=str(data_dir),
-        dry_run=True,
-        stdout=io.StringIO(),
-        stderr=io.StringIO(),
-    )
-    assert MinerAccount.objects.count() == 0
-
-    output = io.StringIO()
-    call_command(
-        "import_legacy_data",
-        config=str(config_path),
-        data_dir=str(data_dir),
-        stdout=output,
-        stderr=io.StringIO(),
-    )
-    assert "Imported 1 preset(s), 2 account state(s)" in output.getvalue()
-    primary = MinerAccount.objects.get(config_key="primary")
-    orphan = MinerAccount.objects.get(config_key="orphan")
-    assert primary.runtime_state.desired_state == MinerInstanceState.DesiredState.RUNNING
-    assert primary.runtime_state.advisory_pid is None
-    assert primary.selection.preset.name == "Games"
-    assert list(primary.custom_channels.values_list("name", flat=True)) == ["saved_for_later"]
-    assert orphan.is_configured is False
-    assert orphan.runtime_state.desired_state == MinerInstanceState.DesiredState.STOPPED
-    assert orphan.runtime_state.advisory_pid is None
-
-    call_command(
-        "import_legacy_data",
-        config=str(config_path),
-        data_dir=str(data_dir),
-        stdout=io.StringIO(),
-        stderr=io.StringIO(),
-    )
-    assert ActionLog.objects.filter(action="legacy_import").count() == 1
-    assert ChannelPreset.objects.count() == 1
-
-    presets_path.write_text(
-        json.dumps({"presets": [{"name": "Games", "channels": ["replacement"]}]}),
-        encoding="utf-8",
-    )
-    with pytest.raises(CommandError, match="--replace"):
-        call_command(
-            "import_legacy_data",
-            config=str(config_path),
-            data_dir=str(data_dir),
-            stdout=io.StringIO(),
-            stderr=io.StringIO(),
-        )
-
-    call_command(
-        "import_legacy_data",
-        config=str(config_path),
-        data_dir=str(data_dir),
-        replace=True,
-        stdout=io.StringIO(),
-        stderr=io.StringIO(),
-    )
-    assert ChannelPreset.objects.get(name="Games").channel_names == ["replacement"]

@@ -1,9 +1,9 @@
 x-app: &app
   build: .
   image: ghcr.io/karilaa-dev/twitch-car-factory:${TWITCH_FARM_IMAGE_TAG:-latest}
-  # Match the owner of the bind-mounted config/data/cookies. The defaults are
-  # the conventional first Linux user; set PUID/PGID to `id -u`/`id -g` on
-  # hosts that use different IDs (macOS commonly uses 501/20).
+  # Match the owner of the bind-mounted data/runtime directories. The defaults
+  # are the conventional first Linux user; set PUID/PGID to `id -u`/`id -g`
+  # on hosts that use different IDs (macOS commonly uses 501/20).
   user: "${PUID:-1000}:${PGID:-1000}"
   environment: &app-environment
     DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?Set DJANGO_SECRET_KEY in .env}
@@ -17,9 +17,8 @@ x-app: &app
     DJANGO_SECURE_HSTS_SECONDS: ${DJANGO_SECURE_HSTS_SECONDS:-0}
     DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS: ${DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS:-0}
     DJANGO_SECURE_HSTS_PRELOAD: ${DJANGO_SECURE_HSTS_PRELOAD:-0}
+    TWITCH_FARM_CREDENTIAL_KEYS: ${TWITCH_FARM_CREDENTIAL_KEYS:?Set TWITCH_FARM_CREDENTIAL_KEYS in .env}
     TWITCH_FARM_DB: /app/data/db.sqlite3
-    TWITCH_FARM_CONFIG: /app/config.yaml
-    TWITCH_FARM_COOKIES_DIR: /app/cookies
     TWITCH_FARM_WORKER_LOCK: /app/data/miner-worker.lock
     TZ: UTC
   volumes:
@@ -62,6 +61,10 @@ services:
     <<: *app
     command: ["python", "manage.py", "run_miner_worker"]
     restart: unless-stopped
+    # The supervisor stops owned miners sequentially and may wait up to ten
+    # seconds per child before forcing it down. Leave enough time for several
+    # miners plus durable run/state/lease finalization before Docker sends KILL.
+    stop_grace_period: 2m
     environment:
       <<: *app-environment
       TWITCH_FARM_RUNTIME_DIR: /app/runtime
@@ -71,17 +74,3 @@ services:
     volumes:
       - ./data:/app/data
       - ./runtime:/app/runtime
-      - ./config.yaml:/app/config.yaml:ro
-      - ./cookies:/app/cookies:ro
-
-  importer:
-    <<: *app
-    profiles: ["tools"]
-    command: ["python", "manage.py", "import_legacy_data", "--config", "/app/config.yaml", "--data-dir", "/app/data"]
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
-    volumes:
-      - ./data:/app/data
-      - ./config.yaml:/app/config.yaml:ro
-      - ./cookies:/app/cookies:ro

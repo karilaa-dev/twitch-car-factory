@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import os
 from pathlib import Path
 
@@ -30,6 +32,40 @@ if not DEBUG and (SECRET_KEY in INSECURE_SECRET_KEYS or len(SECRET_KEY) < 50):
         "DJANGO_SECRET_KEY must be an explicit random value of at least 50 characters "
         "when DJANGO_DEBUG is false."
     )
+
+
+def credential_keys() -> tuple[str, ...]:
+    raw = os.getenv("TWITCH_FARM_CREDENTIAL_KEYS", "")
+    values = tuple(value.strip() for value in raw.split(",") if value.strip())
+    if not values and DEBUG:
+        values = (
+            base64.urlsafe_b64encode(
+                hashlib.sha256(f"twitch-farm:{SECRET_KEY}".encode()).digest()
+            ).decode("ascii"),
+        )
+    if not values:
+        raise ImproperlyConfigured(
+            "TWITCH_FARM_CREDENTIAL_KEYS must contain at least one Fernet key."
+        )
+    for value in values:
+        try:
+            decoded = base64.b64decode(
+                value.encode("ascii"),
+                altchars=b"-_",
+                validate=True,
+            )
+        except Exception as exc:
+            raise ImproperlyConfigured(
+                "TWITCH_FARM_CREDENTIAL_KEYS contains an invalid Fernet key."
+            ) from exc
+        if len(decoded) != 32:
+            raise ImproperlyConfigured(
+                "TWITCH_FARM_CREDENTIAL_KEYS contains an invalid Fernet key."
+            )
+    return values
+
+
+TWITCH_FARM_CREDENTIAL_KEYS = credential_keys()
 ALLOWED_HOSTS = [
     host.strip()
     for host in os.getenv("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1,[::1]").split(",")
@@ -115,6 +151,11 @@ USE_TZ = True
 
 STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
+DATA_UPLOAD_MAX_MEMORY_SIZE = 11 * 1024 * 1024
+# Every accepted legacy ZIP stays in memory.  The importer caps the archive at
+# 10 MiB and never needs Django's temporary-file upload handler.
+FILE_UPLOAD_MAX_MEMORY_SIZE = 11 * 1024 * 1024
+DATA_UPLOAD_MAX_NUMBER_FILES = 1
 STORAGES = {
     "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
     "staticfiles": {
@@ -145,8 +186,6 @@ SECURE_HSTS_PRELOAD = env_bool("DJANGO_SECURE_HSTS_PRELOAD", not DEBUG)
 SECURE_CONTENT_TYPE_NOSNIFF = True
 X_FRAME_OPTIONS = "DENY"
 
-TWITCH_FARM_CONFIG = Path(os.getenv("TWITCH_FARM_CONFIG", BASE_DIR / "config.yaml"))
-TWITCH_FARM_COOKIES_DIR = Path(os.getenv("TWITCH_FARM_COOKIES_DIR", BASE_DIR / "cookies"))
 TWITCH_FARM_RUNTIME_DIR = Path(
     os.getenv("TWITCH_FARM_RUNTIME_DIR", BASE_DIR / "runtime")
 )

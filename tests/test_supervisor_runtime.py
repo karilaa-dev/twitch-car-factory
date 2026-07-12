@@ -1,22 +1,28 @@
 from __future__ import annotations
 
 import json
+import pickle
 import subprocess
 from datetime import timedelta
-from pathlib import Path
 
 import pytest
 from django.core.management import call_command
 from django.db import OperationalError
 from django.utils import timezone
 
-from controller.miner_runner import load_launch_payload, prepare_runtime_cookie
+from controller.crypto import encrypt_json, encrypt_text
+from controller import miner_runner
+from controller.miner_runner import LaunchPayload, load_launch_payload, prepare_runtime_cookie
 from controller.miner_supervisor import (
     MinerSupervisor,
     SupervisorAlreadyRunning,
     SupervisorOptions,
 )
 from controller.models import (
+    AccountChannelSelection,
+    AccountCredential,
+    AccountSessionSeed,
+    FarmConfiguration,
     MinerAccount,
     MinerCommand,
     MinerIncident,
@@ -25,24 +31,57 @@ from controller.models import (
     RestartAttempt,
     WorkerLease,
 )
-from controller.services import create_launch_snapshot, enqueue_command, sync_config_accounts
+from controller.services import create_launch_snapshot, enqueue_command
 
 
-def write_config(path: Path, *, channels: tuple[str, ...] = ("Alpha", "Beta")) -> Path:
-    channel_yaml = "\n".join(f"  - {channel}" for channel in channels)
-    path.write_text(
-        f"""settings:
-  autostart_instances: false
-twitch_users:
-  primary:
-    username: PrimaryUser
-    password: never-put-this-in-argv
-default_channels:
-{channel_yaml or '  []'}
-""",
-        encoding="utf-8",
+def upsert_account(
+    config_key: str,
+    *,
+    username: str,
+    password: str,
+    is_active: bool = True,
+) -> MinerAccount:
+    account, _ = MinerAccount.objects.update_or_create(
+        config_key=config_key,
+        defaults={
+            "display_username": username,
+            "is_active": is_active,
+        },
     )
-    return path
+    AccountCredential.objects.update_or_create(
+        account=account,
+        defaults={"password_ciphertext": encrypt_text(password)},
+    )
+    AccountChannelSelection.objects.get_or_create(account=account)
+    MinerInstanceState.objects.get_or_create(account=account)
+    return account
+
+
+def set_default_channels(channels: tuple[str, ...] = ("Alpha", "Beta")) -> None:
+    configuration = FarmConfiguration.load()
+    configuration.default_channels = list(channels)
+    configuration.autostart_new_accounts = False
+    configuration.save()
+
+
+def configure_farm(
+    *,
+    channels: tuple[str, ...] = ("Alpha", "Beta"),
+    include_second: bool = False,
+) -> MinerAccount:
+    set_default_channels(channels)
+    primary = upsert_account(
+        "primary",
+        username="PrimaryUser",
+        password="never-put-this-in-argv",
+    )
+    if include_second:
+        upsert_account(
+            "secondary",
+            username="SecondaryUser",
+            password="another-secret",
+        )
+    return primary
 
 
 class FakeClock:
@@ -159,7 +198,7 @@ def make_supervisor(clock: FakeClock, factory: ProcessFactory, **option_override
 
 @pytest.mark.django_db
 def test_start_uses_snapshot_only_and_manual_stop_never_restarts(tmp_path, settings):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory(ignore_terminate=True)
     supervisor = make_supervisor(clock, factory)
@@ -178,7 +217,7 @@ def test_start_uses_snapshot_only_and_manual_stop_never_restarts(tmp_path, setti
         assert run.startup_confirmed_at is not None
 
         argv = factory.commands[0]
-        assert argv[-2:] == [str(run.pk), "primary"]
+        assert argv[-2:] == [str(run.pk), str(account.pk)]
         assert "never-put-this-in-argv" not in " ".join(argv)
         assert "Alpha" not in argv and "Beta" not in argv
         assert factory.options[0]["cwd"] == settings.TWITCH_FARM_RUNTIME_DIR
@@ -206,7 +245,7 @@ def test_start_uses_snapshot_only_and_manual_stop_never_restarts(tmp_path, setti
 
 @pytest.mark.django_db
 def test_unexpected_exit_records_incident_attempt_and_recovery(tmp_path, settings):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory()
     supervisor = make_supervisor(clock, factory)
@@ -246,7 +285,7 @@ def test_manual_stop_committed_between_recovery_claim_and_spawn_prevents_launch(
     settings,
     monkeypatch,
 ):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory()
     supervisor = make_supervisor(clock, factory)
@@ -316,7 +355,7 @@ def test_recovery_spawn_transaction_failure_cleans_provisional_child(
     settings,
     monkeypatch,
 ):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory()
     supervisor = make_supervisor(clock, factory)
@@ -380,7 +419,7 @@ def test_command_spawn_transaction_failure_cleans_provisional_child(
     settings,
     monkeypatch,
 ):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory()
     supervisor = make_supervisor(clock, factory)
@@ -428,7 +467,7 @@ def test_manual_stop_committed_during_explicit_restart_prevents_replacement_spaw
     settings,
     monkeypatch,
 ):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory()
     supervisor = make_supervisor(clock, factory)
@@ -483,7 +522,7 @@ def test_explicit_restart_supersedes_active_recovery_attempts_until_confirmation
     settings,
     active_outcome,
 ):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     supervisor = make_supervisor(clock, ProcessFactory())
     supervisor.startup()
@@ -561,7 +600,7 @@ def test_live_recovery_may_confirm_before_explicit_restart_takes_over(
     tmp_path,
     settings,
 ):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory()
     supervisor = make_supervisor(clock, factory)
@@ -625,8 +664,7 @@ def test_invalid_explicit_restart_does_not_cancel_live_recovery(
     tmp_path,
     settings,
 ):
-    config_path = write_config(tmp_path / "config.yaml")
-    settings.TWITCH_FARM_CONFIG = config_path
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory()
     supervisor = make_supervisor(clock, factory)
@@ -655,7 +693,7 @@ def test_invalid_explicit_restart_does_not_cancel_live_recovery(
         assert recovery_child.confirmed is False
 
         command = enqueue_command(account, MinerCommand.Action.RESTART)
-        write_config(config_path, channels=())
+        set_default_channels(())
         assert supervisor.process_pending_commands() == 1
 
         command.refresh_from_db()
@@ -687,8 +725,7 @@ def test_invalid_restart_preserves_existing_rapid_recovery_deadline(
     tmp_path,
     settings,
 ):
-    config_path = write_config(tmp_path / "config.yaml")
-    settings.TWITCH_FARM_CONFIG = config_path
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory()
     supervisor = make_supervisor(clock, factory, rapid_restart_backoff=(5, 15, 30, 60, 120))
@@ -715,7 +752,7 @@ def test_invalid_restart_preserves_existing_rapid_recovery_deadline(
         )
 
         command = enqueue_command(account, MinerCommand.Action.RESTART)
-        write_config(config_path, channels=())
+        set_default_channels(())
         assert supervisor.process_pending_commands() == 1
 
         command.refresh_from_db()
@@ -726,7 +763,7 @@ def test_invalid_restart_preserves_existing_rapid_recovery_deadline(
         assert attempt.scheduled_at == rapid_deadline
         assert state.next_retry_at == rapid_deadline
 
-        write_config(config_path)
+        set_default_channels()
         clock.advance(5)
         assert supervisor._perform_due_recoveries() == 1
         attempt.refresh_from_db()
@@ -742,7 +779,7 @@ def test_failed_validated_restart_takeover_schedules_new_rapid_attempt(
     settings,
     monkeypatch,
 ):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     supervisor = make_supervisor(clock, ProcessFactory())
     supervisor.startup()
@@ -796,7 +833,7 @@ def test_repeated_restart_coalesces_while_replacement_is_starting(
     tmp_path,
     settings,
 ):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory()
     supervisor = make_supervisor(clock, factory)
@@ -835,7 +872,7 @@ def test_failed_restart_signal_allows_surviving_recovery_attempt_to_succeed(
     tmp_path,
     settings,
 ):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory(fail_terminate=True)
     supervisor = make_supervisor(clock, factory)
@@ -897,8 +934,7 @@ def test_terminal_newer_restart_recovers_incident_for_confirmed_fallback_child(
     tmp_path,
     settings,
 ):
-    config_path = write_config(tmp_path / "config.yaml")
-    settings.TWITCH_FARM_CONFIG = config_path
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory(fail_terminate=True)
     supervisor = make_supervisor(clock, factory)
@@ -939,7 +975,7 @@ def test_terminal_newer_restart_recovers_incident_for_confirmed_fallback_child(
         assert attempt.outcome == RestartAttempt.Outcome.SUCCEEDED
         assert incident.status == MinerIncident.Status.RECOVERED
 
-        write_config(config_path, channels=())
+        set_default_channels(())
         assert supervisor.process_pending_commands() == 1
 
         second_restart.refresh_from_db()
@@ -962,7 +998,7 @@ def test_restart_bookkeeping_failure_finalizes_unused_snapshot_and_keeps_old_chi
     settings,
     monkeypatch,
 ):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory()
     supervisor = make_supervisor(clock, factory)
@@ -1019,7 +1055,7 @@ def test_unexpected_exit_keeps_handle_until_run_and_incident_bookkeeping_commits
     settings,
     monkeypatch,
 ):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory()
     supervisor = make_supervisor(clock, factory)
@@ -1076,7 +1112,7 @@ def test_unexpected_exit_keeps_handle_until_run_and_incident_bookkeeping_commits
 
 @pytest.mark.django_db
 def test_five_rapid_recovery_failures_enter_degraded_periodic_retry(tmp_path, settings):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory()
     supervisor = make_supervisor(clock, factory, startup_grace_seconds=10)
@@ -1125,8 +1161,7 @@ def test_five_rapid_recovery_failures_enter_degraded_periodic_retry(tmp_path, se
 
 @pytest.mark.django_db
 def test_startup_rejects_live_lease_and_recovers_stale_pid(tmp_path, settings):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
-    sync_config_accounts()
+    configure_farm()
     account = MinerAccount.objects.get(config_key="primary")
     state = MinerInstanceState.objects.get(account=account)
     state.desired_state = MinerInstanceState.DesiredState.RUNNING
@@ -1177,8 +1212,7 @@ def test_startup_rejects_live_lease_and_recovers_stale_pid(tmp_path, settings):
 
 @pytest.mark.django_db
 def test_invalid_new_channel_config_keeps_healthy_process(tmp_path, settings):
-    config_path = write_config(tmp_path / "config.yaml")
-    settings.TWITCH_FARM_CONFIG = config_path
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory()
     supervisor = make_supervisor(clock, factory)
@@ -1189,7 +1223,7 @@ def test_invalid_new_channel_config_keeps_healthy_process(tmp_path, settings):
         supervisor.run_once(force_checks=True)
         original = factory.processes[0]
 
-        write_config(config_path, channels=())
+        set_default_channels(())
         supervisor.reconcile_fingerprints()
         state = MinerInstanceState.objects.get(account=account)
         assert original.poll() is None
@@ -1201,9 +1235,11 @@ def test_invalid_new_channel_config_keeps_healthy_process(tmp_path, settings):
 
 
 @pytest.mark.django_db
-def test_periodic_config_sync_adds_and_removes_accounts(tmp_path, settings):
-    config_path = write_config(tmp_path / "config.yaml")
-    settings.TWITCH_FARM_CONFIG = config_path
+def test_database_reconciliation_starts_active_and_stops_archived_accounts(
+    tmp_path,
+    settings,
+):
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory()
     supervisor = make_supervisor(clock, factory)
@@ -1213,42 +1249,26 @@ def test_periodic_config_sync_adds_and_removes_accounts(tmp_path, settings):
         enqueue_command(primary, MinerCommand.Action.START)
         supervisor.run_once(force_checks=True)
 
-        config_path.write_text(
-            """settings:
-  autostart_instances: true
-twitch_users:
-  primary:
-    username: PrimaryUser
-    password: primary-secret
-  secondary:
-    username: SecondaryUser
-    password: secondary-secret
-default_channels:
-  - Alpha
-""",
-            encoding="utf-8",
+        secondary = upsert_account(
+            "secondary",
+            username="SecondaryUser",
+            password="secondary-secret",
         )
+        secondary.runtime_state.desired_state = MinerInstanceState.DesiredState.RUNNING
+        secondary.runtime_state.save(update_fields=("desired_state", "updated_at"))
         supervisor.reconcile_fingerprints()
-        secondary = MinerAccount.objects.get(config_key="secondary")
+        secondary.runtime_state.refresh_from_db()
         assert secondary.runtime_state.desired_state == MinerInstanceState.DesiredState.RUNNING
         assert secondary.pk in supervisor.processes
 
-        config_path.write_text(
-            """settings:
-  autostart_instances: true
-twitch_users:
-  secondary:
-    username: SecondaryUser
-    password: secondary-secret
-default_channels:
-  - Alpha
-""",
-            encoding="utf-8",
-        )
+        primary.is_active = False
+        primary.save(update_fields=("is_active", "updated_at"))
+        primary.runtime_state.desired_state = MinerInstanceState.DesiredState.STOPPED
+        primary.runtime_state.save(update_fields=("desired_state", "updated_at"))
         supervisor.reconcile_fingerprints()
         primary.refresh_from_db()
         primary.runtime_state.refresh_from_db()
-        assert primary.is_configured is False
+        assert primary.is_active is False
         assert primary.runtime_state.desired_state == MinerInstanceState.DesiredState.STOPPED
         assert primary.pk not in supervisor.processes
     finally:
@@ -1256,9 +1276,8 @@ default_channels:
 
 
 @pytest.mark.django_db
-def test_config_removal_closes_unowned_recovery_incident(tmp_path, settings):
-    config_path = write_config(tmp_path / "config.yaml")
-    settings.TWITCH_FARM_CONFIG = config_path
+def test_archiving_closes_unowned_recovery_incident(tmp_path, settings):
+    configure_farm()
     clock = FakeClock()
     supervisor = make_supervisor(clock, ProcessFactory())
     supervisor.startup()
@@ -1281,15 +1300,10 @@ def test_config_removal_closes_unowned_recovery_incident(tmp_path, settings):
             scheduled_at=state.next_retry_at,
             outcome=RestartAttempt.Outcome.SCHEDULED,
         )
-        config_path.write_text(
-            """settings:
-  autostart_instances: false
-twitch_users: {}
-default_channels:
-  - Alpha
-""",
-            encoding="utf-8",
-        )
+        account.is_active = False
+        account.save(update_fields=("is_active", "updated_at"))
+        state.desired_state = MinerInstanceState.DesiredState.STOPPED
+        state.save(update_fields=("desired_state", "updated_at"))
 
         supervisor.reconcile_fingerprints()
 
@@ -1297,15 +1311,15 @@ default_channels:
         state.refresh_from_db()
         attempt.refresh_from_db()
         incident.refresh_from_db()
-        assert account.is_configured is False
+        assert account.is_active is False
         assert state.desired_state == MinerInstanceState.DesiredState.STOPPED
         assert state.observed_state == MinerInstanceState.ObservedState.STOPPED
         assert state.next_retry_at is None
         assert attempt.outcome == RestartAttempt.Outcome.FAILED
-        assert "removed from config.yaml" in attempt.error
+        assert "account is archived" in attempt.error
         assert incident.status == MinerIncident.Status.RECOVERED
         assert incident.recovered_at is not None
-        assert "no longer configured" in incident.details
+        assert "account is archived" in incident.details
         assert supervisor.processes == {}
     finally:
         supervisor.shutdown()
@@ -1313,7 +1327,7 @@ default_channels:
 
 @pytest.mark.django_db
 def test_linux_children_receive_parent_death_signal_hook(tmp_path, settings, monkeypatch):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory()
     supervisor = make_supervisor(clock, factory)
@@ -1333,22 +1347,22 @@ def test_runner_and_fake_miner_read_exact_snapshot_without_persisting_password(
     tmp_path,
     settings,
 ):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
-    sync_config_accounts()
+    configure_farm()
     account = MinerAccount.objects.get(config_key="primary")
     run = create_launch_snapshot(account, worker_id="test-worker")
 
-    payload = load_launch_payload(run.pk, account.config_key)
+    payload = load_launch_payload(run.pk, account.pk)
     assert payload.username == "PrimaryUser"
     assert payload.password == "never-put-this-in-argv"
     assert payload.channels == ("Alpha", "Beta")
+    assert payload.password not in repr(payload)
     assert "password" not in {field.name for field in MinerRun._meta.get_fields()}
 
     record_path = tmp_path / "fake-miner.jsonl"
     call_command(
         "run_fake_miner",
         run.pk,
-        account.config_key,
+        account.pk,
         duration=0,
         record_file=str(record_path),
         verbosity=0,
@@ -1360,28 +1374,66 @@ def test_runner_and_fake_miner_read_exact_snapshot_without_persisting_password(
     assert "password" not in record
 
 
-def test_runtime_cookie_is_seeded_into_private_writable_directory(
+@pytest.mark.django_db
+def test_runtime_cookie_consumes_encrypted_seed_into_private_writable_directory(
     tmp_path,
     settings,
     monkeypatch,
 ):
-    seed_dir = tmp_path / "seed-cookies"
-    seed_dir.mkdir()
-    seed = seed_dir / "PrimaryUser.pkl"
-    seed.write_bytes(b"seed-cookie")
+    account = configure_farm()
+    cookies = [
+        {"name": "auth-token", "value": "session-secret"},
+        {"name": "login", "value": "PrimaryUser"},
+    ]
+    AccountSessionSeed.objects.create(
+        account=account,
+        payload_ciphertext=encrypt_json(cookies),
+    )
     runtime_dir = tmp_path / "runtime"
     runtime_dir.mkdir()
-    settings.TWITCH_FARM_COOKIES_DIR = seed_dir
     monkeypatch.chdir(runtime_dir)
 
-    destination = prepare_runtime_cookie("PrimaryUser")
+    destination = prepare_runtime_cookie("PrimaryUser", account.pk)
     assert destination == runtime_dir / "cookies" / "PrimaryUser.pkl"
-    assert destination.read_bytes() == b"seed-cookie"
+    assert pickle.loads(destination.read_bytes()) == cookies
     assert destination.stat().st_mode & 0o777 == 0o600
     assert destination.parent.stat().st_mode & 0o777 == 0o700
+    assert not AccountSessionSeed.objects.filter(account=account).exists()
 
     destination.write_bytes(b"refreshed-cookie")
-    assert prepare_runtime_cookie("PrimaryUser").read_bytes() == b"refreshed-cookie"
+    AccountSessionSeed.objects.create(
+        account=account,
+        payload_ciphertext=encrypt_json(
+            [{"name": "auth-token", "value": "replacement-secret"}]
+        ),
+    )
+    replacement = prepare_runtime_cookie("PrimaryUser", account.pk)
+    assert pickle.loads(replacement.read_bytes()) == [
+        {"name": "auth-token", "value": "replacement-secret"}
+    ]
+    assert not AccountSessionSeed.objects.filter(account=account).exists()
+
+
+def test_miner_entrypoint_suppresses_password_from_upstream_errors(monkeypatch):
+    password = "upstream-error-password-secret"
+    payload = LaunchPayload(
+        username="PrimaryUser",
+        password=password,
+        channels=("Alpha",),
+    )
+    monkeypatch.setattr(miner_runner, "load_launch_payload", lambda *_args: payload)
+    monkeypatch.setattr(miner_runner, "prepare_runtime_cookie", lambda *_args: None)
+
+    def fail_with_password(_payload):
+        raise RuntimeError(f"login failed for password={password}")
+
+    monkeypatch.setattr(miner_runner, "run_miner", fail_with_password)
+
+    with pytest.raises(RuntimeError) as captured:
+        miner_runner.main(1, 1)
+
+    assert password not in str(captured.value)
+    assert "sensitive authentication details were suppressed" in str(captured.value)
 
 
 @pytest.mark.django_db
@@ -1390,7 +1442,7 @@ def test_spawn_persistence_failure_terminates_child_before_losing_handle(
     settings,
     monkeypatch,
 ):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory()
     supervisor = make_supervisor(clock, factory)
@@ -1421,7 +1473,7 @@ def test_spawn_persistence_failure_terminates_child_before_losing_handle(
 
 @pytest.mark.django_db
 def test_runtime_directory_failure_finalizes_unspawned_run(tmp_path, settings):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     invalid_runtime = tmp_path / "runtime-is-a-file"
     invalid_runtime.write_text("not a directory", encoding="utf-8")
     settings.TWITCH_FARM_RUNTIME_DIR = invalid_runtime
@@ -1452,7 +1504,7 @@ def test_unspawned_run_finalization_failure_is_retained_and_retried(
     settings,
     monkeypatch,
 ):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     invalid_runtime = tmp_path / "runtime-is-a-file"
     invalid_runtime.write_text("not a directory", encoding="utf-8")
     settings.TWITCH_FARM_RUNTIME_DIR = invalid_runtime
@@ -1491,7 +1543,7 @@ def test_due_recovery_waits_for_pending_run_finalization(
     settings,
     monkeypatch,
 ):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory()
     supervisor = make_supervisor(clock, factory)
@@ -1550,7 +1602,7 @@ def test_recovery_claim_failure_leaves_attempt_scheduled_and_state_due(
     settings,
     monkeypatch,
 ):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     supervisor = make_supervisor(clock, ProcessFactory())
     supervisor.startup()
@@ -1602,7 +1654,7 @@ def test_recovery_run_association_failure_finalizes_snapshot_before_reschedule(
     settings,
     monkeypatch,
 ):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     supervisor = make_supervisor(clock, ProcessFactory())
     supervisor.startup()
@@ -1659,7 +1711,7 @@ def test_cleanup_reconciliation_reuses_already_scheduled_recovery_attempt(
     settings,
     monkeypatch,
 ):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory(fail_terminate=True)
     supervisor = make_supervisor(clock, factory)
@@ -1758,7 +1810,7 @@ def test_reset_retry_sequence_allocates_new_incident_ordinal_and_recovers(
     tmp_path,
     settings,
 ):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory()
     supervisor = make_supervisor(clock, factory)
@@ -1819,7 +1871,7 @@ def test_failed_spawn_cleanup_is_never_promoted_and_retries_until_finalized(
     settings,
     monkeypatch,
 ):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory(fail_terminate=True)
     supervisor = make_supervisor(clock, factory, startup_grace_seconds=0)
@@ -1866,7 +1918,7 @@ def test_dead_spawn_cleanup_keeps_tombstone_until_run_finalization_commits(
     settings,
     monkeypatch,
 ):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory()
     supervisor = make_supervisor(clock, factory, startup_grace_seconds=0)
@@ -1908,7 +1960,7 @@ def test_dead_spawn_cleanup_keeps_tombstone_until_run_finalization_commits(
 
 @pytest.mark.django_db
 def test_stop_signal_failure_retains_process_ownership_for_retry(tmp_path, settings):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory()
     supervisor = make_supervisor(clock, factory)
@@ -1953,7 +2005,7 @@ def test_new_start_finalizes_dead_stop_tombstone_before_replacement(
     settings,
     monkeypatch,
 ):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory()
     supervisor = make_supervisor(clock, factory)
@@ -2003,7 +2055,7 @@ def test_health_retry_preserves_planned_restart_reason_after_finalization_failur
     settings,
     monkeypatch,
 ):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory()
     supervisor = make_supervisor(clock, factory)
@@ -2057,7 +2109,7 @@ def test_health_retry_preserves_planned_restart_reason_after_finalization_failur
 
 @pytest.mark.django_db
 def test_crash_detected_during_admin_stop_remains_an_incident(tmp_path, settings):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory()
     supervisor = make_supervisor(clock, factory)
@@ -2089,8 +2141,7 @@ def test_crash_detected_during_admin_stop_remains_an_incident(tmp_path, settings
 
 @pytest.mark.django_db
 def test_startup_fails_recovery_attempt_interrupted_by_worker_death(tmp_path, settings):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
-    sync_config_accounts()
+    configure_farm()
     account = MinerAccount.objects.get(config_key="primary")
     state = MinerInstanceState.objects.get(account=account)
     state.desired_state = MinerInstanceState.DesiredState.RUNNING
@@ -2142,8 +2193,7 @@ def test_startup_resolves_scheduled_attempt_before_direct_reconciliation(
     tmp_path,
     settings,
 ):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
-    sync_config_accounts()
+    configure_farm()
     account = MinerAccount.objects.get(config_key="primary")
     state = MinerInstanceState.objects.get(account=account)
     state.desired_state = MinerInstanceState.DesiredState.RUNNING
@@ -2201,8 +2251,7 @@ def test_startup_queued_launch_takes_over_recovery_without_active_attempt_leak(
     settings,
     action,
 ):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
-    sync_config_accounts()
+    configure_farm()
     account = MinerAccount.objects.get(config_key="primary")
     state = MinerInstanceState.objects.get(account=account)
     state.desired_state = MinerInstanceState.DesiredState.RUNNING
@@ -2261,7 +2310,7 @@ def test_older_leased_start_cannot_overwrite_concurrent_stop(
     settings,
     monkeypatch,
 ):
-    settings.TWITCH_FARM_CONFIG = write_config(tmp_path / "config.yaml")
+    configure_farm()
     clock = FakeClock()
     factory = ProcessFactory()
     supervisor = make_supervisor(clock, factory)
@@ -2286,3 +2335,198 @@ def test_older_leased_start_cannot_overwrite_concurrent_stop(
         assert factory.processes == []
     finally:
         supervisor.shutdown()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "shutdown_failure",
+    (
+        OperationalError("simulated first-child shutdown failure"),
+        KeyboardInterrupt(),
+    ),
+)
+def test_shutdown_continues_after_child_failure_and_releases_singleton_ownership(
+    tmp_path,
+    settings,
+    monkeypatch,
+    shutdown_failure,
+):
+    configure_farm(include_second=True)
+    clock = FakeClock()
+    factory = ProcessFactory()
+    supervisor = MinerSupervisor(
+        options=runtime_options(lock_path=tmp_path / "worker.lock"),
+        process_factory=factory,
+        now=clock.now,
+        monotonic=clock.monotonic,
+        sleep=lambda seconds: None,
+        worker_id="test-worker",
+        use_file_lock=True,
+    )
+    supervisor.startup()
+
+    primary = MinerAccount.objects.get(config_key="primary")
+    secondary = MinerAccount.objects.get(config_key="secondary")
+    enqueue_command(primary, MinerCommand.Action.START)
+    enqueue_command(secondary, MinerCommand.Action.START)
+    supervisor.run_once(force_checks=True)
+    assert len(factory.processes) == 2
+    assert WorkerLease.objects.filter(owner_id=supervisor.worker_id).exists()
+    assert supervisor._lock_handle is not None
+
+    original_stop = supervisor.stop_account
+    stop_attempts: list[int] = []
+    failed_once = False
+
+    def fail_first_stop(account, **kwargs):
+        nonlocal failed_once
+        stop_attempts.append(account.pk)
+        if account.pk == primary.pk and not failed_once:
+            failed_once = True
+            raise shutdown_failure
+        return original_stop(account, **kwargs)
+
+    original_release = supervisor._release_file_lock
+    lock_release_attempted = False
+
+    def record_lock_release() -> None:
+        nonlocal lock_release_attempted
+        lock_release_attempted = True
+        original_release()
+
+    monkeypatch.setattr(supervisor, "stop_account", fail_first_stop)
+    monkeypatch.setattr(supervisor, "_release_file_lock", record_lock_release)
+
+    with pytest.raises(type(shutdown_failure)):
+        supervisor.shutdown()
+
+    assert stop_attempts == [primary.pk, secondary.pk]
+    assert primary.pk in supervisor.processes
+    assert secondary.pk not in supervisor.processes
+    assert not factory.processes[0].terminated
+    assert factory.processes[1].terminated
+    assert not WorkerLease.objects.filter(owner_id=supervisor.worker_id).exists()
+    assert lock_release_attempted
+    assert supervisor._lock_handle is None
+    assert not supervisor._started
+    assert supervisor._shutdown_incomplete
+
+    supervisor.shutdown()
+
+    assert stop_attempts == [primary.pk, secondary.pk]
+    assert supervisor.processes == {}
+    assert factory.processes[0].terminated
+    assert not supervisor._shutdown_incomplete
+
+
+@pytest.mark.django_db
+def test_shutdown_retries_a_transient_database_lease_deletion_failure(
+    tmp_path,
+    settings,
+    monkeypatch,
+):
+    configure_farm()
+    clock = FakeClock()
+    supervisor = make_supervisor(clock, ProcessFactory())
+    supervisor.startup()
+    assert WorkerLease.objects.filter(owner_id=supervisor.worker_id).exists()
+
+    original_filter = WorkerLease.objects.filter
+    fail_delete_once = True
+
+    class DeleteOnceFailure:
+        def delete(self):
+            nonlocal fail_delete_once
+            fail_delete_once = False
+            raise OperationalError("simulated lease deletion failure")
+
+    def flaky_filter(*args, **kwargs):
+        queryset = original_filter(*args, **kwargs)
+        return DeleteOnceFailure() if fail_delete_once else queryset
+
+    monkeypatch.setattr(WorkerLease.objects, "filter", flaky_filter)
+
+    with pytest.raises(OperationalError, match="simulated lease deletion failure"):
+        supervisor.shutdown()
+
+    assert WorkerLease.objects.filter(owner_id=supervisor.worker_id).exists()
+    assert supervisor._shutdown_incomplete
+    assert not supervisor._started
+
+    supervisor.shutdown()
+
+    assert not WorkerLease.objects.filter(owner_id=supervisor.worker_id).exists()
+    assert not supervisor._shutdown_incomplete
+
+
+@pytest.mark.django_db
+def test_released_shutdown_retry_cannot_clear_a_new_supervisors_run(
+    tmp_path,
+    settings,
+    monkeypatch,
+):
+    configure_farm()
+    clock = FakeClock()
+    lock_path = tmp_path / "worker.lock"
+    old_factory = ProcessFactory()
+    old_supervisor = MinerSupervisor(
+        options=runtime_options(lock_path=lock_path),
+        process_factory=old_factory,
+        now=clock.now,
+        monotonic=clock.monotonic,
+        sleep=lambda seconds: None,
+        worker_id="old-worker",
+        use_file_lock=True,
+    )
+    old_supervisor.startup()
+    account = MinerAccount.objects.get(config_key="primary")
+    enqueue_command(account, MinerCommand.Action.START)
+    old_supervisor.run_once(force_checks=True)
+    old_managed = old_supervisor.processes[account.pk]
+    old_run_id = old_managed.run_id
+
+    original_stop = old_supervisor.stop_account
+    fail_once = True
+
+    def transient_stop_failure(*args, **kwargs):
+        nonlocal fail_once
+        if fail_once:
+            fail_once = False
+            raise OperationalError("simulated shutdown handoff failure")
+        return original_stop(*args, **kwargs)
+
+    monkeypatch.setattr(old_supervisor, "stop_account", transient_stop_failure)
+    with pytest.raises(OperationalError, match="simulated shutdown handoff failure"):
+        old_supervisor.shutdown()
+
+    assert account.pk in old_supervisor.processes
+    assert old_managed.process.poll() is None
+    assert not WorkerLease.objects.filter(owner_id="old-worker").exists()
+
+    new_factory = ProcessFactory()
+    new_supervisor = MinerSupervisor(
+        options=runtime_options(lock_path=lock_path),
+        process_factory=new_factory,
+        now=clock.now,
+        monotonic=clock.monotonic,
+        sleep=lambda seconds: None,
+        worker_id="new-worker",
+        use_file_lock=True,
+    )
+    new_supervisor.startup()
+    try:
+        new_managed = new_supervisor.processes[account.pk]
+        assert new_managed.run_id != old_run_id
+        assert new_managed.process.poll() is None
+
+        old_supervisor.shutdown()
+
+        state = MinerInstanceState.objects.get(account=account)
+        assert old_supervisor.processes == {}
+        assert old_managed.process.poll() is not None
+        assert state.worker_id == "new-worker"
+        assert state.current_run_id == new_managed.run_id
+        assert new_managed.process.poll() is None
+        assert WorkerLease.objects.filter(owner_id="new-worker").exists()
+    finally:
+        new_supervisor.shutdown()

@@ -6,23 +6,30 @@
 {% block content %}
   <header class="page-header">
     <div class="page-heading">
-      <p class="eyebrow">Configured units</p>
+      <p class="eyebrow">Managed identities</p>
       <h1>Account rack</h1>
-      <p class="lede">Accounts are mirrored from config.yaml. Credentials stay outside the database and are never rendered by this control surface.</p>
+      <p class="lede">Create, configure, and operate Twitch accounts here. Passwords are encrypted at rest and are never shown after they are saved.</p>
     </div>
-    <a class="button" href="{% url 'controller:dashboard' %}">Open runtime board</a>
+    <div class="actions">
+      <a class="button button--quiet" href="{% url 'controller:dashboard' %}">Open runtime board</a>
+      <a class="button button--primary" href="{% url 'controller:account_create' %}">Add account</a>
+    </div>
   </header>
 
   {% if account_rows %}
     <div class="record-grid">
       {% for row in account_rows %}
-        <article class="record-card">
+        <article class="record-card{% if not row.account.is_active %} record-card--inactive{% endif %}">
           <header class="record-card__header">
             <div>
-              <h2><a href="{% url 'controller:account_detail' row.account.pk %}">{{ row.account.config_key }}</a></h2>
-              <span class="muted">{{ row.account.display_username }}</span>
+              <h2><a href="{% url 'controller:account_detail' row.account.pk %}">{{ row.account.display_username }}</a></h2>
+              <span class="muted mono">{{ row.account.config_key }}</span>
             </div>
-            <span class="status-light" data-tone="{{ row.observed|state_tone }}" aria-label="Observed {{ row.observed }}"></span>
+            {% if row.account.is_active %}
+              <span class="status-light" data-tone="{{ row.observed|state_tone }}" aria-label="Observed {{ row.observed }}"></span>
+            {% else %}
+              <span class="status-chip">Archived</span>
+            {% endif %}
           </header>
           <div class="record-card__body">
             <div class="state-pair">
@@ -33,10 +40,11 @@
             <p class="muted">
               {% if row.current_run %}{{ row.source_mode }} / {{ row.source_name }} · {{ row.channels|length }} active channel{{ row.channels|length|pluralize }}{% else %}No active launch snapshot{% endif %}
             </p>
+            {% if not row.account.has_credentials %}<span class="status-chip" data-tone="pending">Credentials needed</span>{% endif %}
             {% if row.open_incident %}<span class="status-chip" data-tone="danger">Recovery incident open</span>{% endif %}
           </div>
           <footer class="record-card__footer">
-            <span>{% if row.account.is_configured %}config synchronized{% else %}config entry missing{% endif %}</span>
+            <span>{% if row.account.is_active %}Ready for operator control{% else %}Preserved history · excluded from launch{% endif %}</span>
             <a href="{% url 'controller:account_detail' row.account.pk %}">Inspect unit →</a>
           </footer>
         </article>
@@ -46,7 +54,11 @@
     <div class="empty-state">
       <div>
         <div class="empty-state__mark"><span>0</span></div>
-        <p>No accounts have been synchronized from config.yaml.</p>
+        <p>No accounts yet. Add one here, or migrate an older installation from Settings.</p>
+        <div class="button-row empty-state__actions">
+          <a class="button button--primary" href="{% url 'controller:account_create' %}">Add account</a>
+          <a class="button" href="{% url 'controller:settings_import' %}">Import legacy data</a>
+        </div>
       </div>
     </div>
   {% endif %}

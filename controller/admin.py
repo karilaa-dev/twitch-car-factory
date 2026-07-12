@@ -6,6 +6,7 @@ from .models import (
     AccountChannelSelection,
     ActionLog,
     ChannelPreset,
+    FarmConfiguration,
     MinerAccount,
     MinerCommand,
     MinerIncident,
@@ -40,13 +41,18 @@ class MinerAccountAdmin(ReadOnlyControllerAdmin):
     list_display = (
         "config_key",
         "display_username",
-        "is_configured",
+        "is_active",
         "channel_revision",
-        "config_synced_at",
     )
-    list_filter = ("is_configured",)
+    list_filter = ("is_active",)
     search_fields = ("config_key", "display_username")
-    readonly_fields = ("configuration_fingerprint", "config_synced_at", "created_at", "updated_at")
+    readonly_fields = ("configuration_fingerprint", "created_at", "updated_at")
+
+
+@admin.register(FarmConfiguration)
+class FarmConfigurationAdmin(ReadOnlyControllerAdmin):
+    list_display = ("id", "autostart_new_accounts", "updated_at")
+    readonly_fields = ("default_channels", "autostart_new_accounts", "updated_at")
 
 
 @admin.register(AccountChannelSelection)
