@@ -112,10 +112,12 @@ def main() -> None:
         staged_row = editor.locator(".channel-editor__row").filter(has_text="smoke_staged_channel")
         staged_row.get_by_role("button", name="Remove").click()
         assert editor.get_by_text("smoke_staged_channel", exact=True).count() == 0
-        while editor.locator(".channel-editor__row").count():
-            editor.locator(".channel-editor__row").first.get_by_role(
+        staged_rows = editor.locator(".channel-editor__row")
+        for _ in range(staged_rows.count()):
+            staged_rows.first.get_by_role(
                 "button", name="Remove"
             ).click()
+        assert staged_rows.count() == 0
         page.get_by_role("button", name="Save preset").click()
         page.wait_for_load_state("networkidle")
         assert page.get_by_text("This field is required.").first.is_visible()

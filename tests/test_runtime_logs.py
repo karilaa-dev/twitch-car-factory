@@ -54,3 +54,14 @@ def test_runtime_log_tail_reads_rotation_in_order_and_bounds_output(tmp_path):
 def test_runtime_log_tail_returns_empty_when_log_is_missing(tmp_path):
     with override_settings(TWITCH_FARM_LOG_FILE=tmp_path / "missing.log"):
         assert read_runtime_log_tail() == []
+
+
+def test_runtime_log_tail_enforces_byte_cap_after_utf8_replacement(tmp_path):
+    path = tmp_path / "twitch-farm.log"
+    path.write_bytes(b"\xff" * MAX_LOG_BYTES)
+
+    with override_settings(TWITCH_FARM_LOG_FILE=path):
+        lines = read_runtime_log_tail()
+
+    assert lines
+    assert len("\n".join(lines).encode("utf-8")) <= MAX_LOG_BYTES

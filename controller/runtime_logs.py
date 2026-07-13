@@ -38,4 +38,5 @@ def read_runtime_log_tail() -> list[str]:
     if not chunks:
         return []
     text = b"\n".join(chunks).decode("utf-8", errors="replace")
+    text = text.encode("utf-8")[-MAX_LOG_BYTES:].decode("utf-8", errors="ignore")
     return text.splitlines()[-MAX_LOG_LINES:]
