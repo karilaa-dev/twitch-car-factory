@@ -431,6 +431,34 @@ class WebViewTests(TestCase):
         self.assertEqual(self.client.post(f"/accounts/{self.account.pk}/archive/").status_code, 404)
         self.assertEqual(self.client.post(f"/accounts/{self.account.pk}/reactivate/").status_code, 404)
 
+    def test_inactive_account_channel_selection_post_is_read_only(self):
+        self.login()
+        self.account.is_active = False
+        self.account.save(update_fields=("is_active", "updated_at"))
+        old_revision = self.account.channel_revision
+
+        response = self.client.post(
+            reverse("controller:account_channel_selection", args=[self.account.pk]),
+            {
+                "mode": AccountChannelSelection.Mode.CUSTOM,
+                "preset": "",
+                "custom_channels": "crafted_channel",
+            },
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.account.refresh_from_db()
+        self.account.selection.refresh_from_db()
+        self.assertEqual(self.account.selection.mode, AccountChannelSelection.Mode.DEFAULT)
+        self.assertEqual(self.account.channel_revision, old_revision)
+        self.assertFalse(self.account.custom_channels.exists())
+        self.assertFalse(
+            ActionLog.objects.filter(
+                account=self.account,
+                action="channel_selection_changed",
+            ).exists()
+        )
+
     def test_account_list_rows_link_to_open_without_an_edit_button(self):
         self.login()
 

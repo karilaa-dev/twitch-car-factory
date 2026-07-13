@@ -519,7 +519,7 @@ def global_action(request: HttpRequest, action: str) -> HttpResponse:
 @staff_member_required(login_url=CONTROL_LOGIN_URL)
 @require_POST
 def account_channel_selection(request: HttpRequest, pk: int) -> HttpResponse:
-    account = get_object_or_404(MinerAccount, pk=pk)
+    account = get_object_or_404(MinerAccount, pk=pk, is_active=True)
     form = AccountChannelSelectionForm(request.POST, account=account)
     if not form.is_valid():
         telemetry_account = get_object_or_404(_account_queryset(), pk=pk)
