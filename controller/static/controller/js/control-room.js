@@ -128,6 +128,19 @@
 (() => {
   "use strict";
 
+  document.addEventListener("click", (event) => {
+    const row = event.target.closest("[data-row-link]");
+    if (!row || event.defaultPrevented) return;
+    if (event.target.closest("a, button, input, select, textarea, label, form")) return;
+    const selection = window.getSelection();
+    if (selection && !selection.isCollapsed) return;
+    window.location.assign(row.dataset.rowLink);
+  });
+})();
+
+(() => {
+  "use strict";
+
   document.querySelectorAll("[data-channel-source-form]").forEach((form) => {
     const modeInputs = [...form.querySelectorAll('input[name="mode"]')];
     if (!modeInputs.length) return;
@@ -176,6 +189,7 @@
     const addButton = editor?.querySelector("[data-channel-add]");
     const list = editor?.querySelector("[data-channel-list]");
     const feedback = editor?.querySelector("[data-channel-feedback]");
+    const verifyUrl = root.dataset.channelVerifyUrl;
     if (!source || !textarea || !editor || !input || !addButton || !list || !feedback) return;
 
     const seen = new Set();
@@ -190,9 +204,10 @@
       });
 
     const sync = () => { textarea.value = channels.join("\n"); };
-    const announce = (message, error = false) => {
+    let verificationPending = false;
+    const announce = (message, tone = "neutral") => {
       feedback.textContent = message;
-      feedback.dataset.tone = error ? "danger" : "neutral";
+      feedback.dataset.tone = tone;
     };
 
     const makeButton = (label, action, index, disabled = false) => {
@@ -275,31 +290,70 @@
       announce(`${channel} moved to position ${nextIndex + 1}.`);
     });
 
-    const addChannel = () => {
+    const addChannel = async () => {
+      if (verificationPending) return;
       const channel = input.value.trim();
       if (!/^[A-Za-z0-9_]{1,100}$/.test(channel)) {
-        announce("Use 1–100 letters, numbers, or underscores.", true);
+        announce("Use 1–100 letters, numbers, or underscores.", "danger");
         input.focus();
         return;
       }
       if (channels.some((existing) => existing.toLowerCase() === channel.toLowerCase())) {
-        announce(`${channel} is already in this list.`, true);
+        announce(`${channel} is already in this list.`, "danger");
         input.select();
         return;
       }
+
+      let verificationStatus = "unverified";
+      verificationPending = true;
+      input.disabled = true;
+      addButton.disabled = true;
+      announce(`Checking ${channel} on Twitch…`);
+      try {
+        const endpoint = new URL(verifyUrl, window.location.origin);
+        endpoint.searchParams.set("name", channel);
+        const response = await fetch(endpoint, {
+          cache: "no-store",
+          credentials: "same-origin",
+          headers: { "X-Requested-With": "XMLHttpRequest" },
+        });
+        if (!response.ok) throw new Error(`Channel check failed: ${response.status}`);
+        const payload = await response.json();
+        verificationStatus = payload.status;
+      } catch (_error) {
+        verificationStatus = "unverified";
+      } finally {
+        verificationPending = false;
+        input.disabled = false;
+        addButton.disabled = false;
+      }
+
+      if (verificationStatus === "missing") {
+        announce(`${channel} does not exist on Twitch.`, "danger");
+        input.select();
+        return;
+      }
+
       channels.push(channel);
       input.value = "";
       sync();
       render();
-      announce(`${channel} added at position ${channels.length}.`);
+      if (verificationStatus === "exists") {
+        announce(`${channel} added at position ${channels.length}.`);
+      } else {
+        announce(
+          `${channel} added, but Twitch could not verify it right now.`,
+          "warning",
+        );
+      }
       input.focus();
     };
 
-    addButton.addEventListener("click", addChannel);
+    addButton.addEventListener("click", () => { void addChannel(); });
     input.addEventListener("keydown", (event) => {
       if (event.key !== "Enter") return;
       event.preventDefault();
-      addChannel();
+      void addChannel();
     });
     root.closest("form")?.addEventListener("submit", sync);
 

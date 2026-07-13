@@ -31,7 +31,10 @@
         </thead>
         <tbody>
           {% for row in account_rows %}
-            <tr{% if not row.account.is_active %} class="table-row--inactive"{% endif %}>
+            <tr
+              data-row-link="{% url 'controller:account_detail' row.account.pk %}"
+              {% if not row.account.is_active %}class="table-row--inactive"{% endif %}
+            >
               <td data-label="Account"><span class="machine-id"><a href="{% url 'controller:account_detail' row.account.pk %}">{{ row.account.config_key }}</a></span></td>
               <td data-label="Current status">
                 {% if row.account.is_active %}<span class="status-chip" data-tone="{{ row.observed|state_tone }}">{{ row.observed }}</span>{% else %}<span class="status-chip">Inactive legacy record</span>{% endif %}

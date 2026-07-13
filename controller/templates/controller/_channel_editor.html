@@ -1,4 +1,8 @@
-<div class="channel-editor-root" data-channel-editor-root>
+<div
+  class="channel-editor-root"
+  data-channel-editor-root
+  data-channel-verify-url="{% url 'controller:channel_validate' %}"
+>
   <div class="field" data-channel-editor-source>
     <label for="{{ field.id_for_label }}">{{ label|default:field.label }}</label>
     {{ field }}

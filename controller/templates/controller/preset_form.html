@@ -17,7 +17,7 @@
     </div>
   </header>
 
-  <div class="detail-layout">
+  <div class="detail-layout detail-layout--single">
     <section class="panel" aria-labelledby="editor-title">
       <header class="panel__header"><h2 id="editor-title">Preset specification</h2></header>
       <div class="panel__body">
@@ -38,16 +38,5 @@
       </div>
     </section>
 
-    <aside class="panel">
-      <header class="panel__header"><h2>Reliability contract</h2></header>
-      <div class="panel__body">
-        <dl class="launch-manifest">
-          <div class="manifest-row"><dt>Validation</dt><dd>At least one valid Twitch channel</dd></div>
-          <div class="manifest-row"><dt>Ordering</dt><dd>Input order remains stable</dd></div>
-          <div class="manifest-row"><dt>Duplicates</dt><dd>Removed case-insensitively</dd></div>
-          <div class="manifest-row"><dt>Live accounts</dt><dd>Restart queued after commit</dd></div>
-        </dl>
-      </div>
-    </aside>
   </div>
 {% endblock %}

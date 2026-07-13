@@ -13,13 +13,13 @@ from django.contrib.auth.views import LoginView
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.db.models import Prefetch
-from django.http import HttpRequest, HttpResponse
+from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse_lazy
 from django.utils import timezone
 from django.views.decorators.cache import never_cache
 from django.views.decorators.debug import sensitive_post_parameters
-from django.views.decorators.http import require_POST, require_safe
+from django.views.decorators.http import require_GET, require_POST, require_safe
 
 from .forms import (
     AccountCreateForm,
@@ -50,11 +50,13 @@ from .services import (
     delete_preset,
     enqueue_all,
     enqueue_command,
+    normalize_channels,
     save_preset,
     set_account_channel_selection,
     update_account,
     update_farm_configuration,
 )
+from .twitch_lookup import TwitchLookupStatus, lookup_twitch_names
 
 
 CONTROL_LOGIN_URL = "controller:login"
@@ -69,6 +71,16 @@ def _log_sensitive_failure(operation: str, exc: Exception) -> None:
         operation,
         type(exc).__name__,
     )
+
+
+def _warn_unverified_channels(request: HttpRequest, form) -> None:
+    names = getattr(form, "unverified_channel_names", ())
+    if names:
+        messages.warning(
+            request,
+            "Saved, but Twitch could not verify these channels right now: "
+            f"{', '.join(names)}.",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,6 +278,23 @@ def healthz(request: HttpRequest) -> HttpResponse:
 
 
 @staff_member_required(login_url=CONTROL_LOGIN_URL)
+@never_cache
+@require_GET
+def channel_validate(request: HttpRequest) -> JsonResponse:
+    raw_name = request.GET.get("name", "")
+    try:
+        channels = normalize_channels(raw_name)
+    except ValidationError as exc:
+        return JsonResponse({"error": "; ".join(exc.messages)}, status=400)
+    if len(channels) != 1:
+        return JsonResponse({"error": "Enter exactly one Twitch channel."}, status=400)
+
+    name = channels[0]
+    status = lookup_twitch_names((name,)).get(name, TwitchLookupStatus.UNVERIFIED)
+    return JsonResponse({"name": name, "status": status.value})
+
+
+@staff_member_required(login_url=CONTROL_LOGIN_URL)
 def dashboard(request: HttpRequest) -> HttpResponse:
     context = _status_context()
     context.update(
@@ -345,6 +374,7 @@ def account_create(request: HttpRequest) -> HttpResponse:
                 status=500,
             )
         else:
+            _warn_unverified_channels(request, form)
             messages.success(request, f"Account {account.config_key} created.")
             return redirect("controller:account_detail", pk=account.pk)
     return render(
@@ -553,6 +583,7 @@ def account_channel_selection(request: HttpRequest, pk: int) -> HttpResponse:
         request,
         "Channel source saved. A restart was queued if the account is meant to be running.",
     )
+    _warn_unverified_channels(request, form)
     return redirect("controller:account_detail", pk=account.pk)
 
 
@@ -577,6 +608,7 @@ def preset_create(request: HttpRequest) -> HttpResponse:
         except ValidationError as exc:
             form.add_error(None, "; ".join(exc.messages))
         else:
+            _warn_unverified_channels(request, form)
             messages.success(request, f"Preset {preset.name} created.")
             return redirect("controller:preset_detail", pk=preset.pk)
     return render(
@@ -653,6 +685,7 @@ def preset_edit(request: HttpRequest, pk: int) -> HttpResponse:
         except ValidationError as exc:
             form.add_error(None, "; ".join(exc.messages))
         else:
+            _warn_unverified_channels(request, form)
             messages.success(request, f"Preset {preset.name} updated.")
             return redirect("controller:preset_detail", pk=preset.pk)
     preset = get_object_or_404(
@@ -770,6 +803,7 @@ def settings_general(request: HttpRequest) -> HttpResponse:
         except ValidationError as exc:
             form.add_error(None, "; ".join(exc.messages))
         else:
+            _warn_unverified_channels(request, form)
             messages.success(request, "Farm settings updated.")
             return redirect("controller:settings_general")
     return render(

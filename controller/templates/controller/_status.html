@@ -16,15 +16,19 @@
       <strong class="metric__value">{{ summary.observed_running }}</strong>
       <span class="metric__note">past startup confirmation</span>
     </article>
-    <article class="metric">
-      <span class="metric__label">Degraded</span>
-      <strong class="metric__value">{{ summary.degraded }}</strong>
-      <span class="metric__note">periodic recovery active</span>
-    </article>
-    <article class="metric">
-      <span class="metric__label">Open incidents</span>
-      <strong class="metric__value">{{ summary.open_incidents }}</strong>
-      <span class="metric__note">durable accident records</span>
+    <article class="metric metric--attention">
+      <span class="metric__label">Degraded / open incidents</span>
+      <span class="metric__split">
+        <span>
+          <strong class="metric__value">{{ summary.degraded }}</strong>
+          <small>degraded</small>
+        </span>
+        <span>
+          <strong class="metric__value">{{ summary.open_incidents }}</strong>
+          <small>open incidents</small>
+        </span>
+      </span>
+      <span class="metric__note">recovery state and durable accident records</span>
     </article>
   </div>
 
@@ -85,11 +89,11 @@
                 <div class="button-row">
                   {% if row.desired == 'running' %}
                     <form method="post" action="{% url 'controller:account_action' row.account.pk 'stop' %}">
-                      {% csrf_token %}<button class="button button--quiet button--danger" type="submit">Stop</button>
+                      {% csrf_token %}<button class="button button--danger" type="submit">Stop</button>
                     </form>
                   {% elif row.account.is_active and row.account.has_credentials %}
                     <form method="post" action="{% url 'controller:account_action' row.account.pk 'start' %}">
-                      {% csrf_token %}<button class="button button--quiet button--safe" type="submit">Start</button>
+                      {% csrf_token %}<button class="button button--safe" type="submit">Start</button>
                     </form>
                   {% endif %}
                   {% if row.account.is_active and row.account.has_credentials %}
