@@ -7,7 +7,6 @@
     <div class="page-heading">
       <p class="eyebrow">Ordered channel presets</p>
       <h1>Preset library</h1>
-      <p class="lede">Reusable ordered channel lists. Saving an assigned preset queues one controlled restart for each desired-running account that uses it.</p>
     </div>
     <a class="button button--primary" href="{% url 'controller:preset_create' %}">Create preset</a>
   </header>
@@ -18,7 +17,7 @@
         <thead><tr><th scope="col">Preset</th><th scope="col">Channels</th><th scope="col">Assignments</th><th scope="col">Updated</th><th scope="col">Action</th></tr></thead>
         <tbody>
           {% for preset in presets %}
-            <tr>
+            <tr data-row-link="{% url 'controller:preset_detail' preset.pk %}">
               <td data-label="Preset"><span class="machine-id"><a href="{% url 'controller:preset_detail' preset.pk %}">{{ preset.name }}</a></span></td>
               <td data-label="Channels">{% include "controller/_channel_overflow.html" with channels=preset.channels.all %}</td>
               <td data-label="Assignments"><span class="status-chip">{{ preset.account_selections.all|length }} account{{ preset.account_selections.all|length|pluralize }}</span></td>

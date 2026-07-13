@@ -6,6 +6,7 @@ import tempfile
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.contrib.messages import get_messages
 from django.test import Client, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -26,12 +27,20 @@ from controller.models import (
     PresetChannel,
     WorkerLease,
 )
+from controller.twitch_lookup import TwitchLookupStatus
 
 
 class WebViewTests(TestCase):
     password = "operator-test-password"
 
     def setUp(self):
+        lookup_patcher = patch("controller.forms.lookup_twitch_names")
+        self.lookup_twitch_names = lookup_patcher.start()
+        self.addCleanup(lookup_patcher.stop)
+        self.lookup_twitch_names.side_effect = lambda names: {
+            name: TwitchLookupStatus.EXISTS for name in names
+        }
+
         user_model = get_user_model()
         self.staff = user_model.objects.create_user(
             username="night-operator",
@@ -119,6 +128,7 @@ class WebViewTests(TestCase):
         protected_urls = [
             reverse("controller:dashboard"),
             reverse("controller:status_fragment"),
+            reverse("controller:channel_validate"),
             reverse("controller:account_list"),
             reverse("controller:account_create"),
             reverse("controller:account_detail", args=[self.account.pk]),
@@ -139,6 +149,44 @@ class WebViewTests(TestCase):
                 response = self.client.get(url)
                 self.assertEqual(response.status_code, 302)
                 self.assertIn(reverse("controller:login"), response.url)
+
+    def test_channel_validation_endpoint_returns_all_three_lookup_states(self):
+        self.login()
+        cases = (
+            TwitchLookupStatus.EXISTS,
+            TwitchLookupStatus.MISSING,
+            TwitchLookupStatus.UNVERIFIED,
+        )
+        for status in cases:
+            with self.subTest(status=status):
+                with patch(
+                    "controller.views.lookup_twitch_names",
+                    return_value={"channel_name": status},
+                ):
+                    response = self.client.get(
+                        reverse("controller:channel_validate"),
+                        {"name": "channel_name"},
+                    )
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    response.json(),
+                    {"name": "channel_name", "status": status.value},
+                )
+                self.assertIn("no-cache", response.headers["Cache-Control"])
+
+    def test_channel_validation_endpoint_rejects_invalid_or_multiple_names(self):
+        self.login()
+        for name in ("", "not valid", "first,second"):
+            with self.subTest(name=name):
+                with patch("controller.views.lookup_twitch_names") as lookup:
+                    response = self.client.get(
+                        reverse("controller:channel_validate"),
+                        {"name": name},
+                    )
+
+                self.assertEqual(response.status_code, 400)
+                lookup.assert_not_called()
 
     def test_login_rejects_authenticated_non_staff_accounts(self):
         non_staff = get_user_model().objects.create_user(
@@ -190,6 +238,11 @@ class WebViewTests(TestCase):
         self.assertContains(response, "Default")
         self.assertContains(response, "exact_first")
         self.assertContains(response, "exact_second")
+        self.assertContains(response, "Degraded / open incidents")
+        self.assertNotContains(
+            response,
+            '<span class="metric__label">Open incidents</span>',
+        )
         self.assertContains(response, incident.summary)
         self.assertContains(response, "Supervisor online")
         self.assertNotContains(response, "Incident open")
@@ -201,6 +254,28 @@ class WebViewTests(TestCase):
             reverse("controller:account_detail", args=[self.account.pk])
         )
         self.assertContains(detail, "pid 4321")
+
+    def test_dashboard_individual_start_and_stop_buttons_use_global_tones(self):
+        self.login()
+        self.state.desired_state = MinerInstanceState.DesiredState.RUNNING
+        self.state.save(update_fields=("desired_state", "updated_at"))
+        stopped = MinerAccount.objects.create(
+            config_key="stopped-unit",
+            display_username="stopped_twitch_user",
+        )
+        AccountCredential.objects.create(
+            account=stopped,
+            password_ciphertext=encrypt_text("stopped-unit-password"),
+        )
+        AccountChannelSelection.objects.create(account=stopped)
+        MinerInstanceState.objects.create(account=stopped)
+
+        response = self.client.get(reverse("controller:dashboard"))
+
+        self.assertContains(response, 'class="button button--danger" type="submit">Stop</button>')
+        self.assertContains(response, 'class="button button--safe" type="submit">Start</button>')
+        self.assertNotContains(response, "button button--quiet button--danger")
+        self.assertNotContains(response, "button button--quiet button--safe")
 
     def test_status_fragment_is_authenticated_and_contains_no_page_shell(self):
         self.login()
@@ -474,6 +549,60 @@ class WebViewTests(TestCase):
             f'<a class="button button--quiet" href="{reverse("controller:account_edit", args=[self.account.pk])}">Edit</a>',
             html=True,
         )
+        self.assertContains(
+            response,
+            f'data-row-link="{reverse("controller:account_detail", args=[self.account.pk])}"',
+        )
+
+    def test_preset_rows_are_clickable_and_new_preset_has_no_reliability_contract(self):
+        self.login()
+        preset = self.create_preset()
+
+        list_response = self.client.get(reverse("controller:preset_list"))
+        create_response = self.client.get(reverse("controller:preset_create"))
+
+        self.assertContains(
+            list_response,
+            f'data-row-link="{reverse("controller:preset_detail", args=[preset.pk])}"',
+        )
+        self.assertContains(create_response, "detail-layout--single")
+        self.assertContains(
+            create_response,
+            f'data-channel-verify-url="{reverse("controller:channel_validate")}"',
+        )
+        self.assertNotContains(create_response, "Reliability contract")
+
+    def test_primary_tabs_omit_page_descriptions_and_settings_explainer(self):
+        self.login()
+        self.create_preset()
+        pages = (
+            (
+                reverse("controller:dashboard"),
+                "Desired state is the instruction.",
+            ),
+            (
+                reverse("controller:account_list"),
+                "Create, configure, and inspect Twitch farm accounts.",
+            ),
+            (
+                reverse("controller:preset_list"),
+                "Reusable ordered channel lists.",
+            ),
+            (
+                reverse("controller:settings_general"),
+                "Manage database-backed farm defaults",
+            ),
+        )
+
+        for url, description in pages:
+            with self.subTest(url=url):
+                response = self.client.get(url)
+                self.assertEqual(response.status_code, 200)
+                self.assertNotContains(response, description)
+
+        settings = self.client.get(reverse("controller:settings_general"))
+        self.assertNotContains(settings, "What these settings control")
+        self.assertNotContains(settings, "Database authority")
 
     def test_account_info_fragment_is_no_store_and_never_discloses_secrets(self):
         self.login()
@@ -632,6 +761,121 @@ class WebViewTests(TestCase):
         page = self.client.get(reverse("controller:settings_general"))
         self.assertContains(page, "data-channel-editor-root")
         self.assertContains(page, "Ordered default channels")
+
+    def test_confirmed_missing_channels_are_rejected_by_every_channel_form(self):
+        self.login()
+        self.lookup_twitch_names.side_effect = lambda names: {
+            name: TwitchLookupStatus.MISSING for name in names
+        }
+        cases = (
+            (
+                reverse("controller:settings_general"),
+                {"default_channels": "missing_streamer"},
+            ),
+            (
+                reverse("controller:account_channel_selection", args=[self.account.pk]),
+                {
+                    "mode": AccountChannelSelection.Mode.CUSTOM,
+                    "preset": "",
+                    "custom_channels": "missing_streamer",
+                },
+            ),
+            (
+                reverse("controller:preset_create"),
+                {"name": "Missing channel preset", "channels": "missing_streamer"},
+            ),
+            (
+                reverse("controller:account_create"),
+                {
+                    "config_key": "missing-channel-account",
+                    "username": "valid_miner_login",
+                    "password": "not-logged-secret",
+                    "mode": AccountChannelSelection.Mode.CUSTOM,
+                    "preset": "",
+                    "custom_channels": "missing_streamer",
+                },
+            ),
+        )
+
+        for url, data in cases:
+            with self.subTest(url=url):
+                response = self.client.post(url, data)
+                self.assertEqual(response.status_code, 400)
+                self.assertContains(
+                    response,
+                    "The following Twitch channel does not exist: missing_streamer.",
+                    status_code=400,
+                )
+
+    def test_unverified_channels_save_with_warning_from_every_channel_form(self):
+        self.login()
+        self.lookup_twitch_names.side_effect = lambda names: {
+            name: TwitchLookupStatus.UNVERIFIED for name in names
+        }
+        cases = (
+            (
+                reverse("controller:settings_general"),
+                {"default_channels": "unverified_default"},
+            ),
+            (
+                reverse("controller:account_channel_selection", args=[self.account.pk]),
+                {
+                    "mode": AccountChannelSelection.Mode.CUSTOM,
+                    "preset": "",
+                    "custom_channels": "unverified_custom",
+                },
+            ),
+            (
+                reverse("controller:preset_create"),
+                {"name": "Unverified preset", "channels": "unverified_preset"},
+            ),
+            (
+                reverse("controller:account_create"),
+                {
+                    "config_key": "unverified-channel-account",
+                    "username": "valid_miner_login",
+                    "password": "not-logged-secret",
+                    "mode": AccountChannelSelection.Mode.CUSTOM,
+                    "preset": "",
+                    "custom_channels": "unverified_account_channel",
+                },
+            ),
+        )
+
+        for url, data in cases:
+            with self.subTest(url=url):
+                response = self.client.post(url, data, follow=True)
+                self.assertEqual(response.status_code, 200)
+                self.assertContains(
+                    response,
+                    "Saved, but Twitch could not verify these channels right now:",
+                )
+
+    def test_account_channel_warning_is_queued_before_success(self):
+        self.login()
+        self.lookup_twitch_names.side_effect = lambda names: {
+            name: TwitchLookupStatus.UNVERIFIED for name in names
+        }
+
+        response = self.client.post(
+            reverse("controller:account_channel_selection", args=[self.account.pk]),
+            {
+                "mode": AccountChannelSelection.Mode.CUSTOM,
+                "preset": "",
+                "custom_channels": "unverified_custom",
+            },
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(
+            [str(message) for message in get_messages(response.wsgi_request)],
+            [
+                "Saved, but Twitch could not verify these channels right now: "
+                "unverified_custom.",
+                "Channel source saved. A restart was queued if the account is meant "
+                "to be running.",
+            ],
+        )
 
     def test_general_settings_requires_csrf_for_staff_mutation(self):
         client = Client(enforce_csrf_checks=True)

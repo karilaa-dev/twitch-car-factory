@@ -12,6 +12,7 @@ from .models import (
     FarmConfiguration,
     MinerAccount,
 )
+from .twitch_lookup import TwitchLookupStatus, lookup_twitch_names
 
 
 class StaffAuthenticationForm(AuthenticationForm):
@@ -46,7 +47,30 @@ def _normalize_channels(value: str, *, require_nonempty: bool = True) -> list[st
     return normalize_channels(value, require_nonempty=require_nonempty)
 
 
-class PresetForm(forms.Form):
+class ChannelValidationMixin:
+    unverified_channel_names: tuple[str, ...] = ()
+
+    def validate_twitch_channels(self, channels: list[str]) -> None:
+        results = lookup_twitch_names(channels)
+        missing = [
+            channel
+            for channel in channels
+            if results.get(channel) == TwitchLookupStatus.MISSING
+        ]
+        self.unverified_channel_names = tuple(
+            channel
+            for channel in channels
+            if results.get(channel) != TwitchLookupStatus.EXISTS
+            and channel not in missing
+        )
+        if missing:
+            label = "channel does" if len(missing) == 1 else "channels do"
+            raise ValidationError(
+                f"The following Twitch {label} not exist: {', '.join(missing)}."
+            )
+
+
+class PresetForm(ChannelValidationMixin, forms.Form):
     name = forms.CharField(
         max_length=150,
         widget=forms.TextInput(
@@ -94,10 +118,12 @@ class PresetForm(forms.Form):
         channels = _normalize_channels(raw_channels)
         if not channels:
             raise ValidationError("Add at least one channel.")
+        self.validate_twitch_channels(channels)
         self.cleaned_channel_names = channels
         return raw_channels
 
-class AccountChannelSelectionForm(forms.Form):
+
+class AccountChannelSelectionForm(ChannelValidationMixin, forms.Form):
     mode = forms.ChoiceField(
         choices=AccountChannelSelection.Mode.choices,
         widget=forms.RadioSelect,
@@ -149,6 +175,11 @@ class AccountChannelSelectionForm(forms.Form):
             self.add_error("preset", "Choose a preset for preset mode.")
         if mode == AccountChannelSelection.Mode.CUSTOM and not custom_channels:
             self.add_error("custom_channels", "Add at least one channel for custom mode.")
+        elif mode == AccountChannelSelection.Mode.CUSTOM:
+            try:
+                self.validate_twitch_channels(custom_channels)
+            except ValidationError as exc:
+                self.add_error("custom_channels", exc)
 
         cleaned_data["custom_channel_names"] = custom_channels
         if mode != AccountChannelSelection.Mode.PRESET:
@@ -176,7 +207,7 @@ class PresetAssignmentForm(forms.Form):
         ).order_by("display_username", "config_key")
 
 
-class AccountCreateForm(forms.Form):
+class AccountCreateForm(ChannelValidationMixin, forms.Form):
     config_key = forms.CharField(
         max_length=150,
         label="Account key",
@@ -258,6 +289,11 @@ class AccountCreateForm(forms.Form):
                 self.add_error("custom_channels", exc)
             if not custom_channels and "custom_channels" not in self.errors:
                 self.add_error("custom_channels", "Add at least one channel for custom mode.")
+            elif custom_channels and "custom_channels" not in self.errors:
+                try:
+                    self.validate_twitch_channels(custom_channels)
+                except ValidationError as exc:
+                    self.add_error("custom_channels", exc)
         cleaned_data["custom_channel_names"] = custom_channels
         if mode != AccountChannelSelection.Mode.PRESET:
             cleaned_data["preset"] = None
@@ -305,7 +341,7 @@ class AccountEditForm(forms.Form):
         return password
 
 
-class FarmConfigurationForm(forms.Form):
+class FarmConfigurationForm(ChannelValidationMixin, forms.Form):
     default_channels = forms.CharField(
         label="Default channels",
         help_text="One channel per line or comma-separated.",
@@ -329,6 +365,7 @@ class FarmConfigurationForm(forms.Form):
     def clean_default_channels(self) -> str:
         raw = self.cleaned_data["default_channels"]
         self.cleaned_channel_names = _normalize_channels(raw)
+        self.validate_twitch_channels(self.cleaned_channel_names)
         return raw
 
 

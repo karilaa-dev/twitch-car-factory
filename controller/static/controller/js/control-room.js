@@ -128,6 +128,26 @@
 (() => {
   "use strict";
 
+  document.addEventListener("click", (event) => {
+    const row = event.target.closest("[data-row-link]");
+    if (!row || event.defaultPrevented) return;
+    if (event.target.closest("a, button, input, select, textarea, label, form")) return;
+    if (
+      event.button !== 0
+      || event.metaKey
+      || event.ctrlKey
+      || event.shiftKey
+      || event.altKey
+    ) return;
+    const selection = window.getSelection();
+    if (selection && !selection.isCollapsed) return;
+    window.location.assign(row.dataset.rowLink);
+  });
+})();
+
+(() => {
+  "use strict";
+
   document.querySelectorAll("[data-channel-source-form]").forEach((form) => {
     const modeInputs = [...form.querySelectorAll('input[name="mode"]')];
     if (!modeInputs.length) return;
@@ -176,6 +196,7 @@
     const addButton = editor?.querySelector("[data-channel-add]");
     const list = editor?.querySelector("[data-channel-list]");
     const feedback = editor?.querySelector("[data-channel-feedback]");
+    const verifyUrl = root.dataset.channelVerifyUrl;
     if (!source || !textarea || !editor || !input || !addButton || !list || !feedback) return;
 
     const seen = new Set();
@@ -190,23 +211,36 @@
       });
 
     const sync = () => { textarea.value = channels.join("\n"); };
-    const announce = (message, error = false) => {
+    let verificationPending = false;
+    const announce = (message, tone = "neutral") => {
       feedback.textContent = message;
-      feedback.dataset.tone = error ? "danger" : "neutral";
+      feedback.dataset.tone = tone;
     };
 
-    const makeButton = (label, action, index, disabled = false) => {
+    const makeRemoveButton = (index) => {
       const button = document.createElement("button");
-      button.className = action === "remove"
-        ? "button button--quiet button--danger"
-        : "button button--quiet";
+      button.className = "button button--quiet button--danger";
       button.type = "button";
-      button.textContent = label;
-      button.disabled = disabled;
-      button.dataset.channelAction = action;
+      button.textContent = "Remove";
+      button.dataset.channelAction = "remove";
       button.dataset.channelIndex = String(index);
-      button.setAttribute("aria-label", `${label} ${channels[index]}`);
+      button.setAttribute("aria-label", `Remove ${channels[index]}`);
       return button;
+    };
+
+    const makeDragHandle = (index) => {
+      const handle = document.createElement("button");
+      handle.className = "channel-editor__drag-handle";
+      handle.type = "button";
+      handle.draggable = true;
+      handle.textContent = "⠿";
+      handle.dataset.channelDragIndex = String(index);
+      handle.title = "Drag to change position";
+      handle.setAttribute(
+        "aria-label",
+        `Drag ${channels[index]} to reorder. Use the up and down arrow keys for keyboard reordering.`,
+      );
+      return handle;
     };
 
     const render = (focusTarget = null) => {
@@ -214,6 +248,7 @@
       channels.forEach((channel, index) => {
         const row = document.createElement("li");
         row.className = "channel-editor__row";
+        row.dataset.channelIndex = String(index);
 
         const identity = document.createElement("span");
         identity.className = "channel-editor__identity";
@@ -228,13 +263,9 @@
 
         const actions = document.createElement("span");
         actions.className = "channel-editor__actions";
-        actions.append(
-          makeButton("Move up", "up", index, index === 0),
-          makeButton("Move down", "down", index, index === channels.length - 1),
-          makeButton("Remove", "remove", index),
-        );
+        actions.append(makeRemoveButton(index));
 
-        row.append(identity, actions);
+        row.append(makeDragHandle(index), identity, actions);
         list.append(row);
       });
       if (!channels.length) {
@@ -245,63 +276,253 @@
       }
 
       if (focusTarget) {
-        const target = list.querySelector(
-          `[data-channel-action="${focusTarget.action}"][data-channel-index="${focusTarget.index}"]`,
-        );
+        const selector = focusTarget.action === "drag"
+          ? `[data-channel-drag-index="${focusTarget.index}"]`
+          : `[data-channel-action="${focusTarget.action}"][data-channel-index="${focusTarget.index}"]`;
+        const target = list.querySelector(selector);
         (target || input).focus();
       }
     };
+
+    const clearDropStyles = () => {
+      list.querySelectorAll(".channel-editor__row").forEach((row) => {
+        row.classList.remove(
+          "channel-editor__row--drop-before",
+          "channel-editor__row--drop-after",
+        );
+      });
+    };
+
+    const clearDragStyles = () => {
+      clearDropStyles();
+      list.querySelectorAll(".channel-editor__row--dragging").forEach((row) => {
+        row.classList.remove("channel-editor__row--dragging");
+      });
+    };
+
+    const markDropTarget = (row, clientY) => {
+      clearDropStyles();
+      const bounds = row.getBoundingClientRect();
+      const after = clientY >= bounds.top + bounds.height / 2;
+      row.classList.add(
+        after
+          ? "channel-editor__row--drop-after"
+          : "channel-editor__row--drop-before",
+      );
+      return { index: Number(row.dataset.channelIndex), after };
+    };
+
+    const moveChannel = (fromIndex, targetIndex, after) => {
+      let nextIndex = targetIndex + (after ? 1 : 0);
+      if (fromIndex < nextIndex) nextIndex -= 1;
+      nextIndex = Math.max(0, Math.min(nextIndex, channels.length - 1));
+      const channel = channels[fromIndex];
+      if (nextIndex === fromIndex) {
+        clearDragStyles();
+        announce(`${channel} remains at position ${fromIndex + 1}.`);
+        return;
+      }
+
+      channels.splice(fromIndex, 1);
+      channels.splice(nextIndex, 0, channel);
+      sync();
+      render({ action: "drag", index: nextIndex });
+      announce(`${channel} moved to position ${nextIndex + 1}.`);
+    };
+
+    let nativeDragIndex = null;
+    let pointerDrag = null;
+
+    list.addEventListener("dragstart", (event) => {
+      const handle = event.target.closest("[data-channel-drag-index]");
+      if (!handle) return;
+      nativeDragIndex = Number(handle.dataset.channelDragIndex);
+      handle.closest(".channel-editor__row")?.classList.add(
+        "channel-editor__row--dragging",
+      );
+      if (event.dataTransfer) {
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData("text/plain", String(nativeDragIndex));
+      }
+    });
+
+    list.addEventListener("dragover", (event) => {
+      if (nativeDragIndex === null) return;
+      const row = event.target.closest(".channel-editor__row");
+      if (!row) return;
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+      markDropTarget(row, event.clientY);
+    });
+
+    list.addEventListener("drop", (event) => {
+      if (nativeDragIndex === null) return;
+      const row = event.target.closest(".channel-editor__row");
+      if (!row) return;
+      event.preventDefault();
+      const target = markDropTarget(row, event.clientY);
+      moveChannel(nativeDragIndex, target.index, target.after);
+      nativeDragIndex = null;
+      clearDragStyles();
+    });
+
+    list.addEventListener("dragend", () => {
+      nativeDragIndex = null;
+      clearDragStyles();
+    });
+
+    list.addEventListener("pointerdown", (event) => {
+      if (event.pointerType === "mouse") return;
+      const handle = event.target.closest("[data-channel-drag-index]");
+      if (!handle) return;
+      event.preventDefault();
+      handle.setPointerCapture(event.pointerId);
+      pointerDrag = {
+        handle,
+        pointerId: event.pointerId,
+        fromIndex: Number(handle.dataset.channelDragIndex),
+        target: null,
+      };
+      handle.closest(".channel-editor__row")?.classList.add(
+        "channel-editor__row--dragging",
+      );
+    });
+
+    list.addEventListener("pointermove", (event) => {
+      if (!pointerDrag || pointerDrag.pointerId !== event.pointerId) return;
+      event.preventDefault();
+      const row = document
+        .elementFromPoint(event.clientX, event.clientY)
+        ?.closest(".channel-editor__row");
+      if (!row || !list.contains(row)) return;
+      pointerDrag.target = markDropTarget(row, event.clientY);
+    });
+
+    const finishPointerDrag = (event, cancelled = false) => {
+      if (!pointerDrag || pointerDrag.pointerId !== event.pointerId) return;
+      event.preventDefault();
+      const { handle, fromIndex, target } = pointerDrag;
+      if (handle.hasPointerCapture(event.pointerId)) {
+        handle.releasePointerCapture(event.pointerId);
+      }
+      pointerDrag = null;
+      if (!cancelled && target) {
+        moveChannel(fromIndex, target.index, target.after);
+      } else {
+        clearDragStyles();
+      }
+    };
+
+    list.addEventListener("pointerup", (event) => finishPointerDrag(event));
+    list.addEventListener("pointercancel", (event) => finishPointerDrag(event, true));
+
+    list.addEventListener("keydown", (event) => {
+      const handle = event.target.closest("[data-channel-drag-index]");
+      if (!handle || !["ArrowUp", "ArrowDown"].includes(event.key)) return;
+      event.preventDefault();
+      const fromIndex = Number(handle.dataset.channelDragIndex);
+      const movingDown = event.key === "ArrowDown";
+      const targetIndex = fromIndex + (movingDown ? 1 : -1);
+      if (targetIndex < 0 || targetIndex >= channels.length) return;
+      moveChannel(fromIndex, targetIndex, movingDown);
+    });
 
     list.addEventListener("click", (event) => {
       const button = event.target.closest("[data-channel-action]");
       if (!button || button.disabled) return;
       const index = Number(button.dataset.channelIndex);
-      const action = button.dataset.channelAction;
       const channel = channels[index];
-
-      if (action === "remove") {
-        channels.splice(index, 1);
-        sync();
-        render(channels.length ? { index: Math.min(index, channels.length - 1), action: "remove" } : null);
-        announce(`${channel} removed from the staged list.`);
-        if (!channels.length) input.focus();
-        return;
-      }
-
-      const nextIndex = action === "up" ? index - 1 : index + 1;
-      [channels[index], channels[nextIndex]] = [channels[nextIndex], channels[index]];
+      channels.splice(index, 1);
       sync();
-      render({ index: nextIndex, action });
-      announce(`${channel} moved to position ${nextIndex + 1}.`);
+      render(
+        channels.length
+          ? { index: Math.min(index, channels.length - 1), action: "remove" }
+          : null,
+      );
+      announce(`${channel} removed from the staged list.`);
+      if (!channels.length) input.focus();
     });
 
-    const addChannel = () => {
+    const addChannel = async () => {
+      if (verificationPending) return;
       const channel = input.value.trim();
       if (!/^[A-Za-z0-9_]{1,100}$/.test(channel)) {
-        announce("Use 1–100 letters, numbers, or underscores.", true);
+        announce("Use 1–100 letters, numbers, or underscores.", "danger");
         input.focus();
         return;
       }
       if (channels.some((existing) => existing.toLowerCase() === channel.toLowerCase())) {
-        announce(`${channel} is already in this list.`, true);
+        announce(`${channel} is already in this list.`, "danger");
         input.select();
         return;
       }
+
+      let verificationStatus = "unverified";
+      verificationPending = true;
+      input.disabled = true;
+      addButton.disabled = true;
+      announce(`Checking ${channel} on Twitch…`);
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), 6000);
+      try {
+        const endpoint = new URL(verifyUrl, window.location.origin);
+        endpoint.searchParams.set("name", channel);
+        const response = await fetch(endpoint, {
+          cache: "no-store",
+          credentials: "same-origin",
+          headers: { "X-Requested-With": "XMLHttpRequest" },
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error(`Channel check failed: ${response.status}`);
+        const payload = await response.json();
+        verificationStatus = payload.status;
+      } catch (_error) {
+        verificationStatus = "unverified";
+      } finally {
+        window.clearTimeout(timeoutId);
+        verificationPending = false;
+        input.disabled = false;
+        addButton.disabled = false;
+      }
+
+      if (verificationStatus === "missing") {
+        announce(`${channel} does not exist on Twitch.`, "danger");
+        input.select();
+        return;
+      }
+
       channels.push(channel);
       input.value = "";
       sync();
       render();
-      announce(`${channel} added at position ${channels.length}.`);
+      if (verificationStatus === "exists") {
+        announce(`${channel} added at position ${channels.length}.`);
+      } else {
+        announce(
+          `${channel} added, but Twitch could not verify it right now.`,
+          "warning",
+        );
+      }
       input.focus();
     };
 
-    addButton.addEventListener("click", addChannel);
+    addButton.addEventListener("click", () => { void addChannel(); });
     input.addEventListener("keydown", (event) => {
       if (event.key !== "Enter") return;
       event.preventDefault();
-      addChannel();
+      void addChannel();
     });
-    root.closest("form")?.addEventListener("submit", sync);
+    root.closest("form")?.addEventListener("submit", (event) => {
+      if (verificationPending) {
+        event.preventDefault();
+        announce(
+          "Wait for the Twitch channel check to finish before saving.",
+          "warning",
+        );
+        return;
+      }
+      sync();
+    });
 
     // Django keeps the source textarea required for the no-JavaScript path.
     // Once enhanced, let server validation report an empty staged list instead

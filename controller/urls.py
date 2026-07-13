@@ -13,6 +13,7 @@ urlpatterns = [
     path("logout/", views.logout_view, name="logout"),
     path("", views.dashboard, name="dashboard"),
     path("status/", views.status_fragment, name="status_fragment"),
+    path("channels/validate/", views.channel_validate, name="channel_validate"),
     path("actions/<str:action>/", views.global_action, name="global_action"),
     path("logs/", views.bot_logs, name="bot_logs"),
     path("logs/tail/", views.bot_log_tail, name="bot_log_tail"),
