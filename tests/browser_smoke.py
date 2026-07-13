@@ -44,26 +44,62 @@ def main() -> None:
         assert page.get_by_role("heading", name="Runtime board").is_visible()
         assert page.get_by_text("Supervisor online").is_visible()
         assert page.locator(".channel-tag").count() > 0
+        live_panel = page.locator("[data-live-status]").element_handle()
+        page.wait_for_timeout(5500)
+        assert page.evaluate("panel => panel.isConnected", live_panel)
         page.screenshot(path=args.output / "dashboard-desktop.png", full_page=True)
 
-        page.locator(".machine-table tbody tr", has=page.locator(".channel-tag")).first.locator(
+        page.locator(".machine-table tbody tr").filter(has_text="running").first.locator(
             ".machine-id a"
         ).click()
         page.wait_for_load_state("networkidle")
         assert page.get_by_role("heading", name="Active launch manifest").is_visible()
         assert page.get_by_text("Exact channels").is_visible()
+        source_form = page.locator("[data-channel-source-form]")
+        if source_form.count():
+            preset_field = source_form.locator('[data-source-field="preset"]')
+            custom_field = source_form.locator('[data-source-field="custom"]')
+            assert preset_field.is_hidden()
+            assert custom_field.is_hidden()
+            source_form.locator('input[name="mode"][value="custom"]').check()
+            assert custom_field.is_visible()
+            assert preset_field.is_hidden()
         page.screenshot(path=args.output / "account-detail.png", full_page=True)
 
         page.get_by_role("link", name="Presets").click()
         page.wait_for_load_state("networkidle")
         assert page.get_by_role("heading", name="Preset library").is_visible()
-        assert page.locator(".preset-card").count() > 0
+        assert page.locator(".preset-table tbody tr").count() > 0
         page.screenshot(path=args.output / "presets.png", full_page=True)
+
+        page.locator(".preset-table tbody tr").first.get_by_role("link", name="Open").click()
+        page.wait_for_load_state("networkidle")
+        assert page.get_by_role("heading", name="Edit preset").is_visible()
+        editor = page.locator("[data-preset-channel-editor]")
+        editor.get_by_label("Add channel").fill("smoke_staged_channel")
+        editor.get_by_role("button", name="Add").click()
+        assert editor.get_by_text("smoke_staged_channel", exact=True).is_visible()
+        first_delete = editor.get_by_role("button", name="Delete").first
+        first_delete.click()
+        assert editor.get_by_role("button", name="Confirm").count() == 1
+        page.wait_for_timeout(5100)
+        assert editor.get_by_role("button", name="Confirm").count() == 0
+        page.screenshot(path=args.output / "preset-editor.png", full_page=True)
+
+        page.get_by_role("link", name="Accounts").click()
+        page.get_by_role("link", name="Bot logs").click()
+        page.wait_for_load_state("networkidle")
+        assert page.get_by_role("heading", name="Bot logs").is_visible()
+        assert page.locator("[data-log-output]").is_visible()
+        page.screenshot(path=args.output / "bot-logs.png", full_page=True)
 
         page.set_viewport_size({"width": 390, "height": 844})
         page.goto(f"{args.base_url}/", wait_until="networkidle")
         overflow = page.evaluate("document.documentElement.scrollWidth - window.innerWidth")
         assert overflow <= 1, f"Mobile layout overflows horizontally by {overflow}px"
+        assert page.locator("[data-channel-overflow]").first.evaluate(
+            "element => element.scrollWidth <= element.clientWidth + 1"
+        )
         page.screenshot(path=args.output / "dashboard-mobile.png", full_page=True)
 
         browser.close()

@@ -28,15 +28,18 @@ See [the feature and state map](docs/bot-feature-map.md) for full behavior.
 staff UI -> Django web -> SQLite accounts/settings/commands -> singleton worker
                                                                |-- miner child A
                                                                `-- miner child B
+staff UI <- bounded log tail <- data/logs/twitch-farm.log <-----'
 
 Settings -> legacy ZIP preview/confirm -> encrypted session seed -> worker
 runtime/cookies/ (worker-only writable sessions) -----------------^
 ```
 
-All Django staff accounts see and operate the same farm. The UI supports adding,
-editing, archiving, and reactivating Twitch accounts; managing default, custom,
-and preset channels; and changing global settings. Initial Django staff creation
-and encryption-key provisioning remain deployment operations.
+All Django staff accounts see and operate the same farm. The UI supports adding
+and editing Twitch accounts, managing default/custom/preset channels, inspecting
+combined worker and miner logs, and changing global settings. Existing inactive
+legacy records remain visible for history but cannot be archived or reactivated
+from the control room. Initial Django staff creation and encryption-key
+provisioning remain deployment operations.
 
 ## Local setup
 
@@ -57,7 +60,7 @@ Run the web and worker in separate terminals with the same
 
 ```bash
 uv run python manage.py runserver
-uv run python manage.py run_miner_worker
+TWITCH_FARM_LOG_WRITER=1 uv run python manage.py run_miner_worker
 ```
 
 Open <http://127.0.0.1:8000/>, sign in with the staff account, configure default
@@ -149,7 +152,11 @@ working reliably, set `DJANGO_SECURE_HSTS_SECONDS` to the intended policy
 hostname is permanently HTTPS. The proxy must replace `X-Forwarded-Proto` with
 the actual client scheme; Django trusts that header to identify secure requests.
 
-The services share `./data`; only the worker mounts `./runtime`. The web service
+The services share `./data`; only the worker mounts `./runtime`. The worker is
+the sole writer for `./data/logs/twitch-farm.log`: it sends supervisor output
+and prefixed miner stdout/stderr to both Docker logs and a 5 MiB rotating file
+with three backups. The staff-only **Accounts → Bot logs** page reads at most
+the latest 400 lines/256 KiB. The web service
 therefore cannot read refreshable Twitch session files. Compose runs every
 service as the non-root `PUID`/`PGID` that owns the bind mounts. SQLite must
 remain on local storage, and only one worker replica is supported. The worker

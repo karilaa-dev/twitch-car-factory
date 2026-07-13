@@ -30,12 +30,7 @@
           {% csrf_token %}<button class="button" type="submit">Restart unit</button>
         </form>
       {% endif %}
-      <a class="button button--primary" href="{% url 'controller:account_edit' account.pk %}">Edit account</a>
-      {% if not account.is_active %}
-        <form method="post" action="{% url 'controller:account_reactivate' account.pk %}">
-          {% csrf_token %}<button class="button button--safe" type="submit">Reactivate account</button>
-        </form>
-      {% endif %}
+      {% if account.is_active %}<a class="button button--primary" href="{% url 'controller:account_edit' account.pk %}">Edit account</a>{% endif %}
     </div>
   </header>
 
@@ -154,23 +149,23 @@
         </div>
       </section>
 
-      <section class="panel" aria-labelledby="selection-title">
+      {% if account.is_active %}<section class="panel" aria-labelledby="selection-title">
         <header class="panel__header"><h2 id="selection-title">Change channel source</h2></header>
         <div class="panel__body">
-          <form class="form-grid" method="post" action="{% url 'controller:account_channel_selection' account.pk %}">
+          <form class="form-grid" method="post" action="{% url 'controller:account_channel_selection' account.pk %}" data-channel-source-form>
             {% csrf_token %}
             {% if selection_form.non_field_errors %}<div class="message error">{{ selection_form.non_field_errors }}</div>{% endif %}
-            <fieldset class="field">
+            <fieldset class="field" data-source-mode>
               <legend>Source mode</legend>
               <div class="choice-grid">{{ selection_form.mode }}</div>
               {{ selection_form.mode.errors }}
             </fieldset>
-            <div class="field">
+            <div class="field" data-source-field="preset">
               <label for="{{ selection_form.preset.id_for_label }}">Preset</label>
               {{ selection_form.preset }}
               {{ selection_form.preset.errors }}
             </div>
-            <div class="field">
+            <div class="field" data-source-field="custom">
               <label for="{{ selection_form.custom_channels.id_for_label }}">Custom channels</label>
               {{ selection_form.custom_channels }}
               {% if selection_form.custom_channels.help_text %}<span class="field-help">{{ selection_form.custom_channels.help_text }}</span>{% endif %}
@@ -180,7 +175,7 @@
           </form>
         </div>
         <footer class="panel__footer">A desired-running unit restarts only after the new channel list validates.</footer>
-      </section>
+      </section>{% endif %}
 
       <section class="panel" aria-labelledby="commands-title">
         <header class="panel__header"><h2 id="commands-title">Command queue</h2></header>
@@ -203,18 +198,6 @@
         </div>
       </section>
 
-      {% if account.is_active %}
-        <section class="panel panel--danger" aria-labelledby="archive-title">
-          <header class="panel__header"><h2 id="archive-title">Archive account</h2></header>
-          <div class="panel__body">
-            <p class="muted">Archiving queues an intentional stop, removes this account from global actions and preset assignment, and preserves its complete runtime history.</p>
-            <form method="post" action="{% url 'controller:account_archive' account.pk %}">
-              {% csrf_token %}
-              <button class="button button--danger" type="submit">Archive {{ account.display_username }}</button>
-            </form>
-          </div>
-        </section>
-      {% endif %}
     </aside>
   </div>
 {% endblock %}

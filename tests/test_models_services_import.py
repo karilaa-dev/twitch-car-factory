@@ -22,13 +22,11 @@ from controller.models import (
     MinerRun,
 )
 from controller.services import (
-    archive_account,
     create_account,
     create_launch_snapshot,
     enqueue_command,
     get_account_password,
     normalize_channels,
-    reactivate_account,
     resolve_channels,
     save_preset,
     set_account_channel_selection,
@@ -164,40 +162,6 @@ def test_update_account_preserves_key_reencrypts_password_and_restarts_running_a
         updated.save()
     updated.refresh_from_db()
     assert updated.config_key == "primary"
-
-
-@pytest.mark.django_db
-def test_archive_and_reactivate_preserve_history_and_require_credentials(
-    db_account: MinerAccount,
-):
-    account = db_account
-    run = create_launch_snapshot(account, "worker-before-archive")
-    state = account.runtime_state
-    state.desired_state = MinerInstanceState.DesiredState.RUNNING
-    state.save(update_fields=("desired_state", "updated_at"))
-
-    archived = archive_account(account)
-
-    archived.refresh_from_db()
-    archived.runtime_state.refresh_from_db()
-    assert archived.is_active is False
-    assert archived.configuration_fingerprint == ""
-    assert archived.runtime_state.desired_state == MinerInstanceState.DesiredState.STOPPED
-    assert MinerCommand.objects.get(account=archived).action == MinerCommand.Action.STOP
-    assert MinerRun.objects.filter(pk=run.pk, account=archived).exists()
-
-    reactivated = reactivate_account(archived)
-    reactivated.refresh_from_db()
-    assert reactivated.is_active is True
-    assert reactivated.configuration_fingerprint
-    assert reactivated.runtime_state.desired_state == MinerInstanceState.DesiredState.STOPPED
-
-    archive_account(reactivated)
-    AccountCredential.objects.filter(account=reactivated).delete()
-    with pytest.raises(ValidationError, match="password"):
-        reactivate_account(reactivated)
-    reactivated.refresh_from_db()
-    assert reactivated.is_active is False
 
 
 @pytest.mark.django_db

@@ -769,6 +769,56 @@ h3 {
   gap: 0.34rem;
 }
 
+.channel-overflow {
+  display: flex;
+  width: min(420px, 31vw);
+  max-width: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: 0.34rem;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.channel-overflow .channel-tag,
+.channel-more {
+  flex: 0 0 auto;
+}
+
+.channel-more {
+  display: inline-flex;
+  min-height: 24px;
+  border: 1px solid var(--amber-dark);
+  border-radius: 999px;
+  align-items: center;
+  padding: 0.2rem 0.55rem;
+  color: var(--amber);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  font-weight: 700;
+  background: #211b11;
+}
+
+.source-label {
+  color: #dbe1dd;
+  font-family: var(--display);
+  font-size: 0.78rem;
+  font-weight: 750;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.table-row--inactive {
+  color: var(--faint);
+  background: rgb(0 0 0 / 16%);
+}
+
+.table-row--inactive .machine-id,
+.table-row--inactive .channel-overflow,
+.table-row--inactive .source-label {
+  opacity: 0.62;
+}
+
 .channel-tag {
   display: inline-flex;
   border: 1px solid #35413c;
@@ -1085,6 +1135,129 @@ code {
 .form-grid {
   display: grid;
   gap: 1rem;
+}
+
+.preset-channel-editor {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.preset-channel-add {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 0.7rem;
+}
+
+.preset-channel-list {
+  display: grid;
+  margin: 0;
+  border: 1px solid var(--line);
+  padding: 0;
+  list-style: none;
+  background: #0e1210;
+}
+
+.preset-channel-row {
+  display: flex;
+  min-height: 52px;
+  border-bottom: 1px solid var(--line);
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.55rem 0.7rem;
+}
+
+.preset-channel-row:last-child {
+  border-bottom: 0;
+}
+
+.preset-channel-row__identity {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 0.7rem;
+}
+
+.preset-channel-row__position {
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+}
+
+.preset-channel-list__empty {
+  padding: 1rem;
+  color: var(--muted);
+  font-size: 0.82rem;
+  text-align: center;
+}
+
+[data-preset-channel-feedback][data-tone="danger"] {
+  color: var(--red);
+}
+
+.log-console {
+  border: 1px solid var(--line);
+  background: #090c0b;
+  box-shadow: var(--shadow);
+}
+
+.log-console__header {
+  display: flex;
+  min-height: 64px;
+  border-bottom: 1px solid var(--line);
+  align-items: center;
+  gap: 0.8rem;
+  padding: 0.8rem 1rem;
+  background: linear-gradient(90deg, rgb(143 227 136 / 5%), transparent 42%), var(--panel);
+}
+
+.log-console__header .poll-indicator {
+  margin-left: auto;
+}
+
+.log-output {
+  width: 100%;
+  height: min(68vh, 760px);
+  min-height: 420px;
+  margin: 0;
+  border: 0;
+  padding: 1rem;
+  color: #c9d5ce;
+  font-family: var(--mono);
+  font-size: 0.76rem;
+  line-height: 1.65;
+  white-space: pre;
+  overflow: auto;
+  overscroll-behavior: contain;
+  background: transparent;
+}
+
+.log-output:focus-visible {
+  outline: 1px solid var(--amber);
+  outline-offset: -3px;
+}
+
+.log-empty {
+  display: grid;
+  min-height: 180px;
+  place-items: center;
+  align-content: center;
+  gap: 0.35rem;
+  padding: 2rem;
+  color: var(--muted);
+  text-align: center;
+}
+
+.log-empty strong {
+  color: #dbe1dd;
+  font-family: var(--display);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+[hidden] {
+  display: none !important;
 }
 
 .field {
@@ -2185,6 +2358,39 @@ button:disabled,
   .supervisor-bar {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .supervisor-bar__identity,
+  .supervisor-bar__identity .status-copy {
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .channel-overflow {
+    width: 100%;
+  }
+
+  .preset-channel-add {
+    grid-template-columns: 1fr;
+  }
+
+  .preset-channel-add .button {
+    width: 100%;
+  }
+
+  .log-console__header {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .log-console__header .poll-indicator {
+    width: 100%;
+    margin-left: 18px;
+  }
+
+  .log-output {
+    min-height: 360px;
+    font-size: 0.7rem;
   }
 
   .machine-table,

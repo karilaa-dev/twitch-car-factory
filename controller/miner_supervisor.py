@@ -16,6 +16,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -41,6 +42,7 @@ from controller import services
 
 
 logger = logging.getLogger(__name__)
+miner_output_logger = logging.getLogger("twitch_farm.miner_output")
 
 
 class ProcessLike(Protocol):
@@ -177,11 +179,13 @@ class ManagedProcess:
     cleanup_error: str = ""
     pending_stop_reason: str = ""
     pending_stop_forced: bool = False
+    output_thread: threading.Thread | None = None
 
 
 _SENSITIVE_VALUE = re.compile(
     r"(?i)\b(password|passwd|token|secret|authorization)\b\s*[:=]\s*([^\s,;]+)"
 )
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 def safe_error(value: object, *, limit: int = 2000) -> str:
@@ -190,6 +194,23 @@ def safe_error(value: object, *, limit: int = 2000) -> str:
     text = str(value).replace("\x00", "")
     text = _SENSITIVE_VALUE.sub(r"\1=[redacted]", text)
     return text[:limit]
+
+
+def _drain_miner_output(stream: IO[str], account_key: str) -> None:
+    """Forward one child's output through the worker's console/file handlers."""
+
+    try:
+        for raw_line in stream:
+            line = _ANSI_ESCAPE.sub("", safe_error(raw_line.rstrip("\r\n"), limit=8000))
+            if line:
+                miner_output_logger.info("miner[%s] %s", account_key, line)
+    except (OSError, ValueError):
+        logger.exception("Miner output stream failed for %s", account_key)
+    finally:
+        try:
+            stream.close()
+        except (OSError, ValueError):
+            pass
 
 
 def linux_parent_death_hook(parent_pid: int) -> Callable[[], None]:
@@ -374,6 +395,7 @@ class MinerSupervisor:
             # recovery attempt now so a worker restart preserves the same
             # incident/audit chain instead of silently bypassing it.
             self._perform_due_recoveries()
+            logger.info("Miner supervisor online: worker=%s pid=%s", self.worker_id, os.getpid())
         except Exception:
             WorkerLease.objects.filter(
                 name=self.lease_name,
@@ -791,6 +813,10 @@ class MinerSupervisor:
             )
             runtime_dir.mkdir(parents=True, exist_ok=True)
             child_environment = os.environ.copy()
+            # The worker is the sole rotating-file writer. Child output is
+            # captured below and re-emitted through the worker handlers.
+            child_environment["TWITCH_FARM_LOG_WRITER"] = "0"
+            child_environment["PYTHONUNBUFFERED"] = "1"
             existing_pythonpath = child_environment.get("PYTHONPATH", "")
             child_environment["PYTHONPATH"] = os.pathsep.join(
                 part for part in (str(settings.BASE_DIR), existing_pythonpath) if part
@@ -803,6 +829,12 @@ class MinerSupervisor:
                 "env": child_environment,
                 "close_fds": True,
                 "start_new_session": True,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.STDOUT,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+                "bufsize": 1,
             }
             if sys.platform.startswith("linux"):
                 popen_options["preexec_fn"] = linux_parent_death_hook(os.getpid())
@@ -851,6 +883,21 @@ class MinerSupervisor:
         # write fails, cleanup can still signal this exact child and a failed
         # cleanup remains visible to later reconciliation.
         self.processes[run.account_id] = managed
+        output_stream = getattr(process, "stdout", None)
+        if output_stream is not None:
+            managed.output_thread = threading.Thread(
+                target=_drain_miner_output,
+                args=(output_stream, run.account.config_key),
+                name=f"miner-log-{run.account_id}",
+                daemon=True,
+            )
+            managed.output_thread.start()
+        logger.info(
+            "Miner process started: account=%s run=%s pid=%s",
+            run.account.config_key,
+            run.pk,
+            process.pid,
+        )
         try:
             MinerRun.objects.filter(pk=run.pk).update(pid=process.pid, worker_id=self.worker_id)
             state, _ = MinerInstanceState.objects.get_or_create(account=run.account)
@@ -2344,6 +2391,7 @@ class MinerSupervisor:
             return
 
         self._shutdown_incomplete = True
+        logger.info("Miner supervisor shutdown requested: worker=%s", self.worker_id)
         owns_singleton = self._started
         errors: list[BaseException] = []
         try:

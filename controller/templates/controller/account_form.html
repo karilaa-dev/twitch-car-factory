@@ -30,7 +30,7 @@
         {% if account %}<span class="status-chip">Unit {{ account.pk|stringformat:'03d' }}</span>{% endif %}
       </header>
       <div class="panel__body">
-        <form class="form-grid" method="post" autocomplete="off">
+        <form class="form-grid" method="post" autocomplete="off"{% if form.mode %} data-channel-source-form{% endif %}>
           {% csrf_token %}
           {% if form.non_field_errors %}<div class="message error" role="alert">{{ form.non_field_errors }}</div>{% endif %}
 
@@ -47,14 +47,14 @@
                 {{ field.errors }}
               </div>
             {% elif field.field.widget.input_type == 'radio' %}
-              <fieldset class="field">
+              <fieldset class="field"{% if field.name == 'mode' %} data-source-mode{% endif %}>
                 <legend>{{ field.label }}</legend>
                 <div class="choice-grid">{{ field }}</div>
                 {% if field.help_text %}<span class="field-help">{{ field.help_text }}</span>{% endif %}
                 {{ field.errors }}
               </fieldset>
             {% else %}
-              <div class="field">
+              <div class="field"{% if field.name == 'preset' or field.name == 'custom_channels' %} data-source-field="{% if field.name == 'preset' %}preset{% else %}custom{% endif %}"{% endif %}>
                 <label for="{{ field.id_for_label }}">{{ field.label }}</label>
                 {{ field }}
                 {% if field.help_text %}<span class="field-help">{{ field.help_text }}</span>{% endif %}

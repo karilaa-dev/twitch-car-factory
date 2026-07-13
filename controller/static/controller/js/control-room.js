@@ -1,6 +1,42 @@
 (() => {
   "use strict";
 
+  const observer = "ResizeObserver" in window
+    ? new ResizeObserver((entries) => entries.forEach(({ target }) => fit(target)))
+    : null;
+
+  const fit = (container) => {
+    const items = [...container.querySelectorAll("[data-channel-item]")];
+    const more = container.querySelector("[data-channel-more]");
+    if (!more || !items.length) return;
+
+    items.forEach((item) => { item.hidden = false; });
+    more.hidden = true;
+    if (container.scrollWidth <= container.clientWidth) return;
+
+    for (let visible = items.length - 1; visible >= 0; visible -= 1) {
+      items.forEach((item, index) => { item.hidden = index >= visible; });
+      more.textContent = `and ${items.length - visible} more`;
+      more.hidden = false;
+      if (container.scrollWidth <= container.clientWidth) break;
+    }
+  };
+
+  const initialize = (root = document) => {
+    root.querySelectorAll("[data-channel-overflow]").forEach((container) => {
+      fit(container);
+      observer?.observe(container);
+    });
+  };
+
+  window.controlRoomFitChannels = initialize;
+  initialize();
+  if (!observer) window.addEventListener("resize", () => initialize());
+})();
+
+(() => {
+  "use strict";
+
   const livePanel = document.querySelector("[data-live-status]");
   if (!livePanel) return;
 
@@ -47,7 +83,23 @@
       }
       if (!response.ok) throw new Error(`Status request failed: ${response.status}`);
       const html = await response.text();
-      current.outerHTML = html;
+      const documentFragment = new DOMParser().parseFromString(html, "text/html");
+      const incoming = documentFragment.querySelector("[data-live-status]");
+      if (!incoming) throw new Error("Status response was missing its live panel");
+
+      const comparableMarkup = (panel) => {
+        const clone = panel.cloneNode(true);
+        const indicator = clone.querySelector("[data-poll-indicator]");
+        if (indicator) {
+          indicator.textContent = "";
+          indicator.removeAttribute("data-state");
+        }
+        return clone.innerHTML;
+      };
+      if (comparableMarkup(current) !== comparableMarkup(incoming)) {
+        current.replaceChildren(...incoming.childNodes);
+        window.controlRoomFitChannels?.(current);
+      }
       setIndicator("ok", "Telemetry updated just now");
     } catch (_error) {
       setIndicator("error", "Telemetry link interrupted");
@@ -60,6 +112,209 @@
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) refresh();
   });
+  schedule();
+})();
+
+(() => {
+  "use strict";
+
+  document.querySelectorAll("[data-channel-source-form]").forEach((form) => {
+    const modeInputs = [...form.querySelectorAll('input[name="mode"]')];
+    if (!modeInputs.length) return;
+
+    const update = () => {
+      const mode = modeInputs.find((input) => input.checked)?.value || "default";
+      form.querySelectorAll("[data-source-field]").forEach((field) => {
+        const visible = field.dataset.sourceField === mode;
+        field.hidden = !visible;
+        field.querySelectorAll("input, select, textarea").forEach((input) => {
+          input.disabled = !visible;
+        });
+      });
+    };
+
+    modeInputs.forEach((input) => input.addEventListener("change", update));
+    update();
+  });
+})();
+
+(() => {
+  "use strict";
+
+  document.querySelectorAll("[data-preset-form]").forEach((form) => {
+    const source = form.querySelector("[data-preset-channel-source]");
+    const textarea = source?.querySelector("textarea");
+    const editor = form.querySelector("[data-preset-channel-editor]");
+    const input = editor?.querySelector("[data-preset-channel-input]");
+    const addButton = editor?.querySelector("[data-preset-channel-add]");
+    const list = editor?.querySelector("[data-preset-channel-list]");
+    const feedback = editor?.querySelector("[data-preset-channel-feedback]");
+    if (!source || !textarea || !editor || !input || !addButton || !list || !feedback) return;
+
+    let channels = textarea.value
+      .split(/[,\r\n]+/)
+      .map((value) => value.trim())
+      .filter(Boolean);
+
+    const sync = () => { textarea.value = channels.join("\n"); };
+    const announce = (message, error = false) => {
+      feedback.textContent = message;
+      feedback.dataset.tone = error ? "danger" : "neutral";
+    };
+
+    const render = () => {
+      list.replaceChildren();
+      channels.forEach((channel, index) => {
+        const row = document.createElement("li");
+        row.className = "preset-channel-row";
+
+        const identity = document.createElement("span");
+        identity.className = "preset-channel-row__identity";
+        identity.innerHTML = `<span class="preset-channel-row__position">${String(index + 1).padStart(2, "0")}</span>`;
+        const tag = document.createElement("span");
+        tag.className = "channel-tag";
+        tag.textContent = channel;
+        identity.append(tag);
+
+        const remove = document.createElement("button");
+        remove.className = "button button--quiet button--danger";
+        remove.type = "button";
+        remove.textContent = "Delete";
+        let confirmationTimer = null;
+        remove.addEventListener("click", () => {
+          if (remove.dataset.confirming === "true") {
+            window.clearTimeout(confirmationTimer);
+            channels.splice(index, 1);
+            sync();
+            render();
+            announce(`${channel} removed from the staged preset.`);
+            return;
+          }
+          remove.dataset.confirming = "true";
+          remove.textContent = "Confirm";
+          confirmationTimer = window.setTimeout(() => {
+            if (!remove.isConnected) return;
+            remove.dataset.confirming = "false";
+            remove.textContent = "Delete";
+          }, 5000);
+        });
+
+        row.append(identity, remove);
+        list.append(row);
+      });
+      if (!channels.length) {
+        const empty = document.createElement("li");
+        empty.className = "preset-channel-list__empty";
+        empty.textContent = "No channels staged. Add at least one before saving.";
+        list.append(empty);
+      }
+    };
+
+    const addChannel = () => {
+      const channel = input.value.trim();
+      if (!/^[A-Za-z0-9_]{1,100}$/.test(channel)) {
+        announce("Use 1–100 letters, numbers, or underscores.", true);
+        input.focus();
+        return;
+      }
+      if (channels.some((existing) => existing.toLowerCase() === channel.toLowerCase())) {
+        announce(`${channel} is already in this preset.`, true);
+        input.select();
+        return;
+      }
+      channels.push(channel);
+      input.value = "";
+      sync();
+      render();
+      announce(`${channel} added to the staged preset.`);
+      input.focus();
+    };
+
+    addButton.addEventListener("click", addChannel);
+    input.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      addChannel();
+    });
+    form.addEventListener("submit", sync);
+
+    source.hidden = true;
+    editor.hidden = false;
+    render();
+  });
+})();
+
+(() => {
+  "use strict";
+
+  const view = document.querySelector("[data-bot-log-view]");
+  if (!view) return;
+
+  const endpoint = view.dataset.logTailUrl;
+  const intervalMs = 5000;
+  let timer;
+  let inFlight = false;
+
+  const schedule = () => {
+    window.clearTimeout(timer);
+    timer = window.setTimeout(refresh, intervalMs);
+  };
+
+  const refresh = async () => {
+    if (inFlight || document.hidden) {
+      schedule();
+      return;
+    }
+    inFlight = true;
+    try {
+      const response = await fetch(endpoint, {
+        cache: "no-store",
+        credentials: "same-origin",
+        headers: { "X-Requested-With": "XMLHttpRequest" },
+      });
+      if (response.redirected) {
+        window.location.assign(response.url);
+        return;
+      }
+      if (!response.ok) throw new Error(`Log request failed: ${response.status}`);
+      const parsed = new DOMParser().parseFromString(await response.text(), "text/html");
+      const incoming = parsed.querySelector("[data-bot-log-fragment]");
+      const current = view.querySelector("[data-bot-log-fragment]");
+      const currentOutput = current?.querySelector("[data-log-output]");
+      const nextOutput = incoming?.querySelector("[data-log-output]");
+      if (!incoming || !current || !currentOutput || !nextOutput) throw new Error("Invalid log response");
+
+      const pinned = currentOutput.scrollHeight - currentOutput.scrollTop - currentOutput.clientHeight < 40;
+      const priorScroll = currentOutput.scrollTop;
+      if (currentOutput.textContent !== nextOutput.textContent) {
+        currentOutput.textContent = nextOutput.textContent;
+        currentOutput.scrollTop = pinned ? currentOutput.scrollHeight : priorScroll;
+      }
+      currentOutput.hidden = nextOutput.hidden;
+
+      const currentHealth = current.querySelector("[data-log-health]");
+      const nextHealth = incoming.querySelector("[data-log-health]");
+      if (currentHealth && nextHealth) currentHealth.replaceChildren(...nextHealth.childNodes);
+      const currentEmpty = current.querySelector("[data-log-empty]");
+      const nextEmpty = incoming.querySelector("[data-log-empty]");
+      if (currentEmpty && nextEmpty) {
+        currentEmpty.hidden = nextEmpty.hidden;
+        currentEmpty.replaceChildren(...nextEmpty.childNodes);
+      }
+      const indicator = current.querySelector("[data-log-poll-indicator]");
+      if (indicator) indicator.textContent = "Logs updated just now";
+    } catch (_error) {
+      const indicator = view.querySelector("[data-log-poll-indicator]");
+      if (indicator) indicator.textContent = "Log link interrupted";
+    } finally {
+      inFlight = false;
+      schedule();
+    }
+  };
+
+  const initialOutput = view.querySelector("[data-log-output]");
+  if (initialOutput) initialOutput.scrollTop = initialOutput.scrollHeight;
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
   schedule();
 })();
 

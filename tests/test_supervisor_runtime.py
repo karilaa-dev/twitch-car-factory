@@ -222,6 +222,10 @@ def test_start_uses_snapshot_only_and_manual_stop_never_restarts(tmp_path, setti
         assert "Alpha" not in argv and "Beta" not in argv
         assert factory.options[0]["cwd"] == settings.TWITCH_FARM_RUNTIME_DIR
         assert str(settings.BASE_DIR) in factory.options[0]["env"]["PYTHONPATH"]
+        assert factory.options[0]["env"]["TWITCH_FARM_LOG_WRITER"] == "0"
+        assert factory.options[0]["env"]["PYTHONUNBUFFERED"] == "1"
+        assert factory.options[0]["stdout"] == subprocess.PIPE
+        assert factory.options[0]["stderr"] == subprocess.STDOUT
 
         stop = enqueue_command(account, MinerCommand.Action.STOP)
         supervisor.run_once(force_checks=True)

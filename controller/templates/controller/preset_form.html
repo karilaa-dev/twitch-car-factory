@@ -11,9 +11,9 @@
 
   <header class="page-header">
     <div class="page-heading">
-      <p class="eyebrow">Launch plan editor</p>
+      <p class="eyebrow">Channel preset editor</p>
       <h1>{% if preset %}Edit preset{% else %}New preset{% endif %}</h1>
-      <p class="lede">Channel order is preserved. Case-insensitive duplicates are removed when the plan is committed.</p>
+      <p class="lede">Channel order is preserved. Case-insensitive duplicates are removed when the preset is saved.</p>
     </div>
   </header>
 
@@ -21,22 +21,17 @@
     <section class="panel" aria-labelledby="editor-title">
       <header class="panel__header"><h2 id="editor-title">Preset specification</h2></header>
       <div class="panel__body">
-        <form class="form-grid" method="post">
+        <form class="form-grid" method="post" data-preset-form>
           {% csrf_token %}
           {% if form.non_field_errors %}<div class="message error" role="alert">{{ form.non_field_errors }}</div>{% endif %}
           <div class="field">
-            <label for="{{ form.name.id_for_label }}">Plan name</label>
+            <label for="{{ form.name.id_for_label }}">Preset name</label>
             {{ form.name }}
             {{ form.name.errors }}
           </div>
-          <div class="field">
-            <label for="{{ form.channels.id_for_label }}">Ordered channels</label>
-            {{ form.channels }}
-            {% if form.channels.help_text %}<span class="field-help">{{ form.channels.help_text }}</span>{% endif %}
-            {{ form.channels.errors }}
-          </div>
+          {% include "controller/_preset_channel_editor.html" with form=form %}
           <div class="button-row">
-            <button class="button button--primary" type="submit">{% if preset %}Commit revision{% else %}Create plan{% endif %}</button>
+            <button class="button button--primary" type="submit">{% if preset %}Save preset{% else %}Create preset{% endif %}</button>
             <a class="button button--quiet" href="{% if preset %}{% url 'controller:preset_detail' preset.pk %}{% else %}{% url 'controller:preset_list' %}{% endif %}">Cancel</a>
           </div>
         </form>

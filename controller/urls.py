@@ -14,16 +14,12 @@ urlpatterns = [
     path("", views.dashboard, name="dashboard"),
     path("status/", views.status_fragment, name="status_fragment"),
     path("actions/<str:action>/", views.global_action, name="global_action"),
+    path("logs/", views.bot_logs, name="bot_logs"),
+    path("logs/tail/", views.bot_log_tail, name="bot_log_tail"),
     path("accounts/", views.account_list, name="account_list"),
     path("accounts/new/", views.account_create, name="account_create"),
     path("accounts/<int:pk>/", views.account_detail, name="account_detail"),
     path("accounts/<int:pk>/edit/", views.account_edit, name="account_edit"),
-    path("accounts/<int:pk>/archive/", views.account_archive, name="account_archive"),
-    path(
-        "accounts/<int:pk>/reactivate/",
-        views.account_reactivate,
-        name="account_reactivate",
-    ),
     path(
         "accounts/<int:pk>/info/",
         views.account_info_fragment,

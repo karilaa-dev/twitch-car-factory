@@ -46,12 +46,10 @@ from .models import (
     WorkerLease,
 )
 from .services import (
-    archive_account,
     create_account,
     delete_preset,
     enqueue_all,
     enqueue_command,
-    reactivate_account,
     save_preset,
     set_account_channel_selection,
     update_account,
@@ -83,6 +81,7 @@ class AccountTelemetry:
     channels: tuple[str, ...]
     source_mode: str
     source_name: str
+    source_label: str
     pid: int | None
     last_heartbeat: datetime | None
     open_incident: MinerIncident | None
@@ -125,6 +124,7 @@ def _account_queryset():
         )
         .prefetch_related(
             "custom_channels",
+            "selection__preset__channels",
             Prefetch("incidents", queryset=open_incidents, to_attr="open_incident_rows"),
         )
         .order_by("config_key")
@@ -139,6 +139,39 @@ def _as_telemetry(account: MinerAccount) -> AccountTelemetry:
 
     run = state.current_run if state else None
     incidents = getattr(account, "open_incident_rows", ())
+    try:
+        selection = account.selection
+    except AccountChannelSelection.DoesNotExist:
+        selection = None
+
+    if run:
+        channels = tuple(run.channels)
+        source_mode = run.source_mode
+        source_name = run.source_name
+    elif selection and selection.mode == AccountChannelSelection.Mode.PRESET:
+        channels = (
+            tuple(channel.name for channel in selection.preset.channels.all())
+            if selection.preset
+            else ()
+        )
+        source_mode = selection.mode
+        source_name = selection.preset.name if selection.preset else ""
+    elif selection and selection.mode == AccountChannelSelection.Mode.CUSTOM:
+        channels = tuple(channel.name for channel in account.custom_channels.all())
+        source_mode = selection.mode
+        source_name = account.config_key
+    else:
+        channels = tuple(FarmConfiguration.load().default_channels)
+        source_mode = AccountChannelSelection.Mode.DEFAULT
+        source_name = "farm defaults"
+
+    if source_mode == AccountChannelSelection.Mode.PRESET:
+        source_label = source_name or "Preset"
+    elif source_mode == AccountChannelSelection.Mode.CUSTOM:
+        source_label = "Custom"
+    else:
+        source_label = "Default"
+
     return AccountTelemetry(
         account=account,
         state=state,
@@ -153,9 +186,10 @@ def _as_telemetry(account: MinerAccount) -> AccountTelemetry:
             else MinerInstanceState.ObservedState.UNKNOWN
         ),
         current_run=run,
-        channels=tuple(run.channels) if run else (),
-        source_mode=run.source_mode if run else "",
-        source_name=run.source_name if run else "",
+        channels=channels,
+        source_mode=source_mode,
+        source_name=source_name,
+        source_label=source_label,
         pid=(state.advisory_pid if state else None) or (run.pid if run else None),
         last_heartbeat=state.last_heartbeat if state else None,
         open_incident=incidents[0] if incidents else None,
@@ -299,7 +333,7 @@ def account_create(request: HttpRequest) -> HttpResponse:
 @staff_member_required(login_url=CONTROL_LOGIN_URL)
 @sensitive_post_parameters("password")
 def account_edit(request: HttpRequest, pk: int) -> HttpResponse:
-    account = get_object_or_404(MinerAccount, pk=pk)
+    account = get_object_or_404(MinerAccount, pk=pk, is_active=True)
     form = AccountEditForm(request.POST or None, account=account)
     if request.method == "POST" and form.is_valid():
         try:
@@ -334,28 +368,6 @@ def account_edit(request: HttpRequest, pk: int) -> HttpResponse:
     )
 
 
-@staff_member_required(login_url=CONTROL_LOGIN_URL)
-@require_POST
-def account_archive(request: HttpRequest, pk: int) -> HttpResponse:
-    account = get_object_or_404(MinerAccount, pk=pk)
-    archive_account(account, actor=request.user)
-    messages.success(request, f"Account {account.config_key} archived.")
-    return redirect("controller:account_detail", pk=account.pk)
-
-
-@staff_member_required(login_url=CONTROL_LOGIN_URL)
-@require_POST
-def account_reactivate(request: HttpRequest, pk: int) -> HttpResponse:
-    account = get_object_or_404(MinerAccount, pk=pk)
-    try:
-        reactivate_account(account, actor=request.user)
-    except ValidationError as exc:
-        messages.error(request, "; ".join(exc.messages))
-    else:
-        messages.success(request, f"Account {account.config_key} reactivated.")
-    return redirect("controller:account_detail", pk=account.pk)
-
-
 def _planned_channel_source(account: MinerAccount) -> dict:
     try:
         selection = account.selection
@@ -374,15 +386,17 @@ def _planned_channel_source(account: MinerAccount) -> dict:
         return {
             "mode": selection.mode,
             "name": selection.preset.name if selection.preset else "Missing preset",
-            "channels": tuple(selection.preset.channel_names) if selection.preset else (),
+            "channels": (
+                tuple(channel.name for channel in selection.preset.channels.all())
+                if selection.preset
+                else ()
+            ),
             "managed_externally": False,
         }
     return {
         "mode": selection.mode,
         "name": account.config_key,
-        "channels": tuple(
-            account.custom_channels.order_by("position").values_list("name", flat=True)
-        ),
+        "channels": tuple(channel.name for channel in account.custom_channels.all()),
         "managed_externally": False,
     }
 
@@ -460,7 +474,11 @@ def account_action(request: HttpRequest, pk: int, action: str) -> HttpResponse:
 @staff_member_required(login_url=CONTROL_LOGIN_URL)
 @require_POST
 def global_action(request: HttpRequest, action: str) -> HttpResponse:
-    if action not in {MinerCommand.Action.START, MinerCommand.Action.STOP}:
+    if action not in {
+        MinerCommand.Action.START,
+        MinerCommand.Action.STOP,
+        MinerCommand.Action.RESTART,
+    }:
         messages.error(request, "Unknown global lifecycle command.")
         return redirect("controller:dashboard")
     commands = enqueue_all(
@@ -569,12 +587,14 @@ def _preset_detail_context(
     preset: ChannelPreset,
     *,
     assignment_form: PresetAssignmentForm | None = None,
+    editor_form: PresetForm | None = None,
 ) -> dict:
     form = assignment_form or PresetAssignmentForm(preset=preset)
     return {
         "preset": preset,
         "assignment_form": form,
         "assignment_rows": _assignment_rows(preset, form),
+        "editor_form": editor_form or PresetForm(instance=preset),
     }
 
 
@@ -592,10 +612,11 @@ def preset_detail(request: HttpRequest, pk: int) -> HttpResponse:
 
 
 @staff_member_required(login_url=CONTROL_LOGIN_URL)
+@require_POST
 def preset_edit(request: HttpRequest, pk: int) -> HttpResponse:
     preset = get_object_or_404(ChannelPreset, pk=pk)
-    form = PresetForm(request.POST or None, instance=preset)
-    if request.method == "POST" and form.is_valid():
+    form = PresetForm(request.POST, instance=preset)
+    if form.is_valid():
         try:
             preset = save_preset(
                 preset=preset,
@@ -608,11 +629,47 @@ def preset_edit(request: HttpRequest, pk: int) -> HttpResponse:
         else:
             messages.success(request, f"Preset {preset.name} updated.")
             return redirect("controller:preset_detail", pk=preset.pk)
+    preset = get_object_or_404(
+        ChannelPreset.objects.prefetch_related("channels", "account_selections__account"),
+        pk=pk,
+    )
     return render(
         request,
-        "controller/preset_form.html",
-        {"form": form, "preset": preset},
-        status=400 if request.method == "POST" else 200,
+        "controller/preset_detail.html",
+        _preset_detail_context(preset, editor_form=form),
+        status=400,
+    )
+
+
+@staff_member_required(login_url=CONTROL_LOGIN_URL)
+@never_cache
+@require_safe
+def bot_logs(request: HttpRequest) -> HttpResponse:
+    from .runtime_logs import read_runtime_log_tail
+
+    return render(
+        request,
+        "controller/bot_logs.html",
+        {
+            "log_lines": read_runtime_log_tail(),
+            "supervisor": _supervisor_telemetry(),
+        },
+    )
+
+
+@staff_member_required(login_url=CONTROL_LOGIN_URL)
+@never_cache
+@require_safe
+def bot_log_tail(request: HttpRequest) -> HttpResponse:
+    from .runtime_logs import read_runtime_log_tail
+
+    return render(
+        request,
+        "controller/_bot_log_tail.html",
+        {
+            "log_lines": read_runtime_log_tail(),
+            "supervisor": _supervisor_telemetry(),
+        },
     )
 
 

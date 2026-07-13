@@ -25,7 +25,7 @@
       {% with current=request.resolver_match.url_name %}
         <nav class="primary-nav" aria-label="Primary navigation">
           <a href="{% url 'controller:dashboard' %}" {% if current == 'dashboard' or current == 'status_fragment' %}aria-current="page"{% endif %}>Runtime</a>
-          <a href="{% url 'controller:account_list' %}" {% if 'account' in current %}aria-current="page"{% endif %}>Accounts</a>
+          <a href="{% url 'controller:account_list' %}" {% if 'account' in current or 'bot_log' in current %}aria-current="page"{% endif %}>Accounts</a>
           <a href="{% url 'controller:preset_list' %}" {% if 'preset' in current %}aria-current="page"{% endif %}>Presets</a>
           <a href="{% url 'controller:settings_general' %}" {% if 'settings' in current %}aria-current="page"{% endif %}>Settings</a>
         </nav>

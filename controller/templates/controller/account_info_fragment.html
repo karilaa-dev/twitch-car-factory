@@ -8,7 +8,7 @@
     {% if account.is_active %}
       <span class="status-chip" data-tone="good">Active</span>
     {% else %}
-      <span class="status-chip">Archived</span>
+      <span class="status-chip">Inactive legacy record</span>
     {% endif %}
   </header>
 
@@ -48,6 +48,6 @@
 
   <footer class="account-info__footer">
     <p>Passwords and session data are intentionally never disclosed.</p>
-    <a class="button button--primary" href="{% url 'controller:account_edit' account.pk %}">Edit account</a>
+    {% if account.is_active %}<a class="button button--primary" href="{% url 'controller:account_edit' account.pk %}">Edit account</a>{% endif %}
   </footer>
 </article>

@@ -20,6 +20,7 @@ x-app: &app
     TWITCH_FARM_CREDENTIAL_KEYS: ${TWITCH_FARM_CREDENTIAL_KEYS:?Set TWITCH_FARM_CREDENTIAL_KEYS in .env}
     TWITCH_FARM_DB: /app/data/db.sqlite3
     TWITCH_FARM_WORKER_LOCK: /app/data/miner-worker.lock
+    TWITCH_FARM_LOG_FILE: /app/data/logs/twitch-farm.log
     TZ: UTC
   volumes:
     - ./data:/app/data
@@ -68,6 +69,7 @@ services:
     environment:
       <<: *app-environment
       TWITCH_FARM_RUNTIME_DIR: /app/runtime
+      TWITCH_FARM_LOG_WRITER: "1"
     depends_on:
       migrate:
         condition: service_completed_successfully
