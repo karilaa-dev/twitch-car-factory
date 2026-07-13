@@ -303,6 +303,10 @@
     });
     root.closest("form")?.addEventListener("submit", sync);
 
+    // Django keeps the source textarea required for the no-JavaScript path.
+    // Once enhanced, let server validation report an empty staged list instead
+    // of letting native validation target a control hidden from the operator.
+    textarea.required = false;
     source.hidden = true;
     editor.hidden = false;
     render();

@@ -13,7 +13,14 @@ def test_miner_output_is_prefixed_redacted_and_emitted_once(caplog):
     caplog.set_level(logging.INFO, logger="twitch_farm.miner_output")
 
     _drain_miner_output(
-        io.StringIO("\x1b[32mconnected\x1b[0m\npassword=hunter2\n"),
+        io.StringIO(
+            "\x1b[32mconnected\x1b[0m\n"
+            "\x1b[31mpassword\x1b[0m=hunter2\n"
+            "Authorization: Bearer bearer-secret\n"
+            'Proxy-Authorization: Digest username="demo", response="digest-secret"\n'
+            '{"password": "quoted-secret"}\n'
+            "access_token='token with spaces'\n"
+        ),
         "primary",
     )
 
@@ -21,6 +28,10 @@ def test_miner_output_is_prefixed_redacted_and_emitted_once(caplog):
     assert messages == [
         "miner[primary] connected",
         "miner[primary] password=[redacted]",
+        "miner[primary] Authorization: [redacted]",
+        "miner[primary] Proxy-Authorization: [redacted]",
+        'miner[primary] {"password": [redacted]}',
+        "miner[primary] access_token=[redacted]",
     ]
 
 

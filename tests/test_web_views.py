@@ -213,6 +213,25 @@ class WebViewTests(TestCase):
         self.assertContains(response, "fragment_channel")
         self.assertNotContains(response, "<!doctype html>")
 
+    def test_status_fragment_loads_farm_defaults_once_for_all_accounts(self):
+        self.login()
+        for index in range(3):
+            account = MinerAccount.objects.create(
+                config_key=f"default-{index}",
+                display_username=f"default_user_{index}",
+            )
+            AccountChannelSelection.objects.create(account=account)
+
+        with patch.object(
+            FarmConfiguration,
+            "load",
+            wraps=FarmConfiguration.load,
+        ) as load_configuration:
+            response = self.client.get(reverse("controller:status_fragment"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(load_configuration.call_count, 1)
+
     def test_supervisor_staleness_is_a_critical_dashboard_alert(self):
         self.login()
         WorkerLease.objects.create(

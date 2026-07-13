@@ -64,7 +64,7 @@ def main() -> None:
         focused_control.evaluate("control => control.blur()")
         page.screenshot(path=args.output / "dashboard-desktop.png", full_page=True)
 
-        page.locator(".machine-table tbody tr").filter(has_text="running").first.locator(
+        page.locator(".machine-table tbody tr").filter(has_text="Default").first.locator(
             ".machine-id a"
         ).click()
         page.wait_for_load_state("networkidle")
@@ -112,6 +112,18 @@ def main() -> None:
         staged_row = editor.locator(".channel-editor__row").filter(has_text="smoke_staged_channel")
         staged_row.get_by_role("button", name="Remove").click()
         assert editor.get_by_text("smoke_staged_channel", exact=True).count() == 0
+        while editor.locator(".channel-editor__row").count():
+            editor.locator(".channel-editor__row").first.get_by_role(
+                "button", name="Remove"
+            ).click()
+        page.get_by_role("button", name="Save preset").click()
+        page.wait_for_load_state("networkidle")
+        assert page.get_by_text("This field is required.").first.is_visible()
+        expected_validation_error = (
+            "Failed to load resource: the server responded with a status of 400 (Bad Request)"
+        )
+        if expected_validation_error in console_errors:
+            console_errors.remove(expected_validation_error)
         page.screenshot(path=args.output / "preset-editor.png", full_page=True)
 
         page.get_by_role("link", name="Settings").click()

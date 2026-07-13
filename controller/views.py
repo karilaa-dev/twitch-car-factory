@@ -131,7 +131,11 @@ def _account_queryset():
     )
 
 
-def _as_telemetry(account: MinerAccount) -> AccountTelemetry:
+def _as_telemetry(
+    account: MinerAccount,
+    *,
+    farm_default_channels: tuple[str, ...] | None = None,
+) -> AccountTelemetry:
     try:
         state = account.runtime_state
     except MinerInstanceState.DoesNotExist:
@@ -161,7 +165,11 @@ def _as_telemetry(account: MinerAccount) -> AccountTelemetry:
         source_mode = selection.mode
         source_name = account.config_key
     else:
-        channels = tuple(FarmConfiguration.load().default_channels)
+        channels = (
+            farm_default_channels
+            if farm_default_channels is not None
+            else tuple(FarmConfiguration.load().default_channels)
+        )
         source_mode = AccountChannelSelection.Mode.DEFAULT
         source_name = "farm defaults"
 
@@ -196,6 +204,14 @@ def _as_telemetry(account: MinerAccount) -> AccountTelemetry:
     )
 
 
+def _account_telemetry_rows() -> list[AccountTelemetry]:
+    farm_default_channels = tuple(FarmConfiguration.load().default_channels)
+    return [
+        _as_telemetry(account, farm_default_channels=farm_default_channels)
+        for account in _account_queryset()
+    ]
+
+
 def _supervisor_telemetry() -> SupervisorTelemetry:
     lease = WorkerLease.objects.order_by("-heartbeat_at").first()
     if lease is None:
@@ -220,7 +236,7 @@ def _supervisor_telemetry() -> SupervisorTelemetry:
 
 
 def _status_context() -> dict:
-    rows = [_as_telemetry(account) for account in _account_queryset()]
+    rows = _account_telemetry_rows()
     return {
         "account_rows": rows,
         "supervisor": _supervisor_telemetry(),
@@ -278,7 +294,7 @@ def account_list(request: HttpRequest) -> HttpResponse:
         request,
         "controller/accounts.html",
         {
-            "account_rows": [_as_telemetry(account) for account in _account_queryset()],
+            "account_rows": _account_telemetry_rows(),
             "active_count": MinerAccount.objects.filter(is_active=True).count(),
         },
     )

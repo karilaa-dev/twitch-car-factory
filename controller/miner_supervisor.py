@@ -181,7 +181,25 @@ class ManagedProcess:
 
 
 _SENSITIVE_VALUE = re.compile(
-    r"(?i)\b(password|passwd|token|secret|authorization)\b\s*[:=]\s*([^\s,;]+)"
+    r"""(?ix)
+    (?P<label>
+        \b(?:
+            password|passwd|secret|token|
+            api[_-]?key|access[_-]?token|refresh[_-]?token|
+            auth[_-]?token|client[_-]?secret
+        )\b
+        ["']?\s*[:=]\s*
+    )
+    (?:
+        "(?:\\.|[^"\\])*" |
+        '(?:\\.|[^'\\])*' |
+        (?:bearer|basic)\s+[^\s,;}\]]+ |
+        [^\s,;}\]]+
+    )
+    """
+)
+_AUTHORIZATION_VALUE = re.compile(
+    r"(?im)(?P<label>\bauthorization\b[\"']?\s*[:=]\s*)[^\r\n]*"
 )
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
@@ -190,7 +208,8 @@ def safe_error(value: object, *, limit: int = 2000) -> str:
     """Bound and redact errors before persisting them or showing them in HTML."""
 
     text = str(value).replace("\x00", "")
-    text = _SENSITIVE_VALUE.sub(r"\1=[redacted]", text)
+    text = _AUTHORIZATION_VALUE.sub(r"\g<label>[redacted]", text)
+    text = _SENSITIVE_VALUE.sub(r"\g<label>[redacted]", text)
     return text[:limit]
 
 
@@ -199,7 +218,8 @@ def _drain_miner_output(stream: IO[str], account_key: str) -> None:
 
     try:
         for raw_line in stream:
-            line = _ANSI_ESCAPE.sub("", safe_error(raw_line.rstrip("\r\n"), limit=8000))
+            unstyled_line = _ANSI_ESCAPE.sub("", raw_line.rstrip("\r\n"))
+            line = safe_error(unstyled_line, limit=8000)
             if line:
                 miner_output_logger.info("miner[%s] %s", account_key, line)
     except (OSError, ValueError):
