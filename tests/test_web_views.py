@@ -571,6 +571,38 @@ class WebViewTests(TestCase):
         )
         self.assertNotContains(create_response, "Reliability contract")
 
+    def test_primary_tabs_omit_page_descriptions_and_settings_explainer(self):
+        self.login()
+        self.create_preset()
+        pages = (
+            (
+                reverse("controller:dashboard"),
+                "Desired state is the instruction.",
+            ),
+            (
+                reverse("controller:account_list"),
+                "Create, configure, and inspect Twitch farm accounts.",
+            ),
+            (
+                reverse("controller:preset_list"),
+                "Reusable ordered channel lists.",
+            ),
+            (
+                reverse("controller:settings_general"),
+                "Manage database-backed farm defaults",
+            ),
+        )
+
+        for url, description in pages:
+            with self.subTest(url=url):
+                response = self.client.get(url)
+                self.assertEqual(response.status_code, 200)
+                self.assertNotContains(response, description)
+
+        settings = self.client.get(reverse("controller:settings_general"))
+        self.assertNotContains(settings, "What these settings control")
+        self.assertNotContains(settings, "Database authority")
+
     def test_account_info_fragment_is_no_store_and_never_discloses_secrets(self):
         self.login()
 

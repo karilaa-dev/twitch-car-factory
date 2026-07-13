@@ -28,24 +28,30 @@ class FakeResponse:
 
 
 def test_lookup_batches_names_and_distinguishes_existing_from_missing():
-    response = FakeResponse(
-        [
-            {"data": {"user": {"id": "12826"}}},
-            {"data": {"user": None}},
-        ]
-    )
-    with patch("controller.twitch_lookup.urlopen", return_value=response) as urlopen:
-        result = lookup_twitch_names(["twitch", "missing_channel", "TWITCH"])
+    first_batch_names = ["twitch", *(f"channel_{index}" for index in range(49))]
+    responses = [
+        FakeResponse(
+            [{"data": {"user": {"id": str(index)}}} for index in range(50)]
+        ),
+        FakeResponse([{"data": {"user": None}}]),
+    ]
+    with patch("controller.twitch_lookup.urlopen", side_effect=responses) as urlopen:
+        result = lookup_twitch_names(
+            [*first_batch_names, "missing_channel", "TWITCH"]
+        )
 
-    assert result == {
-        "twitch": TwitchLookupStatus.EXISTS,
-        "missing_channel": TwitchLookupStatus.MISSING,
+    expected = {
+        name: TwitchLookupStatus.EXISTS for name in first_batch_names
     }
-    request = urlopen.call_args.args[0]
-    payload = json.loads(request.data)
-    assert [item["variables"]["login"] for item in payload] == [
-        "twitch",
-        "missing_channel",
+    expected["missing_channel"] = TwitchLookupStatus.MISSING
+    assert result == expected
+    assert urlopen.call_count == 2
+
+    payloads = [json.loads(call.args[0].data) for call in urlopen.call_args_list]
+    assert [len(payload) for payload in payloads] == [50, 1]
+    assert [item["variables"]["login"] for item in payloads[0]] == first_batch_names
+    assert [item["variables"]["login"] for item in payloads[1]] == [
+        "missing_channel"
     ]
 
 
