@@ -30,12 +30,46 @@
         {% if account %}<span class="status-chip">Unit {{ account.pk|stringformat:'03d' }}</span>{% endif %}
       </header>
       <div class="panel__body">
-        <form class="form-grid" method="post" autocomplete="off">
+        <form class="form-grid" method="post" autocomplete="off"{% if form.mode %} data-channel-source-form{% endif %}>
           {% csrf_token %}
-          {% if form.non_field_errors %}<div class="message error" role="alert">{{ form.non_field_errors }}</div>{% endif %}
+          {% include "controller/_form_error_summary.html" with form=form %}
 
-          {% for field in form %}
-            {% if field.field.widget.input_type == 'checkbox' %}
+          {% if form.mode %}
+            <div class="field">
+              <label for="{{ form.config_key.id_for_label }}">{{ form.config_key.label }}</label>
+              {{ form.config_key }}
+              <span class="field-help">{{ form.config_key.help_text }}</span>
+              {{ form.config_key.errors }}
+            </div>
+            <div class="field">
+              <label for="{{ form.username.id_for_label }}">{{ form.username.label }}</label>
+              {{ form.username }}
+              {{ form.username.errors }}
+            </div>
+            <div class="field">
+              <label for="{{ form.password.id_for_label }}">{{ form.password.label }}</label>
+              {{ form.password }}
+              {{ form.password.errors }}
+            </div>
+
+            <div class="form-section">
+              <div class="form-section__heading">
+                <h3>Initial channel source</h3>
+                <p>Choose where this account gets its ordered launch channels.</p>
+              </div>
+              {% include "controller/_channel_source_fields.html" with form=form %}
+            </div>
+
+            <div class="field field--choice">
+              <label class="toggle-field" for="{{ form.start_after_save.id_for_label }}">
+                {{ form.start_after_save }}
+                <span><strong>{{ form.start_after_save.label }}</strong><small>{{ form.start_after_save.help_text }}</small></span>
+              </label>
+              {{ form.start_after_save.errors }}
+            </div>
+          {% else %}
+            {% for field in form %}
+              {% if field.field.widget.input_type == 'checkbox' %}
               <div class="field field--choice">
                 <label class="toggle-field" for="{{ field.id_for_label }}">
                   {{ field }}
@@ -46,22 +80,16 @@
                 </label>
                 {{ field.errors }}
               </div>
-            {% elif field.field.widget.input_type == 'radio' %}
-              <fieldset class="field">
-                <legend>{{ field.label }}</legend>
-                <div class="choice-grid">{{ field }}</div>
-                {% if field.help_text %}<span class="field-help">{{ field.help_text }}</span>{% endif %}
-                {{ field.errors }}
-              </fieldset>
-            {% else %}
+              {% else %}
               <div class="field">
                 <label for="{{ field.id_for_label }}">{{ field.label }}</label>
                 {{ field }}
                 {% if field.help_text %}<span class="field-help">{{ field.help_text }}</span>{% endif %}
                 {{ field.errors }}
               </div>
-            {% endif %}
-          {% endfor %}
+              {% endif %}
+            {% endfor %}
+          {% endif %}
 
           <div class="button-row">
             <button class="button button--primary" type="submit">{% if account %}Save changes{% else %}Add account{% endif %}</button>

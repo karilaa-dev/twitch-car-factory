@@ -14,29 +14,29 @@
     <div class="panel__body">
       <form class="form-grid" method="post">
         {% csrf_token %}
-        {% if form.non_field_errors %}<div class="message error" role="alert">{{ form.non_field_errors }}</div>{% endif %}
+        {% include "controller/_form_error_summary.html" with form=form %}
 
-        {% for field in form %}
-          {% if field.field.widget.input_type == 'checkbox' %}
-            <div class="field field--choice">
-              <label class="toggle-field" for="{{ field.id_for_label }}">
-                {{ field }}
-                <span>
-                  <strong>{{ field.label }}</strong>
-                  {% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}
-                </span>
-              </label>
-              {{ field.errors }}
-            </div>
-          {% else %}
-            <div class="field">
-              <label for="{{ field.id_for_label }}">{{ field.label }}</label>
-              {{ field }}
-              {% if field.help_text %}<span class="field-help">{{ field.help_text }}</span>{% endif %}
-              {{ field.errors }}
-            </div>
-          {% endif %}
-        {% endfor %}
+        <div class="form-section">
+          <div class="form-section__heading">
+            <h3>Default channels</h3>
+            <p>Accounts using the Default source launch these channels in the order shown.</p>
+          </div>
+          {% include "controller/_channel_editor.html" with field=form.default_channels label="Ordered default channels" %}
+        </div>
+
+        <div class="form-section">
+          <div class="form-section__heading">
+            <h3>New-account preference</h3>
+            <p>This changes only the default choice on the add-account form.</p>
+          </div>
+          <div class="field field--choice">
+            <label class="toggle-field" for="{{ form.autostart_new_accounts.id_for_label }}">
+              {{ form.autostart_new_accounts }}
+              <span><strong>{{ form.autostart_new_accounts.label }}</strong><small>{{ form.autostart_new_accounts.help_text }}</small></span>
+            </label>
+            {{ form.autostart_new_accounts.errors }}
+          </div>
+        </div>
 
         <div class="button-row">
           <button class="button button--primary" type="submit">Save general settings</button>

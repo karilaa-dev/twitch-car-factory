@@ -11,6 +11,7 @@ from pathlib import Path
 from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
+from controller.miner_runner import configure_linux_parent_death_signal
 from controller.models import MinerRun
 
 
@@ -58,6 +59,7 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options) -> None:
+        configure_linux_parent_death_signal()
         run = (
             MinerRun.objects.select_related("account")
             .filter(

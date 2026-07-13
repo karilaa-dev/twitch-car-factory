@@ -1,0 +1,28 @@
+<div class="channel-editor-root" data-channel-editor-root>
+  <div class="field" data-channel-editor-source>
+    <label for="{{ field.id_for_label }}">{{ label|default:field.label }}</label>
+    {{ field }}
+    {% if field.help_text %}<span class="field-help">{{ field.help_text }}</span>{% endif %}
+  </div>
+
+  <div class="channel-editor" data-channel-editor hidden>
+    <div class="channel-editor__add">
+      <div class="field">
+        <label for="{{ field.id_for_label }}_add">Add channel</label>
+        <input
+          id="{{ field.id_for_label }}_add"
+          type="text"
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="channel_name"
+          data-channel-input
+        >
+      </div>
+      <button class="button button--secondary" type="button" data-channel-add>Add channel</button>
+    </div>
+    <p class="field-help" data-channel-feedback role="status" aria-live="polite">Channels launch in the order shown.</p>
+    <ol class="channel-editor__list" data-channel-list aria-label="Ordered channels"></ol>
+  </div>
+
+  {{ field.errors }}
+</div>

@@ -34,7 +34,7 @@
       <span class="status-copy">
         <strong>{{ supervisor.label }}</strong>
         <small>
-          owner {{ supervisor.owner_id }}{% if supervisor.pid %} · pid {{ supervisor.pid }}{% endif %}
+          owner {{ supervisor.owner_id }}
           {% if supervisor.heartbeat_at %} · heartbeat {{ supervisor.heartbeat_at|timesince }} ago{% endif %}
         </small>
       </span>
@@ -50,14 +50,13 @@
 
   {% if account_rows %}
     <div class="machine-table-wrap">
-      <table class="machine-table">
+      <table class="machine-table runtime-table">
         <thead>
           <tr>
             <th scope="col">Account</th>
-            <th scope="col">Target → actual</th>
-            <th scope="col">Launch source</th>
-            <th scope="col">Exact active channels</th>
-            <th scope="col">Process</th>
+            <th scope="col">Status</th>
+            <th scope="col">Source</th>
+            <th scope="col">Channels</th>
             <th scope="col">Controls</th>
           </tr>
         </thead>
@@ -67,42 +66,20 @@
               <td data-label="Account">
                 <span class="machine-id">
                   <a href="{% url 'controller:account_detail' row.account.pk %}">{{ row.account.config_key }}</a>
-                  <small>{{ row.account.display_username }}{% if not row.account.is_active %} · archived{% elif not row.account.has_credentials %} · credentials needed{% endif %}</small>
                 </span>
               </td>
-              <td data-label="Target / actual">
-                <span class="state-pair">
-                  <span class="state-block">
-                    <small>Desired</small>
-                    <span class="status-chip" data-tone="{{ row.desired|state_tone }}">{{ row.desired }}</span>
-                  </span>
-                  <span class="state-pair__arrow" aria-hidden="true">→</span>
-                  <span class="state-block">
-                    <small>Observed</small>
-                    <span class="status-chip" data-tone="{{ row.observed|state_tone }}">{{ row.observed }}</span>
-                  </span>
-                </span>
+              <td data-label="Status">
+                <span class="status-chip" data-tone="{{ row.observed|state_tone }}">{{ row.observed }}</span>
               </td>
-              <td data-label="Launch source">
-                {% if row.current_run %}
-                  <span class="mono">{{ row.source_mode }}</span><br>
-                  <small class="muted">{{ row.source_name }}</small>
-                {% else %}
-                  <span class="faint">No active run</span>
-                {% endif %}
+              <td data-label="Source">
+                <span class="source-label">{{ row.source_label }}</span>
               </td>
               <td data-label="Channels">
                 {% if row.channels %}
-                  <span class="channel-trace">
-                    {% for channel in row.channels %}<span class="channel-tag">{{ channel }}</span>{% endfor %}
-                  </span>
+                  {% include "controller/_channel_overflow.html" with channels=row.channels %}
                 {% else %}
-                  <span class="faint">No launch snapshot</span>
+                  <span class="faint">No channels configured</span>
                 {% endif %}
-              </td>
-              <td data-label="Process">
-                {% if row.pid %}<span class="mono">pid {{ row.pid }}</span>{% else %}<span class="faint">unassigned</span>{% endif %}
-                {% if row.open_incident %}<br><span class="status-chip" data-tone="danger">incident open</span>{% endif %}
               </td>
               <td data-label="Controls">
                 <div class="button-row">

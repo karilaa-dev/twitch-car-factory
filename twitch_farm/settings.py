@@ -192,6 +192,13 @@ TWITCH_FARM_RUNTIME_DIR = Path(
 TWITCH_FARM_WORKER_LOCK = Path(
     os.getenv("TWITCH_FARM_WORKER_LOCK", DATABASE_PATH.parent / "miner-worker.lock")
 )
+TWITCH_FARM_LOG_FILE = Path(
+    os.getenv("TWITCH_FARM_LOG_FILE", DATABASE_PATH.parent / "logs" / "twitch-farm.log")
+)
+TWITCH_FARM_LOG_WRITER = env_bool("TWITCH_FARM_LOG_WRITER", False)
+
+if TWITCH_FARM_LOG_WRITER:
+    TWITCH_FARM_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 LOGGING = {
     "version": 1,
@@ -199,6 +206,20 @@ LOGGING = {
     "formatters": {
         "standard": {"format": "%(asctime)s %(levelname)s %(name)s: %(message)s"},
     },
-    "handlers": {"console": {"class": "logging.StreamHandler", "formatter": "standard"}},
-    "root": {"handlers": ["console"], "level": os.getenv("LOG_LEVEL", "INFO")},
+    "handlers": {
+        "console": {"class": "logging.StreamHandler", "formatter": "standard"},
+        "runtime_file": {
+            "class": "logging.handlers.RotatingFileHandler",
+            "formatter": "standard",
+            "filename": str(TWITCH_FARM_LOG_FILE),
+            "maxBytes": 5 * 1024 * 1024,
+            "backupCount": 3,
+            "encoding": "utf-8",
+            "delay": True,
+        },
+    },
+    "root": {
+        "handlers": ["console", "runtime_file"] if TWITCH_FARM_LOG_WRITER else ["console"],
+        "level": os.getenv("LOG_LEVEL", "INFO"),
+    },
 }

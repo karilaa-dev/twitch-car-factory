@@ -1,0 +1,11 @@
+{% load control_room %}
+<span
+  class="channel-overflow"
+  data-channel-overflow
+  role="group"
+  aria-label="Channels: {{ channels|channel_list }}"
+  title="{{ channels|channel_list }}"
+>
+  {% for channel in channels %}<span class="channel-tag" data-channel-item aria-hidden="true">{{ channel }}</span>{% endfor %}
+  <span class="channel-more" data-channel-more aria-hidden="true" hidden></span>
+</span>

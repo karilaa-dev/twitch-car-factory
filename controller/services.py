@@ -347,47 +347,6 @@ def update_account(
 
 
 @transaction.atomic
-def archive_account(account: MinerAccount, *, actor=None) -> MinerAccount:
-    account = MinerAccount.objects.select_for_update().get(pk=account.pk)
-    state, _ = MinerInstanceState.objects.get_or_create(account=account)
-    if state.desired_state == MinerInstanceState.DesiredState.RUNNING or state.current_run_id:
-        enqueue_command(
-            account,
-            MinerCommand.Action.STOP,
-            actor=actor,
-            reason="Account archived from the web control room.",
-        )
-    account.is_active = False
-    account.configuration_fingerprint = ""
-    account.save(update_fields=("is_active", "configuration_fingerprint", "updated_at"))
-    ActionLog.objects.create(
-        actor=actor,
-        account=account,
-        action="account_archived",
-        message=f"Archived account {account.config_key}.",
-    )
-    return account
-
-
-@transaction.atomic
-def reactivate_account(account: MinerAccount, *, actor=None) -> MinerAccount:
-    account = MinerAccount.objects.select_for_update().get(pk=account.pk)
-    if not AccountCredential.objects.filter(account=account).exists():
-        raise ValidationError("Add a Twitch password before reactivating this account.")
-    account.is_active = True
-    account.save(update_fields=("is_active", "updated_at"))
-    resolve_channels(account)
-    _refresh_account_fingerprint(account)
-    ActionLog.objects.create(
-        actor=actor,
-        account=account,
-        action="account_reactivated",
-        message=f"Reactivated account {account.config_key}.",
-    )
-    return account
-
-
-@transaction.atomic
 def update_farm_configuration(
     *,
     default_channels: str | Iterable[str],

@@ -8,58 +8,52 @@
     <div class="page-heading">
       <p class="eyebrow">Managed identities</p>
       <h1>Account rack</h1>
-      <p class="lede">Create, configure, and operate Twitch accounts here. Passwords are encrypted at rest and are never shown after they are saved.</p>
+      <p class="lede">Create, configure, and inspect Twitch farm accounts. Passwords remain encrypted and are never returned to this interface.</p>
     </div>
     <div class="actions">
-      <a class="button button--quiet" href="{% url 'controller:dashboard' %}">Open runtime board</a>
+      <a class="button button--quiet" href="{% url 'controller:bot_logs' %}">Bot logs</a>
       <a class="button button--primary" href="{% url 'controller:account_create' %}">Add account</a>
     </div>
   </header>
 
   {% if account_rows %}
-    <div class="record-grid">
-      {% for row in account_rows %}
-        <article class="record-card{% if not row.account.is_active %} record-card--inactive{% endif %}">
-          <header class="record-card__header">
-            <div>
-              <h2><a href="{% url 'controller:account_detail' row.account.pk %}">{{ row.account.display_username }}</a></h2>
-              <span class="muted mono">{{ row.account.config_key }}</span>
-            </div>
-            {% if row.account.is_active %}
-              <span class="status-light" data-tone="{{ row.observed|state_tone }}" aria-label="Observed {{ row.observed }}"></span>
-            {% else %}
-              <span class="status-chip">Archived</span>
-            {% endif %}
-          </header>
-          <div class="record-card__body">
-            <div class="state-pair">
-              <span class="state-block"><small>Desired</small><span class="status-chip" data-tone="{{ row.desired|state_tone }}">{{ row.desired }}</span></span>
-              <span class="state-pair__arrow" aria-hidden="true">→</span>
-              <span class="state-block"><small>Observed</small><span class="status-chip" data-tone="{{ row.observed|state_tone }}">{{ row.observed }}</span></span>
-            </div>
-            <p class="muted">
-              {% if row.current_run %}{{ row.source_mode }} / {{ row.source_name }} · {{ row.channels|length }} active channel{{ row.channels|length|pluralize }}{% else %}No active launch snapshot{% endif %}
-            </p>
-            {% if not row.account.has_credentials %}<span class="status-chip" data-tone="pending">Credentials needed</span>{% endif %}
-            {% if row.open_incident %}<span class="status-chip" data-tone="danger">Recovery incident open</span>{% endif %}
-          </div>
-          <footer class="record-card__footer">
-            <span>{% if row.account.is_active %}Ready for operator control{% else %}Preserved history · excluded from launch{% endif %}</span>
-            <a href="{% url 'controller:account_detail' row.account.pk %}">Inspect unit →</a>
-          </footer>
-        </article>
-      {% endfor %}
+    <div class="machine-table-wrap">
+      <table class="machine-table account-table">
+        <thead>
+          <tr>
+            <th scope="col">Account</th>
+            <th scope="col">Current status</th>
+            <th scope="col">Source</th>
+            <th scope="col">Channels</th>
+            <th scope="col">Credential</th>
+            <th scope="col">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in account_rows %}
+            <tr{% if not row.account.is_active %} class="table-row--inactive"{% endif %}>
+              <td data-label="Account"><span class="machine-id"><a href="{% url 'controller:account_detail' row.account.pk %}">{{ row.account.config_key }}</a></span></td>
+              <td data-label="Current status">
+                {% if row.account.is_active %}<span class="status-chip" data-tone="{{ row.observed|state_tone }}">{{ row.observed }}</span>{% else %}<span class="status-chip">Inactive legacy record</span>{% endif %}
+              </td>
+              <td data-label="Source"><span class="source-label">{{ row.source_label }}</span></td>
+              <td data-label="Channels">
+                {% if row.channels %}{% include "controller/_channel_overflow.html" with channels=row.channels %}{% else %}<span class="faint">No channels configured</span>{% endif %}
+              </td>
+              <td data-label="Credential">
+                {% if row.account.has_credentials %}<span class="status-chip" data-tone="good">Stored</span>{% else %}<span class="status-chip" data-tone="pending">Needed</span>{% endif %}
+              </td>
+              <td data-label="Actions">
+                <div class="button-row">
+                  <a class="button button--quiet" href="{% url 'controller:account_detail' row.account.pk %}">Open</a>
+                </div>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
     </div>
   {% else %}
-    <div class="empty-state">
-      <div>
-        <div class="empty-state__mark"><span>0</span></div>
-        <p>No accounts yet. Add one here, or migrate an older installation from Settings.</p>
-        <div class="button-row empty-state__actions">
-          <a class="button button--primary" href="{% url 'controller:account_create' %}">Add account</a>
-          <a class="button" href="{% url 'controller:settings_import' %}">Import legacy data</a>
-        </div>
-      </div>
-    </div>
+    <div class="empty-state"><div><div class="empty-state__mark"><span>0</span></div><p>No accounts yet. Add one here, or migrate an older installation from Settings.</p></div></div>
   {% endif %}
 {% endblock %}

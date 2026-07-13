@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from pathlib import Path
+import tempfile
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
@@ -122,8 +124,8 @@ class WebViewTests(TestCase):
             reverse("controller:account_detail", args=[self.account.pk]),
             reverse("controller:account_edit", args=[self.account.pk]),
             reverse("controller:account_info_fragment", args=[self.account.pk]),
-            reverse("controller:account_archive", args=[self.account.pk]),
-            reverse("controller:account_reactivate", args=[self.account.pk]),
+            reverse("controller:bot_logs"),
+            reverse("controller:bot_log_tail"),
             reverse("controller:preset_list"),
             reverse("controller:preset_create"),
             reverse("controller:preset_detail", args=[preset.pk]),
@@ -184,12 +186,21 @@ class WebViewTests(TestCase):
         response = self.client.get(reverse("controller:dashboard"))
 
         self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "Desired")
-        self.assertContains(response, "Observed")
+        self.assertContains(response, "<th scope=\"col\">Status</th>")
+        self.assertContains(response, "Default")
         self.assertContains(response, "exact_first")
         self.assertContains(response, "exact_second")
         self.assertContains(response, incident.summary)
         self.assertContains(response, "Supervisor online")
+        self.assertNotContains(response, "Incident open")
+        self.assertNotContains(response, "<th scope=\"col\">Process</th>")
+        self.assertNotContains(response, "pid 4321")
+        self.assertNotContains(response, "pid 987")
+
+        detail = self.client.get(
+            reverse("controller:account_detail", args=[self.account.pk])
+        )
+        self.assertContains(detail, "pid 4321")
 
     def test_status_fragment_is_authenticated_and_contains_no_page_shell(self):
         self.login()
@@ -201,6 +212,25 @@ class WebViewTests(TestCase):
         self.assertContains(response, 'id="live-status"')
         self.assertContains(response, "fragment_channel")
         self.assertNotContains(response, "<!doctype html>")
+
+    def test_status_fragment_loads_farm_defaults_once_for_all_accounts(self):
+        self.login()
+        for index in range(3):
+            account = MinerAccount.objects.create(
+                config_key=f"default-{index}",
+                display_username=f"default_user_{index}",
+            )
+            AccountChannelSelection.objects.create(account=account)
+
+        with patch.object(
+            FarmConfiguration,
+            "load",
+            wraps=FarmConfiguration.load,
+        ) as load_configuration:
+            response = self.client.get(reverse("controller:status_fragment"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(load_configuration.call_count, 1)
 
     def test_supervisor_staleness_is_a_critical_dashboard_alert(self):
         self.login()
@@ -268,6 +298,25 @@ class WebViewTests(TestCase):
         form = response.context["form"]
         self.assertEqual(form["mode"].value(), AccountChannelSelection.Mode.DEFAULT)
         self.assertTrue(form["start_after_save"].value())
+        self.assertContains(response, "data-channel-editor-root")
+        self.assertContains(response, "data-preset-preview")
+
+    def test_account_source_page_prefetches_ordered_preset_preview(self):
+        self.login()
+        preset = self.create_preset(
+            name="Preview rotation",
+            channels=["preview_one", "preview_two"],
+        )
+
+        response = self.client.get(
+            reverse("controller:account_detail", args=[self.account.pk])
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'data-preset-id="%s"' % preset.pk)
+        self.assertContains(response, "preview_one")
+        self.assertContains(response, "preview_two")
+        self.assertContains(response, "data-channel-editor-root")
 
     def test_invalid_account_form_never_echoes_submitted_password(self):
         self.login()
@@ -363,78 +412,67 @@ class WebViewTests(TestCase):
         self.assertNotContains(edit_page, replacement_password)
         self.assertNotContains(edit_page, self.credential.password_ciphertext)
 
-    def test_account_archive_and_reactivate_are_post_only_and_audited(self):
-        self.login()
-        self.state.desired_state = MinerInstanceState.DesiredState.RUNNING
-        self.state.save(update_fields=("desired_state", "updated_at"))
-        archive_url = reverse("controller:account_archive", args=[self.account.pk])
-        reactivate_url = reverse("controller:account_reactivate", args=[self.account.pk])
-
-        self.assertEqual(self.client.get(archive_url).status_code, 405)
-        response = self.client.post(archive_url)
-
-        self.assertRedirects(
-            response,
-            reverse("controller:account_detail", args=[self.account.pk]),
-        )
-        self.account.refresh_from_db()
-        self.state.refresh_from_db()
-        self.assertFalse(self.account.is_active)
-        self.assertEqual(
-            self.state.desired_state,
-            MinerInstanceState.DesiredState.STOPPED,
-        )
-        self.assertTrue(
-            MinerCommand.objects.filter(
-                account=self.account,
-                action=MinerCommand.Action.STOP,
-                actor=self.staff,
-            ).exists()
-        )
-        self.assertTrue(
-            ActionLog.objects.filter(
-                account=self.account,
-                actor=self.staff,
-                action="account_archived",
-            ).exists()
-        )
-
-        self.assertEqual(self.client.get(reactivate_url).status_code, 405)
-        response = self.client.post(reactivate_url)
-
-        self.assertRedirects(
-            response,
-            reverse("controller:account_detail", args=[self.account.pk]),
-        )
-        self.account.refresh_from_db()
-        self.assertTrue(self.account.is_active)
-        self.assertTrue(
-            ActionLog.objects.filter(
-                account=self.account,
-                actor=self.staff,
-                action="account_reactivated",
-            ).exists()
-        )
-
-    def test_account_reactivation_requires_a_stored_credential(self):
+    def test_archive_controls_are_removed_and_existing_inactive_rows_are_read_only(self):
         self.login()
         self.account.is_active = False
         self.account.save(update_fields=("is_active", "updated_at"))
-        self.credential.delete()
-
-        response = self.client.post(
-            reverse("controller:account_reactivate", args=[self.account.pk]),
-            follow=True,
+        list_response = self.client.get(reverse("controller:account_list"))
+        detail_response = self.client.get(
+            reverse("controller:account_detail", args=[self.account.pk])
         )
 
+        self.assertContains(list_response, "Inactive legacy record")
+        self.assertNotContains(detail_response, "Archive account")
+        self.assertNotContains(detail_response, "Reactivate account")
+        self.assertEqual(
+            self.client.get(reverse("controller:account_edit", args=[self.account.pk])).status_code,
+            404,
+        )
+        self.assertEqual(self.client.post(f"/accounts/{self.account.pk}/archive/").status_code, 404)
+        self.assertEqual(self.client.post(f"/accounts/{self.account.pk}/reactivate/").status_code, 404)
+
+    def test_inactive_account_channel_selection_post_is_read_only(self):
+        self.login()
+        self.account.is_active = False
+        self.account.save(update_fields=("is_active", "updated_at"))
+        old_revision = self.account.channel_revision
+
+        response = self.client.post(
+            reverse("controller:account_channel_selection", args=[self.account.pk]),
+            {
+                "mode": AccountChannelSelection.Mode.CUSTOM,
+                "preset": "",
+                "custom_channels": "crafted_channel",
+            },
+        )
+
+        self.assertEqual(response.status_code, 404)
         self.account.refresh_from_db()
-        self.assertFalse(self.account.is_active)
-        self.assertContains(response, "Add a Twitch password before reactivating")
+        self.account.selection.refresh_from_db()
+        self.assertEqual(self.account.selection.mode, AccountChannelSelection.Mode.DEFAULT)
+        self.assertEqual(self.account.channel_revision, old_revision)
+        self.assertFalse(self.account.custom_channels.exists())
         self.assertFalse(
             ActionLog.objects.filter(
                 account=self.account,
-                action="account_reactivated",
+                action="channel_selection_changed",
             ).exists()
+        )
+
+    def test_account_list_rows_link_to_open_without_an_edit_button(self):
+        self.login()
+
+        response = self.client.get(reverse("controller:account_list"))
+
+        self.assertContains(
+            response,
+            f'<a class="button button--quiet" href="{reverse("controller:account_detail", args=[self.account.pk])}">Open</a>',
+            html=True,
+        )
+        self.assertNotContains(
+            response,
+            f'<a class="button button--quiet" href="{reverse("controller:account_edit", args=[self.account.pk])}">Edit</a>',
+            html=True,
         )
 
     def test_account_info_fragment_is_no_store_and_never_discloses_secrets(self):
@@ -520,6 +558,32 @@ class WebViewTests(TestCase):
         self.assertEqual(MinerCommand.objects.count(), 1)
         self.assertEqual(MinerCommand.objects.get().account, self.account)
 
+        MinerCommand.objects.all().delete()
+        response = self.client.post(
+            reverse("controller:global_action", args=[MinerCommand.Action.RESTART])
+        )
+        self.assertRedirects(response, reverse("controller:dashboard"))
+        self.assertEqual(MinerCommand.objects.get().action, MinerCommand.Action.RESTART)
+
+    def test_bot_log_view_is_bounded_escaped_and_reports_worker_health(self):
+        self.login()
+        WorkerLease.objects.create(
+            owner_id="worker-test",
+            expires_at=timezone.now() + timedelta(seconds=30),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "twitch-farm.log"
+            log_path.write_text("first line\n<script>alert(1)</script>\n", encoding="utf-8")
+            with self.settings(TWITCH_FARM_LOG_FILE=log_path):
+                response = self.client.get(reverse("controller:bot_logs"))
+                tail = self.client.get(reverse("controller:bot_log_tail"))
+
+        self.assertContains(response, "Supervisor online")
+        self.assertContains(response, "first line")
+        self.assertContains(response, "&lt;script&gt;alert(1)&lt;/script&gt;")
+        self.assertNotContains(response, "<script>alert(1)</script>")
+        self.assertContains(tail, 'data-bot-log-fragment')
+
     def test_mutation_rejects_missing_csrf_token(self):
         client = Client(enforce_csrf_checks=True)
         client.force_login(self.staff)
@@ -564,6 +628,10 @@ class WebViewTests(TestCase):
         action = ActionLog.objects.get(action="farm_settings_updated")
         self.assertEqual(action.actor, self.staff)
         self.assertEqual(action.details["default_channels"], ["Warframe", "TwitchDrops"])
+
+        page = self.client.get(reverse("controller:settings_general"))
+        self.assertContains(page, "data-channel-editor-root")
+        self.assertContains(page, "Ordered default channels")
 
     def test_general_settings_requires_csrf_for_staff_mutation(self):
         client = Client(enforce_csrf_checks=True)
@@ -750,6 +818,15 @@ class WebViewTests(TestCase):
                 account=self.account,
                 action=MinerCommand.Action.RESTART,
             ).exists()
+        )
+        detail = self.client.get(reverse("controller:preset_detail", args=[preset.pk]))
+        self.assertContains(detail, "Edit preset")
+        self.assertContains(detail, "Save preset")
+        self.assertContains(detail, "data-channel-editor-root")
+        self.assertContains(detail, "data-channel-list")
+        self.assertEqual(
+            self.client.get(reverse("controller:preset_edit", args=[preset.pk])).status_code,
+            405,
         )
 
     def test_preset_page_initial_html_shows_only_assignable_public_usernames(self):
