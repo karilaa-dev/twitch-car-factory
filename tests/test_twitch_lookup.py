@@ -94,3 +94,18 @@ def test_lookup_marks_only_malformed_batch_item_as_unverified():
         "unknown_shape": TwitchLookupStatus.UNVERIFIED,
         "twitch": TwitchLookupStatus.EXISTS,
     }
+
+
+def test_lookup_marks_graphql_item_error_as_unverified_even_with_null_user():
+    response = FakeResponse(
+        [
+            {
+                "errors": [{"message": "Temporarily rate limited"}],
+                "data": {"user": None},
+            }
+        ]
+    )
+    with patch("controller.twitch_lookup.urlopen", return_value=response):
+        result = lookup_twitch_names(["temporarily_unknown"])
+
+    assert result == {"temporarily_unknown": TwitchLookupStatus.UNVERIFIED}

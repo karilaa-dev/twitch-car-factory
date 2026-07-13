@@ -6,6 +6,7 @@ import tempfile
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.contrib.messages import get_messages
 from django.test import Client, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -849,6 +850,32 @@ class WebViewTests(TestCase):
                     response,
                     "Saved, but Twitch could not verify these channels right now:",
                 )
+
+    def test_account_channel_warning_is_queued_before_success(self):
+        self.login()
+        self.lookup_twitch_names.side_effect = lambda names: {
+            name: TwitchLookupStatus.UNVERIFIED for name in names
+        }
+
+        response = self.client.post(
+            reverse("controller:account_channel_selection", args=[self.account.pk]),
+            {
+                "mode": AccountChannelSelection.Mode.CUSTOM,
+                "preset": "",
+                "custom_channels": "unverified_custom",
+            },
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(
+            [str(message) for message in get_messages(response.wsgi_request)],
+            [
+                "Saved, but Twitch could not verify these channels right now: "
+                "unverified_custom.",
+                "Channel source saved. A restart was queued if the account is meant "
+                "to be running.",
+            ],
+        )
 
     def test_general_settings_requires_csrf_for_staff_mutation(self):
         client = Client(enforce_csrf_checks=True)

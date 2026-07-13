@@ -579,11 +579,11 @@ def account_channel_selection(request: HttpRequest, pk: int) -> HttpResponse:
             _account_detail_context(telemetry_account, selection_form=form),
             status=400,
         )
+    _warn_unverified_channels(request, form)
     messages.success(
         request,
         "Channel source saved. A restart was queued if the account is meant to be running.",
     )
-    _warn_unverified_channels(request, form)
     return redirect("controller:account_detail", pk=account.pk)
 
 

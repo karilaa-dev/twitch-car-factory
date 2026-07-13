@@ -55,6 +55,9 @@ def _lookup_batch(names: tuple[str, ...]) -> dict[str, TwitchLookupStatus]:
         if not isinstance(item, dict):
             statuses[name] = TwitchLookupStatus.UNVERIFIED
             continue
+        if item.get("errors"):
+            statuses[name] = TwitchLookupStatus.UNVERIFIED
+            continue
         data = item.get("data")
         if not isinstance(data, dict) or "user" not in data:
             statuses[name] = TwitchLookupStatus.UNVERIFIED

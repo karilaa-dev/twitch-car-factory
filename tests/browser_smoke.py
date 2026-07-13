@@ -150,6 +150,35 @@ def main() -> None:
         page.wait_for_load_state("networkidle")
         assert page.get_by_role("heading", name="Edit preset").is_visible()
         editor = page.locator("[data-channel-editor]")
+        page.evaluate(
+            """
+            () => {
+              const originalFetch = window.fetch;
+              window.fetch = () => new Promise((resolve) => {
+                window.__completeChannelCheck = () => resolve(new Response(
+                  JSON.stringify({ status: "exists" }),
+                  { status: 200, headers: { "Content-Type": "application/json" } },
+                ));
+              });
+              window.__restoreChannelFetch = () => { window.fetch = originalFetch; };
+            }
+            """
+        )
+        editor.get_by_label("Add channel").fill("pending_smoke_channel")
+        editor.get_by_role("button", name="Add channel").click()
+        assert editor.get_by_role("button", name="Add channel").is_disabled()
+        editor_url = page.url
+        page.get_by_role("button", name="Save preset").click()
+        assert page.url == editor_url
+        assert "Wait for the Twitch channel check" in editor.locator(
+            "[data-channel-feedback]"
+        ).inner_text()
+        page.evaluate("window.__completeChannelCheck()")
+        editor.get_by_text("pending_smoke_channel", exact=True).wait_for()
+        page.evaluate("window.__restoreChannelFetch()")
+        editor.locator(".channel-editor__row").filter(
+            has_text="pending_smoke_channel"
+        ).get_by_role("button", name="Remove").click()
         editor.get_by_label("Add channel").fill("smoke_staged_channel")
         editor.get_by_role("button", name="Add channel").click()
         editor.get_by_text("smoke_staged_channel", exact=True).wait_for()

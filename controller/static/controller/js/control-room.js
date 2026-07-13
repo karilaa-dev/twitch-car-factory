@@ -512,7 +512,17 @@
       event.preventDefault();
       void addChannel();
     });
-    root.closest("form")?.addEventListener("submit", sync);
+    root.closest("form")?.addEventListener("submit", (event) => {
+      if (verificationPending) {
+        event.preventDefault();
+        announce(
+          "Wait for the Twitch channel check to finish before saving.",
+          "warning",
+        );
+        return;
+      }
+      sync();
+    });
 
     // Django keeps the source textarea required for the no-JavaScript path.
     // Once enhanced, let server validation report an empty staged list instead
