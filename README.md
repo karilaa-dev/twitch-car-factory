@@ -66,6 +66,18 @@ TWITCH_FARM_LOG_WRITER=1 uv run python manage.py run_miner_worker
 Open <http://127.0.0.1:8000/>, sign in with the staff account, configure default
 channels under **Settings → General**, and add Twitch accounts from **Accounts**.
 
+For UI development, populate seven fake accounts covering every observed
+runtime state (starting, running, stopping, stopped, restarting, degraded, and
+unknown):
+
+```bash
+uv run python manage.py seed_demo_data
+```
+
+The command is repeatable, uses only `demo-` account keys, and refuses to run
+when `DJANGO_DEBUG` is disabled. The fake credentials are display fixtures and
+must never be used with Twitch.
+
 ## Credential encryption keys
 
 `TWITCH_FARM_CREDENTIAL_KEYS` is a comma-separated Fernet keyring. The first key

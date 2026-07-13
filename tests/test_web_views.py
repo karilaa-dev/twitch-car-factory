@@ -192,7 +192,7 @@ class WebViewTests(TestCase):
         self.assertContains(response, "exact_second")
         self.assertContains(response, incident.summary)
         self.assertContains(response, "Supervisor online")
-        self.assertContains(response, "Incident open")
+        self.assertNotContains(response, "Incident open")
         self.assertNotContains(response, "<th scope=\"col\">Process</th>")
         self.assertNotContains(response, "pid 4321")
         self.assertNotContains(response, "pid 987")
@@ -411,6 +411,22 @@ class WebViewTests(TestCase):
         )
         self.assertEqual(self.client.post(f"/accounts/{self.account.pk}/archive/").status_code, 404)
         self.assertEqual(self.client.post(f"/accounts/{self.account.pk}/reactivate/").status_code, 404)
+
+    def test_account_list_rows_link_to_open_without_an_edit_button(self):
+        self.login()
+
+        response = self.client.get(reverse("controller:account_list"))
+
+        self.assertContains(
+            response,
+            f'<a class="button button--quiet" href="{reverse("controller:account_detail", args=[self.account.pk])}">Open</a>',
+            html=True,
+        )
+        self.assertNotContains(
+            response,
+            f'<a class="button button--quiet" href="{reverse("controller:account_edit", args=[self.account.pk])}">Edit</a>',
+            html=True,
+        )
 
     def test_account_info_fragment_is_no_store_and_never_discloses_secrets(self):
         self.login()

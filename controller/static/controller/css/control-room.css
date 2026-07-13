@@ -1922,6 +1922,16 @@ input[type="checkbox"] {
     font-weight: 700;
   }
 
+  .account-table td[data-label="Current status"],
+  .account-table td[data-label="Credential"] {
+    grid-template-columns: 1fr;
+  }
+
+  .account-table td[data-label="Current status"] .status-chip,
+  .account-table td[data-label="Credential"] .status-chip {
+    width: 100%;
+  }
+
   .manifest-row {
     grid-template-columns: 1fr;
     gap: 0.15rem;

@@ -6,10 +6,12 @@ decrypted in this dedicated child and never appear in argv or launch records.
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 from pathlib import Path
 import pickle
+import signal
 import sys
 from dataclasses import dataclass, field
 
@@ -23,6 +25,34 @@ class LaunchPayload:
     username: str
     password: str = field(repr=False)
     channels: tuple[str, ...]
+
+
+def configure_linux_parent_death_signal() -> None:
+    """Kill this miner if its process-owning supervisor disappears.
+
+    This runs after ``exec`` in the dedicated child instead of through
+    ``subprocess.Popen(preexec_fn=...)``. The supervisor drains miner output in
+    background threads, and Python code in a pre-exec child can deadlock when
+    the parent process is multithreaded.
+    """
+
+    parent_pid_value = os.environ.pop("TWITCH_FARM_SUPERVISOR_PID", None)
+    if not sys.platform.startswith("linux") or parent_pid_value is None:
+        return
+    try:
+        parent_pid = int(parent_pid_value)
+    except ValueError as exc:
+        raise RuntimeError("Supervisor PID must be a positive integer.") from exc
+    if parent_pid <= 0:
+        raise RuntimeError("Supervisor PID must be a positive integer.")
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGKILL) != 0:  # PR_SET_PDEATHSIG = 1
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+    # Close the race where the supervisor exits after Popen but before prctl.
+    if os.getppid() != parent_pid:
+        os.kill(os.getpid(), signal.SIGKILL)
 
 
 @sensitive_variables()
@@ -193,6 +223,7 @@ def run_miner(payload: LaunchPayload) -> None:
 def main(run_id: int, account_id: int) -> None:
     """Initialize Django, load the exact launch snapshot, and run the miner."""
 
+    configure_linux_parent_death_signal()
     os.environ.setdefault("DJANGO_SETTINGS_MODULE", "twitch_farm.settings")
     import django
 

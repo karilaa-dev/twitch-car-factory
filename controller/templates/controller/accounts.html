@@ -46,7 +46,6 @@
               <td data-label="Actions">
                 <div class="button-row">
                   <a class="button button--quiet" href="{% url 'controller:account_detail' row.account.pk %}">Open</a>
-                  {% if row.account.is_active %}<a class="button button--quiet" href="{% url 'controller:account_edit' row.account.pk %}">Edit</a>{% endif %}
                 </div>
               </td>
             </tr>

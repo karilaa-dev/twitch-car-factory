@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import pickle
+import signal
 import subprocess
 from datetime import timedelta
 
@@ -1330,7 +1332,11 @@ def test_archiving_closes_unowned_recovery_incident(tmp_path, settings):
 
 
 @pytest.mark.django_db
-def test_linux_children_receive_parent_death_signal_hook(tmp_path, settings, monkeypatch):
+def test_linux_children_configure_parent_death_without_preexec_fn(
+    tmp_path,
+    settings,
+    monkeypatch,
+):
     configure_farm()
     clock = FakeClock()
     factory = ProcessFactory()
@@ -1341,9 +1347,38 @@ def test_linux_children_receive_parent_death_signal_hook(tmp_path, settings, mon
         monkeypatch.setattr("controller.miner_supervisor.sys.platform", "linux")
         enqueue_command(account, MinerCommand.Action.START)
         supervisor.run_once(force_checks=True)
-        assert callable(factory.options[0]["preexec_fn"])
+        assert "preexec_fn" not in factory.options[0]
+        assert factory.options[0]["env"]["TWITCH_FARM_SUPERVISOR_PID"] == str(os.getpid())
     finally:
         supervisor.shutdown()
+
+
+def test_runner_configures_linux_parent_death_signal_after_exec(monkeypatch):
+    parent_pid = 4242
+    prctl_calls = []
+    kill_calls = []
+
+    class FakeLibc:
+        def prctl(self, option, death_signal):
+            prctl_calls.append((option, death_signal))
+            return 0
+
+    monkeypatch.setattr(miner_runner.sys, "platform", "linux")
+    monkeypatch.setenv("TWITCH_FARM_SUPERVISOR_PID", str(parent_pid))
+    monkeypatch.setattr(miner_runner.ctypes, "CDLL", lambda *_args, **_kwargs: FakeLibc())
+    monkeypatch.setattr(miner_runner.os, "getppid", lambda: parent_pid + 1)
+    monkeypatch.setattr(miner_runner.os, "getpid", lambda: 5252)
+    monkeypatch.setattr(
+        miner_runner.os,
+        "kill",
+        lambda pid, death_signal: kill_calls.append((pid, death_signal)),
+    )
+
+    miner_runner.configure_linux_parent_death_signal()
+
+    assert prctl_calls == [(1, signal.SIGKILL)]
+    assert kill_calls == [(5252, signal.SIGKILL)]
+    assert "TWITCH_FARM_SUPERVISOR_PID" not in os.environ
 
 
 @pytest.mark.django_db

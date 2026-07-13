@@ -70,7 +70,6 @@
               </td>
               <td data-label="Status">
                 <span class="status-chip" data-tone="{{ row.observed|state_tone }}">{{ row.observed }}</span>
-                {% if row.open_incident %}<span class="status-chip" data-tone="danger">Incident open</span>{% endif %}
               </td>
               <td data-label="Source">
                 <span class="source-label">{{ row.source_label }}</span>

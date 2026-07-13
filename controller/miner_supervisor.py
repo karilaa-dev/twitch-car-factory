@@ -9,11 +9,9 @@ and keeps retrying without turning a broken miner into a tight restart loop.
 from __future__ import annotations
 
 import fcntl
-import ctypes
 import logging
 import os
 import re
-import signal
 import subprocess
 import sys
 import threading
@@ -211,27 +209,6 @@ def _drain_miner_output(stream: IO[str], account_key: str) -> None:
             stream.close()
         except (OSError, ValueError):
             pass
-
-
-def linux_parent_death_hook(parent_pid: int) -> Callable[[], None]:
-    """Return a child-side hook that prevents orphan miners on Linux.
-
-    ``PR_SET_PDEATHSIG`` is inherited across ``exec``.  SIGKILL is intentional:
-    this path is only used when the supervisor itself disappears without its
-    normal ten-second graceful shutdown, and even the fake miner's
-    ``ignore-term`` mode must not survive as an unowned process.  Comparing the
-    actual parent PID closes the small race between ``fork`` and ``prctl`` and
-    still works when the supervisor legitimately runs as container PID 1.
-    """
-
-    def configure_parent_death_signal() -> None:
-        libc = ctypes.CDLL(None, use_errno=True)
-        if libc.prctl(1, signal.SIGKILL) != 0:  # PR_SET_PDEATHSIG = 1
-            os._exit(127)
-        if os.getppid() != parent_pid:
-            os.kill(os.getpid(), signal.SIGKILL)
-
-    return configure_parent_death_signal
 
 
 class MinerSupervisor:
@@ -837,7 +814,10 @@ class MinerSupervisor:
                 "bufsize": 1,
             }
             if sys.platform.startswith("linux"):
-                popen_options["preexec_fn"] = linux_parent_death_hook(os.getpid())
+                # The child installs PR_SET_PDEATHSIG at the top of its Python
+                # entry point. Avoid preexec_fn here: output-draining threads
+                # make running Python code between fork and exec unsafe.
+                child_environment["TWITCH_FARM_SUPERVISOR_PID"] = str(os.getpid())
             process = self.process_factory(self.build_process_command(run), **popen_options)
         except Exception as exc:
             error = safe_error(exc)
