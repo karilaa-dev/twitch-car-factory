@@ -21,19 +21,19 @@
       <section class="panel" aria-labelledby="preset-editor-title">
         <header class="panel__header"><h2 id="preset-editor-title">Edit preset</h2><span class="status-chip">Staged changes</span></header>
         <div class="panel__body">
-          <form class="form-grid" method="post" action="{% url 'controller:preset_edit' preset.pk %}" data-preset-form>
+          <form class="form-grid" method="post" action="{% url 'controller:preset_edit' preset.pk %}">
             {% csrf_token %}
-            {% if editor_form.non_field_errors %}<div class="message error" role="alert">{{ editor_form.non_field_errors }}</div>{% endif %}
+            {% include "controller/_form_error_summary.html" with form=editor_form %}
             <div class="field">
               <label for="{{ editor_form.name.id_for_label }}">Preset name</label>
               {{ editor_form.name }}
               {{ editor_form.name.errors }}
             </div>
-            {% include "controller/_preset_channel_editor.html" with form=editor_form %}
+            {% include "controller/_channel_editor.html" with field=editor_form.channels label="Ordered channels" %}
             <button class="button button--primary" type="submit">Save preset</button>
           </form>
         </div>
-        <footer class="panel__footer">Add and delete operations remain local until Save preset validates the complete ordered list.</footer>
+        <footer class="panel__footer">Add, reorder, and remove operations remain staged until Save preset validates the complete list.</footer>
       </section>
 
       <section class="panel" aria-labelledby="assign-title">

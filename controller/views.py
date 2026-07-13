@@ -284,6 +284,15 @@ def account_list(request: HttpRequest) -> HttpResponse:
     )
 
 
+def _channel_source_context() -> dict:
+    return {
+        "channel_source_presets": ChannelPreset.objects.prefetch_related("channels").order_by(
+            "name"
+        ),
+        "farm_default_channels": tuple(FarmConfiguration.load().default_channels),
+    }
+
+
 @staff_member_required(login_url=CONTROL_LOGIN_URL)
 @sensitive_post_parameters("password")
 def account_create(request: HttpRequest) -> HttpResponse:
@@ -316,7 +325,7 @@ def account_create(request: HttpRequest) -> HttpResponse:
             return render(
                 request,
                 "controller/account_form.html",
-                {"form": form, "account": None},
+                {"form": form, "account": None, **_channel_source_context()},
                 status=500,
             )
         else:
@@ -325,7 +334,7 @@ def account_create(request: HttpRequest) -> HttpResponse:
     return render(
         request,
         "controller/account_form.html",
-        {"form": form, "account": None},
+        {"form": form, "account": None, **_channel_source_context()},
         status=400 if request.method == "POST" else 200,
     )
 
@@ -416,6 +425,7 @@ def _account_detail_context(
         .order_by("-opened_at")[:20],
         "runs": account.runs.order_by("-started_at")[:12],
         "commands": account.commands.select_related("actor").order_by("-created_at")[:10],
+        **_channel_source_context(),
     }
 
 

@@ -4,21 +4,20 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#0b0e0d">
+  <meta name="theme-color" content="#0b0d12">
   <title>{% block title %}Control Room{% endblock %} · Twitch Farm</title>
   <link rel="stylesheet" href="{% static 'controller/css/control-room.css' %}">
   {% block head %}{% endblock %}
 </head>
 <body>
-  <a class="skip-link" href="#main-content">Skip to control surface</a>
-  <div class="caution-rail" aria-hidden="true"></div>
+  <a class="skip-link" href="#main-content">Skip to main content</a>
   <header class="site-header">
     <div class="header-inner">
       <a class="brand" href="{% url 'controller:dashboard' %}" aria-label="Twitch Farm control room home">
-        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-mark" aria-hidden="true">TF</span>
         <span class="brand-copy">
           <strong>Twitch Farm</strong>
-          <small>Process control / 01</small>
+          <small>Control room</small>
         </span>
       </a>
 
@@ -55,9 +54,7 @@
     {% block content %}{% endblock %}
   </main>
 
-  <footer class="site-footer">
-    Shared operator state · encrypted credentials · durable command ledger · process ownership isolated to supervisor
-  </footer>
+  <footer class="site-footer">Twitch Farm control room · Staff access only</footer>
   {% block scripts %}
     <script src="{% static 'controller/js/control-room.js' %}" defer></script>
   {% endblock %}

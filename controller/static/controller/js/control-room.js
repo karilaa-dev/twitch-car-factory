@@ -1,10 +1,6 @@
 (() => {
   "use strict";
 
-  const observer = "ResizeObserver" in window
-    ? new ResizeObserver((entries) => entries.forEach(({ target }) => fit(target)))
-    : null;
-
   const fit = (container) => {
     const items = [...container.querySelectorAll("[data-channel-item]")];
     const more = container.querySelector("[data-channel-more]");
@@ -14,13 +10,17 @@
     more.hidden = true;
     if (container.scrollWidth <= container.clientWidth) return;
 
+    more.hidden = false;
     for (let visible = items.length - 1; visible >= 0; visible -= 1) {
       items.forEach((item, index) => { item.hidden = index >= visible; });
-      more.textContent = `and ${items.length - visible} more`;
-      more.hidden = false;
+      more.textContent = `+${items.length - visible} more`;
       if (container.scrollWidth <= container.clientWidth) break;
     }
   };
+
+  const observer = "ResizeObserver" in window
+    ? new ResizeObserver((entries) => entries.forEach(({ target }) => fit(target)))
+    : null;
 
   const initialize = (root = document) => {
     root.querySelectorAll("[data-channel-overflow]").forEach((container) => {
@@ -94,6 +94,16 @@
           indicator.textContent = "";
           indicator.removeAttribute("data-state");
         }
+        clone.querySelectorAll("[data-channel-overflow]").forEach((container) => {
+          container.querySelectorAll("[data-channel-item]").forEach((item) => {
+            item.hidden = false;
+          });
+          const more = container.querySelector("[data-channel-more]");
+          if (more) {
+            more.hidden = true;
+            more.textContent = "";
+          }
+        });
         return clone.innerHTML;
       };
       if (comparableMarkup(current) !== comparableMarkup(incoming)) {
@@ -133,28 +143,51 @@
       });
     };
 
+    const presetSelect = form.querySelector('[data-source-field="preset"] select');
+    const presetPreview = form.querySelector("[data-preset-preview]");
+    const updatePresetPreview = () => {
+      if (!presetSelect || !presetPreview) return;
+      const selected = presetSelect.value;
+      let matched = false;
+      presetPreview.querySelectorAll("[data-preset-option]").forEach((option) => {
+        const visible = option.dataset.presetId === selected;
+        option.hidden = !visible;
+        matched ||= visible;
+      });
+      const empty = presetPreview.querySelector("[data-preset-empty]");
+      if (empty) empty.hidden = matched;
+    };
+
     modeInputs.forEach((input) => input.addEventListener("change", update));
+    presetSelect?.addEventListener("change", updatePresetPreview);
     update();
+    updatePresetPreview();
   });
 })();
 
 (() => {
   "use strict";
 
-  document.querySelectorAll("[data-preset-form]").forEach((form) => {
-    const source = form.querySelector("[data-preset-channel-source]");
+  document.querySelectorAll("[data-channel-editor-root]").forEach((root) => {
+    const source = root.querySelector("[data-channel-editor-source]");
     const textarea = source?.querySelector("textarea");
-    const editor = form.querySelector("[data-preset-channel-editor]");
-    const input = editor?.querySelector("[data-preset-channel-input]");
-    const addButton = editor?.querySelector("[data-preset-channel-add]");
-    const list = editor?.querySelector("[data-preset-channel-list]");
-    const feedback = editor?.querySelector("[data-preset-channel-feedback]");
+    const editor = root.querySelector("[data-channel-editor]");
+    const input = editor?.querySelector("[data-channel-input]");
+    const addButton = editor?.querySelector("[data-channel-add]");
+    const list = editor?.querySelector("[data-channel-list]");
+    const feedback = editor?.querySelector("[data-channel-feedback]");
     if (!source || !textarea || !editor || !input || !addButton || !list || !feedback) return;
 
+    const seen = new Set();
     let channels = textarea.value
       .split(/[,\r\n]+/)
       .map((value) => value.trim())
-      .filter(Boolean);
+      .filter((value) => {
+        const key = value.toLocaleLowerCase();
+        if (!value || seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
 
     const sync = () => { textarea.value = channels.join("\n"); };
     const announce = (message, error = false) => {
@@ -162,53 +195,85 @@
       feedback.dataset.tone = error ? "danger" : "neutral";
     };
 
-    const render = () => {
+    const makeButton = (label, action, index, disabled = false) => {
+      const button = document.createElement("button");
+      button.className = action === "remove"
+        ? "button button--quiet button--danger"
+        : "button button--quiet";
+      button.type = "button";
+      button.textContent = label;
+      button.disabled = disabled;
+      button.dataset.channelAction = action;
+      button.dataset.channelIndex = String(index);
+      button.setAttribute("aria-label", `${label} ${channels[index]}`);
+      return button;
+    };
+
+    const render = (focusTarget = null) => {
       list.replaceChildren();
       channels.forEach((channel, index) => {
         const row = document.createElement("li");
-        row.className = "preset-channel-row";
+        row.className = "channel-editor__row";
 
         const identity = document.createElement("span");
-        identity.className = "preset-channel-row__identity";
-        identity.innerHTML = `<span class="preset-channel-row__position">${String(index + 1).padStart(2, "0")}</span>`;
+        identity.className = "channel-editor__identity";
+        const position = document.createElement("span");
+        position.className = "channel-editor__position";
+        position.textContent = String(index + 1);
+        position.setAttribute("aria-hidden", "true");
         const tag = document.createElement("span");
         tag.className = "channel-tag";
         tag.textContent = channel;
-        identity.append(tag);
+        identity.append(position, tag);
 
-        const remove = document.createElement("button");
-        remove.className = "button button--quiet button--danger";
-        remove.type = "button";
-        remove.textContent = "Delete";
-        let confirmationTimer = null;
-        remove.addEventListener("click", () => {
-          if (remove.dataset.confirming === "true") {
-            window.clearTimeout(confirmationTimer);
-            channels.splice(index, 1);
-            sync();
-            render();
-            announce(`${channel} removed from the staged preset.`);
-            return;
-          }
-          remove.dataset.confirming = "true";
-          remove.textContent = "Confirm";
-          confirmationTimer = window.setTimeout(() => {
-            if (!remove.isConnected) return;
-            remove.dataset.confirming = "false";
-            remove.textContent = "Delete";
-          }, 5000);
-        });
+        const actions = document.createElement("span");
+        actions.className = "channel-editor__actions";
+        actions.append(
+          makeButton("Move up", "up", index, index === 0),
+          makeButton("Move down", "down", index, index === channels.length - 1),
+          makeButton("Remove", "remove", index),
+        );
 
-        row.append(identity, remove);
+        row.append(identity, actions);
         list.append(row);
       });
       if (!channels.length) {
         const empty = document.createElement("li");
-        empty.className = "preset-channel-list__empty";
+        empty.className = "channel-editor__empty";
         empty.textContent = "No channels staged. Add at least one before saving.";
         list.append(empty);
       }
+
+      if (focusTarget) {
+        const target = list.querySelector(
+          `[data-channel-action="${focusTarget.action}"][data-channel-index="${focusTarget.index}"]`,
+        );
+        (target || input).focus();
+      }
     };
+
+    list.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-channel-action]");
+      if (!button || button.disabled) return;
+      const index = Number(button.dataset.channelIndex);
+      const action = button.dataset.channelAction;
+      const channel = channels[index];
+
+      if (action === "remove") {
+        channels.splice(index, 1);
+        sync();
+        render(channels.length ? { index: Math.min(index, channels.length - 1), action: "remove" } : null);
+        announce(`${channel} removed from the staged list.`);
+        if (!channels.length) input.focus();
+        return;
+      }
+
+      const nextIndex = action === "up" ? index - 1 : index + 1;
+      [channels[index], channels[nextIndex]] = [channels[nextIndex], channels[index]];
+      sync();
+      render({ index: nextIndex, action });
+      announce(`${channel} moved to position ${nextIndex + 1}.`);
+    });
 
     const addChannel = () => {
       const channel = input.value.trim();
@@ -218,7 +283,7 @@
         return;
       }
       if (channels.some((existing) => existing.toLowerCase() === channel.toLowerCase())) {
-        announce(`${channel} is already in this preset.`, true);
+        announce(`${channel} is already in this list.`, true);
         input.select();
         return;
       }
@@ -226,7 +291,7 @@
       input.value = "";
       sync();
       render();
-      announce(`${channel} added to the staged preset.`);
+      announce(`${channel} added at position ${channels.length}.`);
       input.focus();
     };
 
@@ -236,11 +301,29 @@
       event.preventDefault();
       addChannel();
     });
-    form.addEventListener("submit", sync);
+    root.closest("form")?.addEventListener("submit", sync);
 
     source.hidden = true;
     editor.hidden = false;
     render();
+  });
+})();
+
+(() => {
+  "use strict";
+  const summary = document.querySelector("[data-error-summary]");
+  if (!summary) return;
+  summary.focus();
+  summary.addEventListener("click", (event) => {
+    const link = event.target.closest('a[href^="#"]');
+    if (!link) return;
+    const target = document.querySelector(link.getAttribute("href"));
+    const editorRoot = target?.closest("[data-channel-editor-root]");
+    const editorInput = editorRoot?.querySelector("[data-channel-input]");
+    if (target?.closest("[data-channel-editor-source]")?.hidden && editorInput) {
+      event.preventDefault();
+      editorInput.focus();
+    }
   });
 })();
 

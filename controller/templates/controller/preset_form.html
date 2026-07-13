@@ -21,15 +21,15 @@
     <section class="panel" aria-labelledby="editor-title">
       <header class="panel__header"><h2 id="editor-title">Preset specification</h2></header>
       <div class="panel__body">
-        <form class="form-grid" method="post" data-preset-form>
+        <form class="form-grid" method="post">
           {% csrf_token %}
-          {% if form.non_field_errors %}<div class="message error" role="alert">{{ form.non_field_errors }}</div>{% endif %}
+          {% include "controller/_form_error_summary.html" with form=form %}
           <div class="field">
             <label for="{{ form.name.id_for_label }}">Preset name</label>
             {{ form.name }}
             {{ form.name.errors }}
           </div>
-          {% include "controller/_preset_channel_editor.html" with form=form %}
+          {% include "controller/_channel_editor.html" with field=form.channels label="Ordered channels" %}
           <div class="button-row">
             <button class="button button--primary" type="submit">{% if preset %}Save preset{% else %}Create preset{% endif %}</button>
             <a class="button button--quiet" href="{% if preset %}{% url 'controller:preset_detail' preset.pk %}{% else %}{% url 'controller:preset_list' %}{% endif %}">Cancel</a>

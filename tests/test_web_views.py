@@ -186,12 +186,21 @@ class WebViewTests(TestCase):
         response = self.client.get(reverse("controller:dashboard"))
 
         self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "Current status")
+        self.assertContains(response, "<th scope=\"col\">Status</th>")
         self.assertContains(response, "Default")
         self.assertContains(response, "exact_first")
         self.assertContains(response, "exact_second")
         self.assertContains(response, incident.summary)
         self.assertContains(response, "Supervisor online")
+        self.assertContains(response, "Incident open")
+        self.assertNotContains(response, "<th scope=\"col\">Process</th>")
+        self.assertNotContains(response, "pid 4321")
+        self.assertNotContains(response, "pid 987")
+
+        detail = self.client.get(
+            reverse("controller:account_detail", args=[self.account.pk])
+        )
+        self.assertContains(detail, "pid 4321")
 
     def test_status_fragment_is_authenticated_and_contains_no_page_shell(self):
         self.login()
@@ -270,6 +279,25 @@ class WebViewTests(TestCase):
         form = response.context["form"]
         self.assertEqual(form["mode"].value(), AccountChannelSelection.Mode.DEFAULT)
         self.assertTrue(form["start_after_save"].value())
+        self.assertContains(response, "data-channel-editor-root")
+        self.assertContains(response, "data-preset-preview")
+
+    def test_account_source_page_prefetches_ordered_preset_preview(self):
+        self.login()
+        preset = self.create_preset(
+            name="Preview rotation",
+            channels=["preview_one", "preview_two"],
+        )
+
+        response = self.client.get(
+            reverse("controller:account_detail", args=[self.account.pk])
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'data-preset-id="%s"' % preset.pk)
+        self.assertContains(response, "preview_one")
+        self.assertContains(response, "preview_two")
+        self.assertContains(response, "data-channel-editor-root")
 
     def test_invalid_account_form_never_echoes_submitted_password(self):
         self.login()
@@ -538,6 +566,10 @@ class WebViewTests(TestCase):
         self.assertEqual(action.actor, self.staff)
         self.assertEqual(action.details["default_channels"], ["Warframe", "TwitchDrops"])
 
+        page = self.client.get(reverse("controller:settings_general"))
+        self.assertContains(page, "data-channel-editor-root")
+        self.assertContains(page, "Ordered default channels")
+
     def test_general_settings_requires_csrf_for_staff_mutation(self):
         client = Client(enforce_csrf_checks=True)
         client.force_login(self.staff)
@@ -727,7 +759,8 @@ class WebViewTests(TestCase):
         detail = self.client.get(reverse("controller:preset_detail", args=[preset.pk]))
         self.assertContains(detail, "Edit preset")
         self.assertContains(detail, "Save preset")
-        self.assertContains(detail, "data-preset-channel-editor")
+        self.assertContains(detail, "data-channel-editor-root")
+        self.assertContains(detail, "data-channel-list")
         self.assertEqual(
             self.client.get(reverse("controller:preset_edit", args=[preset.pk])).status_code,
             405,

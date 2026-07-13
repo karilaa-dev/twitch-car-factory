@@ -34,7 +34,7 @@
       <span class="status-copy">
         <strong>{{ supervisor.label }}</strong>
         <small>
-          owner {{ supervisor.owner_id }}{% if supervisor.pid %} · pid {{ supervisor.pid }}{% endif %}
+          owner {{ supervisor.owner_id }}
           {% if supervisor.heartbeat_at %} · heartbeat {{ supervisor.heartbeat_at|timesince }} ago{% endif %}
         </small>
       </span>
@@ -50,14 +50,13 @@
 
   {% if account_rows %}
     <div class="machine-table-wrap">
-      <table class="machine-table">
+      <table class="machine-table runtime-table">
         <thead>
           <tr>
             <th scope="col">Account</th>
-            <th scope="col">Current status</th>
-            <th scope="col">Launch source</th>
+            <th scope="col">Status</th>
+            <th scope="col">Source</th>
             <th scope="col">Channels</th>
-            <th scope="col">Process</th>
             <th scope="col">Controls</th>
           </tr>
         </thead>
@@ -69,10 +68,11 @@
                   <a href="{% url 'controller:account_detail' row.account.pk %}">{{ row.account.config_key }}</a>
                 </span>
               </td>
-              <td data-label="Current status">
+              <td data-label="Status">
                 <span class="status-chip" data-tone="{{ row.observed|state_tone }}">{{ row.observed }}</span>
+                {% if row.open_incident %}<span class="status-chip" data-tone="danger">Incident open</span>{% endif %}
               </td>
-              <td data-label="Launch source">
+              <td data-label="Source">
                 <span class="source-label">{{ row.source_label }}</span>
               </td>
               <td data-label="Channels">
@@ -81,10 +81,6 @@
                 {% else %}
                   <span class="faint">No channels configured</span>
                 {% endif %}
-              </td>
-              <td data-label="Process">
-                {% if row.pid %}<span class="mono">pid {{ row.pid }}</span>{% else %}<span class="faint">unassigned</span>{% endif %}
-                {% if row.open_incident %}<br><span class="status-chip" data-tone="danger">incident open</span>{% endif %}
               </td>
               <td data-label="Controls">
                 <div class="button-row">

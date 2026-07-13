@@ -53,8 +53,52 @@
     </div>
   </dl>
 
-  <div class="detail-layout" style="margin-top: 1rem;">
+  <div class="detail-layout account-detail-layout">
     <div class="stack">
+      {% if account.is_active %}
+        <section class="panel panel--prominent" aria-labelledby="selection-title">
+          <header class="panel__header">
+            <div>
+              <p class="panel-kicker">Next launch</p>
+              <h2 id="selection-title">Change channel source</h2>
+            </div>
+            <span class="status-chip">Current: {{ planned_source.mode }}</span>
+          </header>
+          <div class="panel__body">
+            <form class="form-grid" method="post" action="{% url 'controller:account_channel_selection' account.pk %}" data-channel-source-form>
+              {% csrf_token %}
+              {% include "controller/_form_error_summary.html" with form=selection_form %}
+              <div class="current-source-summary">
+                <div>
+                  <span class="field-help">Currently selected</span>
+                  <strong>{{ planned_source.name }}</strong>
+                </div>
+                {% if planned_source.channels %}
+                  <div class="channel-trace" aria-label="Current source channels">
+                    {% for channel in planned_source.channels %}<span class="channel-tag">{{ channel }}</span>{% endfor %}
+                  </div>
+                {% endif %}
+              </div>
+              {% include "controller/_channel_source_fields.html" with form=selection_form %}
+              <div class="button-row">
+                <button class="button button--primary" type="submit">Save channel source</button>
+              </div>
+            </form>
+          </div>
+          <footer class="panel__footer">A desired-running account restarts only after the new channel list validates.</footer>
+        </section>
+      {% else %}
+        <section class="panel" aria-labelledby="source-title">
+          <header class="panel__header"><h2 id="source-title">Next launch source</h2></header>
+          <div class="panel__body current-source-summary">
+            <div><span class="field-help">Archived account</span><strong>{{ planned_source.name }}</strong></div>
+            <div class="channel-trace" aria-label="Selected source channels">
+              {% for channel in planned_source.channels %}<span class="channel-tag">{{ channel }}</span>{% empty %}<span class="faint">No channels configured</span>{% endfor %}
+            </div>
+          </div>
+        </section>
+      {% endif %}
+
       <section class="panel" aria-labelledby="manifest-title">
         <header class="panel__header">
           <h2 id="manifest-title">Active launch manifest</h2>
@@ -137,46 +181,6 @@
     </div>
 
     <aside class="stack">
-      <section class="panel" aria-labelledby="source-title">
-        <header class="panel__header"><h2 id="source-title">Next launch source</h2></header>
-        <div class="panel__body">
-          <p><span class="status-chip">{{ planned_source.mode }}</span> <strong>{{ planned_source.name }}</strong></p>
-          {% if planned_source.managed_externally %}
-            <p class="muted">Default channels are managed in Settings. The exact list is snapshotted when the worker validates the next launch.</p>
-          {% elif planned_source.channels %}
-            <div class="channel-trace">{% for channel in planned_source.channels %}<span class="channel-tag">{{ channel }}</span>{% endfor %}</div>
-          {% endif %}
-        </div>
-      </section>
-
-      {% if account.is_active %}<section class="panel" aria-labelledby="selection-title">
-        <header class="panel__header"><h2 id="selection-title">Change channel source</h2></header>
-        <div class="panel__body">
-          <form class="form-grid" method="post" action="{% url 'controller:account_channel_selection' account.pk %}" data-channel-source-form>
-            {% csrf_token %}
-            {% if selection_form.non_field_errors %}<div class="message error">{{ selection_form.non_field_errors }}</div>{% endif %}
-            <fieldset class="field" data-source-mode>
-              <legend>Source mode</legend>
-              <div class="choice-grid">{{ selection_form.mode }}</div>
-              {{ selection_form.mode.errors }}
-            </fieldset>
-            <div class="field" data-source-field="preset">
-              <label for="{{ selection_form.preset.id_for_label }}">Preset</label>
-              {{ selection_form.preset }}
-              {{ selection_form.preset.errors }}
-            </div>
-            <div class="field" data-source-field="custom">
-              <label for="{{ selection_form.custom_channels.id_for_label }}">Custom channels</label>
-              {{ selection_form.custom_channels }}
-              {% if selection_form.custom_channels.help_text %}<span class="field-help">{{ selection_form.custom_channels.help_text }}</span>{% endif %}
-              {{ selection_form.custom_channels.errors }}
-            </div>
-            <button class="button button--primary" type="submit">Commit source</button>
-          </form>
-        </div>
-        <footer class="panel__footer">A desired-running unit restarts only after the new channel list validates.</footer>
-      </section>{% endif %}
-
       <section class="panel" aria-labelledby="commands-title">
         <header class="panel__header"><h2 id="commands-title">Command queue</h2></header>
         <div class="panel__body">
