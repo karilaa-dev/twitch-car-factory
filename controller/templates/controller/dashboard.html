@@ -4,23 +4,23 @@
 {% block title %}Runtime board{% endblock %}
 
 {% block content %}
-  <header class="page-header">
+  <header class="page-header page-header--runtime">
     <div class="page-heading">
       <p class="eyebrow">Shared farm state</p>
       <h1>Runtime board</h1>
     </div>
-    <div class="actions" aria-label="Global miner controls">
+    <div class="actions actions--global" aria-label="Global miner controls">
       <form method="post" action="{% url 'controller:global_action' 'start' %}">
         {% csrf_token %}
-        <button class="button button--safe button--icon" type="submit">Start all</button>
+        <button class="button button--safe button--command button--start" type="submit">Start all</button>
       </form>
-      <form method="post" action="{% url 'controller:global_action' 'stop' %}">
+      <form method="post" action="{% url 'controller:global_action' 'stop' %}" data-confirm="Stop all accounts? Every running account will be intentionally stopped.">
         {% csrf_token %}
-        <button class="button button--danger" type="submit">Stop all</button>
+        <button class="button button--danger button--command button--stop" type="submit">Stop all</button>
       </form>
-      <form method="post" action="{% url 'controller:global_action' 'restart' %}">
+      <form method="post" action="{% url 'controller:global_action' 'restart' %}" data-confirm="Restart all accounts? Every active miner process will be replaced.">
         {% csrf_token %}
-        <button class="button" type="submit">Restart all</button>
+        <button class="button button--command button--restart" type="submit">Restart all</button>
       </form>
     </div>
   </header>

@@ -37,6 +37,20 @@ def main() -> None:
         )
         page.on("pageerror", lambda error: page_errors.append(str(error)))
 
+        def assert_no_horizontal_overflow(label: str) -> None:
+            overflow = page.evaluate(
+                "document.documentElement.scrollWidth - window.innerWidth"
+            )
+            assert overflow <= 1, f"{label} overflows horizontally by {overflow}px"
+
+        def assert_touch_targets(locator, label: str) -> None:
+            for index in range(locator.count()):
+                box = locator.nth(index).bounding_box()
+                assert box is not None, f"{label} target {index} has no bounding box"
+                assert box["height"] >= 44, (
+                    f"{label} target {index} is only {box['height']}px tall"
+                )
+
         def validate_channel(route):
             name = parse_qs(urlparse(route.request.url).query).get("name", [""])[0]
             if name == "missing_smoke_channel":
@@ -63,7 +77,7 @@ def main() -> None:
         assert page.get_by_role("heading", name="Runtime board").is_visible()
         assert page.locator(".page-header .lede").count() == 0
         assert page.get_by_text("Degraded / open incidents").is_visible()
-        assert page.get_by_text("Supervisor online").is_visible()
+        assert page.get_by_text("Supervisor online").count() == 0
         assert page.locator(".channel-tag").count() > 0
         assert page.get_by_role("columnheader", name="Process").count() == 0
         assert "pid 4321" not in page.locator("[data-live-status]").inner_text().lower()
@@ -90,6 +104,68 @@ def main() -> None:
         assert "button--quiet" not in stop_button.get_attribute("class").split()
         assert "button--safe" in start_button.get_attribute("class").split()
         assert "button--quiet" not in start_button.get_attribute("class").split()
+        restart_button = live_status.get_by_role(
+            "button", name="Restart", exact=True
+        ).first
+        assert "button--stop" in stop_button.get_attribute("class").split()
+        assert "button--start" in start_button.get_attribute("class").split()
+        assert "button--restart" in restart_button.get_attribute("class").split()
+        for command_button in (stop_button, start_button, restart_button):
+            assert command_button.evaluate(
+                "element => getComputedStyle(element, '::before').display !== 'none'"
+            )
+        confirmation_messages: list[str] = []
+        page.once(
+            "dialog",
+            lambda dialog: (confirmation_messages.append(dialog.message), dialog.dismiss()),
+        )
+        restart_button.click()
+        assert confirmation_messages and confirmation_messages[0].startswith("Restart ")
+        assert page.url == f"{args.base_url}/"
+        global_stop = page.get_by_role("button", name="Stop all", exact=True)
+        page.once(
+            "dialog",
+            lambda dialog: (confirmation_messages.append(dialog.message), dialog.dismiss()),
+        )
+        global_stop.click()
+        assert confirmation_messages[-1].startswith("Stop all accounts?")
+        assert page.url == f"{args.base_url}/"
+        desktop_runtime_header = page.locator(".page-header--runtime").bounding_box()
+        desktop_metric_grid = page.locator(".metric-grid").bounding_box()
+        desktop_runtime_table = page.locator(".runtime-table").bounding_box()
+        assert desktop_runtime_header is not None
+        assert desktop_metric_grid is not None and desktop_metric_grid["height"] <= 92, (
+            f"Desktop metric grid is {desktop_metric_grid['height'] if desktop_metric_grid else 'missing'}px tall"
+        )
+        assert desktop_runtime_table is not None
+        desktop_summary_height = (
+            desktop_runtime_table["y"] - desktop_runtime_header["y"]
+        )
+        assert desktop_summary_height <= 155, (
+            f"Desktop dashboard summary is {desktop_summary_height}px tall"
+        )
+        desktop_global_buttons = page.locator(".actions--global .button")
+        for index in range(desktop_global_buttons.count()):
+            button_box = desktop_global_buttons.nth(index).bounding_box()
+            assert button_box is not None and 40 <= button_box["height"] <= 42
+        preset_source = page.locator(".runtime-table .source-label").filter(
+            has_text="Demo drops rotation"
+        ).first
+        assert preset_source.inner_text() == "Demo drops rotation"
+        assert preset_source.evaluate(
+            "element => element.scrollWidth <= element.clientWidth + 1"
+        )
+        desktop_runtime_rows = page.locator(".runtime-table tbody tr")
+        for index in range(desktop_runtime_rows.count()):
+            row_box = desktop_runtime_rows.nth(index).bounding_box()
+            assert row_box is not None and row_box["height"] <= 48, (
+                f"Desktop runtime row {index} is {row_box['height'] if row_box else 'missing'}px tall"
+            )
+        desktop_runtime_buttons = desktop_runtime_rows.locator(".button")
+        for index in range(desktop_runtime_buttons.count()):
+            button_box = desktop_runtime_buttons.nth(index).bounding_box()
+            assert button_box is not None
+            assert 38 <= button_box["height"] <= 40
         page.screenshot(path=args.output / "dashboard-desktop.png", full_page=True)
 
         page.locator(".machine-table tbody tr").filter(has_text="Default").first.locator(
@@ -274,31 +350,115 @@ def main() -> None:
 
         page.set_viewport_size({"width": 390, "height": 844})
         page.goto(f"{args.base_url}/", wait_until="networkidle")
-        overflow = page.evaluate("document.documentElement.scrollWidth - window.innerWidth")
-        assert overflow <= 1, f"Mobile layout overflows horizontally by {overflow}px"
+        assert_no_horizontal_overflow("Mobile dashboard")
         assert page.locator("[data-channel-overflow]").first.evaluate(
             "element => element.scrollWidth <= element.clientWidth + 1"
         )
+
+        global_controls = page.locator(".actions--global .button")
+        assert global_controls.count() == 3
+        assert_touch_targets(global_controls, "Global control")
+        global_boxes = [
+            global_controls.nth(index).bounding_box()
+            for index in range(global_controls.count())
+        ]
+        assert all(box is not None for box in global_boxes)
+        assert max(box["y"] for box in global_boxes) - min(
+            box["y"] for box in global_boxes
+        ) <= 1
+
+        metrics = page.locator(".metric-grid .metric")
+        first_metric = metrics.nth(0).bounding_box()
+        second_metric = metrics.nth(1).bounding_box()
+        incident_metric = metrics.nth(2).bounding_box()
+        assert first_metric is not None and second_metric is not None
+        assert incident_metric is not None
+        assert abs(first_metric["y"] - second_metric["y"]) <= 1
+        assert incident_metric["y"] > first_metric["y"]
+
+        runtime_row = page.locator(".runtime-table tbody tr").first
+        assert runtime_row.evaluate("element => getComputedStyle(element).display") == "grid"
+        runtime_box = runtime_row.bounding_box()
+        assert runtime_box is not None and runtime_box["height"] < 235
+        mobile_runtime_header = page.locator(".page-header--runtime").bounding_box()
+        mobile_runtime_table = page.locator(".runtime-table").bounding_box()
+        assert mobile_runtime_header is not None and mobile_runtime_table is not None
+        assert mobile_runtime_table["y"] - mobile_runtime_header["y"] <= 245
+        assert_touch_targets(runtime_row.locator(".button"), "Runtime row")
         page.screenshot(path=args.output / "dashboard-mobile.png", full_page=True)
 
         page.goto(f"{args.base_url}/accounts/", wait_until="networkidle")
+        assert_no_horizontal_overflow("Mobile accounts")
         mobile_status = page.locator(
             '.account-table td[data-label="Current status"] .status-chip'
         ).first
         assert mobile_status.evaluate(
             "element => element.getBoundingClientRect().width < "
-            "element.parentElement.getBoundingClientRect().width - 8"
+            "element.closest('tr').getBoundingClientRect().width - 8"
         )
+        account_row = page.locator(".account-table tbody tr").first
+        assert account_row.evaluate("element => getComputedStyle(element).display") == "grid"
+        account_box = account_row.bounding_box()
+        assert account_box is not None and account_box["height"] < 235
+        assert_touch_targets(account_row.locator(".button"), "Account row")
+        page.screenshot(path=args.output / "accounts-mobile.png", full_page=True)
+
+        account_row.locator(".machine-id a").click()
+        page.wait_for_load_state("networkidle")
+        assert_no_horizontal_overflow("Mobile account detail")
+        telemetry_tiles = page.locator(".telemetry-grid .telemetry")
+        desired_tile = telemetry_tiles.nth(0).bounding_box()
+        observed_tile = telemetry_tiles.nth(1).bounding_box()
+        assert desired_tile is not None and observed_tile is not None
+        assert abs(desired_tile["y"] - observed_tile["y"]) <= 1
+        page.screenshot(path=args.output / "account-detail-mobile.png", full_page=True)
+
+        edit_account = page.get_by_role("link", name="Edit account")
+        if edit_account.count():
+            edit_account.click()
+            page.wait_for_load_state("networkidle")
+            assert_no_horizontal_overflow("Mobile account editor")
+            assert_touch_targets(page.locator("main .button"), "Account editor")
+            page.screenshot(path=args.output / "account-editor-mobile.png", full_page=True)
+
+        page.goto(f"{args.base_url}/accounts/", wait_until="networkidle")
+        page.get_by_role("link", name="Bot logs").click()
+        page.wait_for_load_state("networkidle")
+        assert_no_horizontal_overflow("Mobile bot logs")
+        page.screenshot(path=args.output / "bot-logs-mobile.png", full_page=True)
 
         page.goto(f"{args.base_url}/presets/", wait_until="networkidle")
+        assert_no_horizontal_overflow("Mobile presets")
         mobile_assignment = page.locator(
             '.preset-table td[data-label="Assignments"] .status-chip'
         ).first
         assert mobile_assignment.evaluate(
             "element => element.getBoundingClientRect().width < "
-            "element.parentElement.getBoundingClientRect().width - 8"
+            "element.closest('tr').getBoundingClientRect().width - 8"
         )
+        preset_row = page.locator(".preset-table tbody tr").first
+        assert preset_row.evaluate("element => getComputedStyle(element).display") == "grid"
+        preset_box = preset_row.bounding_box()
+        assert preset_box is not None and preset_box["height"] < 210
+        assert_touch_targets(preset_row.locator(".button"), "Preset row")
+        page.screenshot(path=args.output / "presets-mobile.png", full_page=True)
 
+        preset_row.locator(".machine-id a").click()
+        page.wait_for_load_state("networkidle")
+        assert_no_horizontal_overflow("Mobile preset editor")
+        page.screenshot(path=args.output / "preset-editor-mobile.png", full_page=True)
+
+        page.goto(f"{args.base_url}/settings/", wait_until="networkidle")
+        assert_no_horizontal_overflow("Mobile settings")
+        settings_links = page.locator(".settings-nav a")
+        assert settings_links.count() >= 2
+        first_settings_link = settings_links.nth(0).bounding_box()
+        second_settings_link = settings_links.nth(1).bounding_box()
+        assert first_settings_link is not None and second_settings_link is not None
+        assert abs(first_settings_link["y"] - second_settings_link["y"]) <= 1
+        page.screenshot(path=args.output / "settings-mobile.png", full_page=True)
+
+        page.goto(f"{args.base_url}/presets/", wait_until="networkidle")
         page.get_by_role("link", name="Create preset").click()
         page.wait_for_load_state("networkidle")
         assert page.get_by_text("Reliability contract").count() == 0
@@ -314,13 +474,32 @@ def main() -> None:
             "unverified_smoke_channel added, but Twitch could not verify it right now."
         ).wait_for()
         new_editor.get_by_text("unverified_smoke_channel", exact=True).wait_for()
-        overflow = page.evaluate("document.documentElement.scrollWidth - window.innerWidth")
-        assert overflow <= 1, f"Mobile channel editor overflows by {overflow}px"
+        assert_no_horizontal_overflow("Mobile channel editor")
+        assert_touch_targets(new_editor.locator("button"), "Channel editor")
 
         page.set_viewport_size({"width": 320, "height": 720})
         page.goto(f"{args.base_url}/", wait_until="networkidle")
-        overflow = page.evaluate("document.documentElement.scrollWidth - window.innerWidth")
-        assert overflow <= 1, f"320px layout overflows horizontally by {overflow}px"
+        assert_no_horizontal_overflow("320px dashboard")
+        compact_controls = page.locator(".actions--global .button")
+        compact_boxes = [
+            compact_controls.nth(index).bounding_box()
+            for index in range(compact_controls.count())
+        ]
+        assert all(box is not None for box in compact_boxes)
+        assert max(box["y"] for box in compact_boxes) - min(
+            box["y"] for box in compact_boxes
+        ) <= 1
+        assert_touch_targets(compact_controls, "320px global control")
+        page.screenshot(path=args.output / "dashboard-mobile-320.png", full_page=True)
+
+        page.goto(f"{args.base_url}/accounts/", wait_until="networkidle")
+        assert_no_horizontal_overflow("320px accounts")
+
+        page.goto(f"{args.base_url}/presets/", wait_until="networkidle")
+        assert_no_horizontal_overflow("320px presets")
+
+        page.goto(f"{args.base_url}/settings/", wait_until="networkidle")
+        assert_no_horizontal_overflow("320px settings")
 
         browser.close()
 

@@ -1,6 +1,16 @@
 (() => {
   "use strict";
 
+  document.addEventListener("submit", (event) => {
+    const form = event.target.closest("form[data-confirm]");
+    if (!form || event.defaultPrevented) return;
+    if (!window.confirm(form.dataset.confirm)) event.preventDefault();
+  });
+})();
+
+(() => {
+  "use strict";
+
   const fit = (container) => {
     const items = [...container.querySelectorAll("[data-channel-item]")];
     const more = container.querySelector("[data-channel-more]");

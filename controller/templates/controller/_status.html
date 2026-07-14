@@ -32,21 +32,21 @@
     </article>
   </div>
 
-  <div class="supervisor-bar" role="status">
-    <div class="supervisor-bar__identity">
-      <span class="status-light" data-tone="{{ supervisor.status|state_tone }}" aria-hidden="true"></span>
-      <span class="status-copy">
-        <strong>{{ supervisor.label }}</strong>
-        <small>
-          owner {{ supervisor.owner_id }}
-          {% if supervisor.heartbeat_at %} · heartbeat {{ supervisor.heartbeat_at|timesince }} ago{% endif %}
-        </small>
-      </span>
-    </div>
-    <span class="poll-indicator" data-poll-indicator>Telemetry refreshes every 5 seconds</span>
-  </div>
-
   {% if supervisor.status != 'healthy' %}
+    <div class="supervisor-bar" role="status">
+      <div class="supervisor-bar__identity">
+        <span class="status-light" data-tone="{{ supervisor.status|state_tone }}" aria-hidden="true"></span>
+        <span class="status-copy">
+          <strong>{{ supervisor.label }}</strong>
+          <small>
+            owner {{ supervisor.owner_id }}
+            {% if supervisor.heartbeat_at %} · heartbeat {{ supervisor.heartbeat_at|timesince }} ago{% endif %}
+          </small>
+        </span>
+      </div>
+      <span class="poll-indicator" data-poll-indicator>Telemetry refreshes every 5 seconds</span>
+    </div>
+
     <div class="message error" role="alert">
       Runtime commands remain durable, but no live supervisor currently owns process reconciliation. Check the worker service.
     </div>
@@ -88,17 +88,17 @@
               <td data-label="Controls">
                 <div class="button-row">
                   {% if row.desired == 'running' %}
-                    <form method="post" action="{% url 'controller:account_action' row.account.pk 'stop' %}">
-                      {% csrf_token %}<button class="button button--danger" type="submit">Stop</button>
+                    <form method="post" action="{% url 'controller:account_action' row.account.pk 'stop' %}" data-confirm="Stop {{ row.account.config_key }}? This account will remain stopped until it is started again.">
+                      {% csrf_token %}<button class="button button--danger button--command button--stop" type="submit">Stop</button>
                     </form>
                   {% elif row.account.is_active and row.account.has_credentials %}
                     <form method="post" action="{% url 'controller:account_action' row.account.pk 'start' %}">
-                      {% csrf_token %}<button class="button button--safe" type="submit">Start</button>
+                      {% csrf_token %}<button class="button button--safe button--command button--start" type="submit">Start</button>
                     </form>
                   {% endif %}
                   {% if row.account.is_active and row.account.has_credentials %}
-                    <form method="post" action="{% url 'controller:account_action' row.account.pk 'restart' %}">
-                      {% csrf_token %}<button class="button button--quiet" type="submit">Restart</button>
+                    <form method="post" action="{% url 'controller:account_action' row.account.pk 'restart' %}" data-confirm="Restart {{ row.account.config_key }}? Its current miner process will be replaced.">
+                    {% csrf_token %}<button class="button button--command button--restart" type="submit">Restart</button>
                     </form>
                   {% endif %}
                 </div>

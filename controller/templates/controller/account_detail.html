@@ -18,16 +18,16 @@
     <div class="actions" aria-label="Account lifecycle controls">
       {% if account.is_active and telemetry.desired == 'running' %}
         <form method="post" action="{% url 'controller:account_action' account.pk 'stop' %}">
-          {% csrf_token %}<button class="button button--danger" type="submit">Stop intentionally</button>
+          {% csrf_token %}<button class="button button--danger button--command button--stop" type="submit">Stop intentionally</button>
         </form>
       {% elif account.is_active and account.has_credentials %}
         <form method="post" action="{% url 'controller:account_action' account.pk 'start' %}">
-          {% csrf_token %}<button class="button button--safe" type="submit">Start unit</button>
+          {% csrf_token %}<button class="button button--safe button--command button--start" type="submit">Start unit</button>
         </form>
       {% endif %}
       {% if account.is_active and account.has_credentials %}
         <form method="post" action="{% url 'controller:account_action' account.pk 'restart' %}">
-          {% csrf_token %}<button class="button" type="submit">Restart unit</button>
+          {% csrf_token %}<button class="button button--command button--restart" type="submit">Restart unit</button>
         </form>
       {% endif %}
       {% if account.is_active %}<a class="button button--primary" href="{% url 'controller:account_edit' account.pk %}">Edit account</a>{% endif %}

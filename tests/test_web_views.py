@@ -244,7 +244,7 @@ class WebViewTests(TestCase):
             '<span class="metric__label">Open incidents</span>',
         )
         self.assertContains(response, incident.summary)
-        self.assertContains(response, "Supervisor online")
+        self.assertNotContains(response, "Supervisor online")
         self.assertNotContains(response, "Incident open")
         self.assertNotContains(response, "<th scope=\"col\">Process</th>")
         self.assertNotContains(response, "pid 4321")
@@ -272,8 +272,10 @@ class WebViewTests(TestCase):
 
         response = self.client.get(reverse("controller:dashboard"))
 
-        self.assertContains(response, 'class="button button--danger" type="submit">Stop</button>')
-        self.assertContains(response, 'class="button button--safe" type="submit">Start</button>')
+        self.assertContains(response, 'class="button button--danger button--command button--stop" type="submit">Stop</button>')
+        self.assertContains(response, 'class="button button--safe button--command button--start" type="submit">Start</button>')
+        self.assertContains(response, 'data-confirm="Stop primary? This account will remain stopped until it is started again."')
+        self.assertContains(response, 'data-confirm="Restart stopped-unit? Its current miner process will be replaced."')
         self.assertNotContains(response, "button button--quiet button--danger")
         self.assertNotContains(response, "button button--quiet button--safe")
 
