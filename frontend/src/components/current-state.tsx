@@ -1,4 +1,4 @@
-import { Flag } from "lucide-react"
+import { LoaderCircle } from "lucide-react"
 
 import { StatusBadge } from "@/components/status-badge"
 import { Button } from "@/components/ui/button"
@@ -35,28 +35,30 @@ export function CurrentState({
   observed: RuntimeStatus
   desired: "running" | "stopped"
 }) {
+  const showDesiredState = shouldShowDesiredState(observed, desired)
+
   return (
-    <span className="inline-flex items-center gap-0">
-      <StatusBadge status={observed} />
-      {shouldShowDesiredState(observed, desired) ? (
+    <span className="inline-flex items-center gap-0.5">
+      {showDesiredState ? (
         <Tooltip>
           <TooltipTrigger
             render={
               <Button
                 variant="ghost"
                 size="icon-xs"
-                className="-ml-3"
+                className="-mr-1 text-muted-foreground"
                 aria-label={`Desired state: ${desired}`}
               />
             }
           >
-            <Flag data-icon="inline-start" />
+            <LoaderCircle className="animate-spin" data-icon="inline-start" />
           </TooltipTrigger>
           <TooltipContent>
             <p>Desired state: {desired}</p>
           </TooltipContent>
         </Tooltip>
       ) : null}
+      <StatusBadge status={observed} />
     </span>
   )
 }

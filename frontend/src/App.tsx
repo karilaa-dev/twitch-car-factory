@@ -85,11 +85,11 @@ function PrimaryNavigation({ mobile = false }: { mobile?: boolean }) {
               data-active={current(item.to) || undefined}
               className={
                 mobile
-                  ? "min-h-11 min-w-0 justify-center rounded-lg px-0.5 py-1 text-[0.68rem] leading-none"
+                  ? "min-h-12 min-w-0 flex-col justify-center gap-1 rounded-lg px-0.5 py-1 text-[0.65rem] leading-none"
                   : undefined
               }
             >
-              <item.icon className={mobile ? "hidden" : undefined} />
+              <item.icon className={mobile ? "size-4 shrink-0" : undefined} />
               <span className="truncate">{item.label}</span>
             </NavigationMenuLink>
           </NavigationMenuItem>

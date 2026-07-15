@@ -37,6 +37,7 @@ frontend/test-results/
 frontend/playwright-report/
 frontend/blob-report/
 frontend/*.tsbuildinfo
+artifacts/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

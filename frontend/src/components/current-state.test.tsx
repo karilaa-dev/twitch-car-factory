@@ -19,7 +19,8 @@ describe("CurrentState", () => {
       name: "Desired state: running",
     })
     expect(intent).toBeVisible()
-    expect(intent).toHaveClass("-ml-3")
+    expect(intent.querySelector("svg")).toHaveClass("animate-spin")
+    expect(intent.nextElementSibling).toHaveTextContent("starting")
     expect(screen.queryByText("running")).not.toBeInTheDocument()
     await user.hover(intent)
     expect(await screen.findByText("Desired state: running")).toBeVisible()
