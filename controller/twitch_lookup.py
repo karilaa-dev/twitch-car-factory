@@ -12,7 +12,7 @@ from urllib.request import Request, urlopen
 from TwitchChannelPointsMiner.constants import CLIENT_ID, GQLOperations
 
 
-TWITCH_LOOKUP_TIMEOUT_SECONDS = 5
+TWITCH_LOOKUP_TIMEOUT_SECONDS = 6
 TWITCH_LOOKUP_BATCH_SIZE = 50
 
 

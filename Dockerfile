@@ -1,5 +1,13 @@
 # syntax=docker/dockerfile:1
 
+FROM node:24-bookworm-slim AS frontend
+
+WORKDIR /app/frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
+COPY frontend/ ./
+RUN npm run build
+
 FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
 
 WORKDIR /app
@@ -22,6 +30,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY manage.py ./
 COPY twitch_farm/ twitch_farm/
 COPY controller/ controller/
+COPY --from=frontend /app/controller/static/controller/app/ controller/static/controller/app/
 
 RUN mkdir -p /app/data /app/runtime /app/staticfiles \
     && DJANGO_DEBUG=0 \

@@ -1,0 +1,22 @@
+{% load static %}<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#0a0a0a">
+    <meta name="color-scheme" content="dark light">
+    <title>Twitch Farm Control Room</title>
+    <script>
+      (() => {
+        const theme = localStorage.getItem("twitch-farm-theme") || "dark";
+        document.documentElement.classList.toggle("dark", theme === "dark");
+      })();
+    </script>
+    <link rel="stylesheet" href="{% static 'controller/app/app.css' %}">
+  </head>
+  <body>
+    <div id="root"></div>
+    <noscript>This control room requires JavaScript.</noscript>
+    <script type="module" src="{% static 'controller/app/app.js' %}"></script>
+  </body>
+</html>

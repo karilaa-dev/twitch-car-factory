@@ -43,13 +43,20 @@ provisioning remain deployment operations.
 
 ## Local setup
 
-Requires Python 3.13 and [uv](https://docs.astral.sh/uv/).
+Requires Python 3.13, [uv](https://docs.astral.sh/uv/), and Node 24 with npm
+for control-room frontend development. Production images build the frontend in
+a Node stage and contain only the generated assets and Python runtime.
 
 ```bash
 uv sync --frozen
 export TWITCH_FARM_CREDENTIAL_KEYS="$(uv run python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
 uv run python manage.py migrate
 uv run python manage.py createsuperuser
+cd frontend
+nvm use
+npm ci
+npm run build
+cd ..
 ```
 
 `createsuperuser` creates only the staff login for the control room. It does not
@@ -66,7 +73,9 @@ TWITCH_FARM_LOG_WRITER=1 uv run python manage.py run_miner_worker
 Open <http://127.0.0.1:8000/>, sign in with the staff account, configure default
 channels under **Settings → General**, and add Twitch accounts from **Accounts**.
 
-For UI development, populate seven fake accounts covering every observed
+For live UI development, run `npm run build -- --watch` in `frontend/` and
+Django in its normal terminal so API, authentication, and generated assets stay
+same-origin. Populate seven fake accounts covering every observed
 runtime state (starting, running, stopping, stopped, restarting, degraded, and
 unknown):
 
@@ -167,8 +176,8 @@ the actual client scheme; Django trusts that header to identify secure requests.
 The services share `./data`; only the worker mounts `./runtime`. The worker is
 the sole writer for `./data/logs/twitch-farm.log`: it sends supervisor output
 and prefixed miner stdout/stderr to both Docker logs and a 5 MiB rotating file
-with three backups. The staff-only **Accounts → Bot logs** page reads at most
-the latest 400 lines/256 KiB. The web service
+with three backups. The staff-only **Logs** page reads at most the latest 400
+lines/256 KiB. The web service
 therefore cannot read refreshable Twitch session files. Compose runs every
 service as the non-root `PUID`/`PGID` that owns the bind mounts. SQLite must
 remain on local storage, and only one worker replica is supported. The worker
@@ -186,6 +195,13 @@ uv run python manage.py run_fake_miner --help
 Run the full validation suite:
 
 ```bash
+cd frontend
+npm ci
+npm run typecheck
+npm run lint
+npm test
+npm run build
+cd ..
 uv run pytest -q
 uv run python manage.py check
 DJANGO_DEBUG=0 \

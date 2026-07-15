@@ -24,6 +24,12 @@ from controller.models import (
     PresetChannel,
 )
 
+DEFAULT_DEMO_PRESET_NAME = "Demo drops rotation"
+DEMO_PRESET_CHANNELS = {
+    DEFAULT_DEMO_PRESET_NAME: ("lirik", "cohhcarnage", "shroud"),
+    "Demo evolving rotation": ("lirik", "twitchgaming", "rocketleague"),
+}
+
 
 @dataclass(frozen=True, slots=True)
 class DemoAccount:
@@ -31,10 +37,26 @@ class DemoAccount:
     desired: str
     mode: str
     channels: tuple[str, ...]
+    slug: str | None = None
+    planned_mode: str | None = None
+    planned_channels: tuple[str, ...] | None = None
+    preset_name: str = DEFAULT_DEMO_PRESET_NAME
 
     @property
     def key(self) -> str:
-        return f"demo-{self.state}"
+        return f"demo-{self.slug or self.state}"
+
+    @property
+    def username(self) -> str:
+        return f"demo_{(self.slug or self.state).replace('-', '_')}"
+
+    @property
+    def next_mode(self) -> str:
+        return self.planned_mode or self.mode
+
+    @property
+    def next_channels(self) -> tuple[str, ...]:
+        return self.planned_channels or self.channels
 
 
 DEMO_ACCOUNTS = (
@@ -45,6 +67,32 @@ DEMO_ACCOUNTS = (
     DemoAccount("restarting", "running", "preset", ("lirik", "cohhcarnage", "shroud")),
     DemoAccount("degraded", "running", "custom", ("esl_csgo", "riotgames")),
     DemoAccount("unknown", "stopped", "default", ("warframe", "twitch")),
+    DemoAccount(
+        "running",
+        "running",
+        "custom",
+        ("lirik", "cohhcarnage", "shroud"),
+        slug="source-change",
+        planned_mode="custom",
+        planned_channels=("twitchgaming", "rocketleague"),
+    ),
+    DemoAccount(
+        "running",
+        "running",
+        "preset",
+        ("lirik", "cohhcarnage", "shroud"),
+        slug="preset-content-change",
+        planned_mode="preset",
+        preset_name="Demo evolving rotation",
+    ),
+    DemoAccount(
+        "running",
+        "running",
+        "custom",
+        ("sodapoppin", "moonmoon"),
+        slug="custom-to-preset",
+        planned_mode="preset",
+    ),
 )
 
 
@@ -61,22 +109,39 @@ class Command(BaseCommand):
                 configuration.default_channels = ["warframe", "twitch"]
                 configuration.save(update_fields=("default_channels", "updated_at"))
 
-            preset, _ = ChannelPreset.objects.get_or_create(name="Demo drops rotation")
-            if not preset.channels.exists():
-                for position, name in enumerate(("lirik", "cohhcarnage", "shroud")):
-                    PresetChannel.objects.create(
-                        preset=preset,
-                        position=position,
-                        name=name,
+            presets: dict[str, ChannelPreset] = {}
+            for preset_name, channel_names in DEMO_PRESET_CHANNELS.items():
+                preset, _ = ChannelPreset.objects.get_or_create(name=preset_name)
+                existing_channels = tuple(
+                    preset.channels.order_by("position", "id").values_list(
+                        "name", flat=True
                     )
+                )
+                if existing_channels != channel_names:
+                    preset.channels.all().delete()
+                    PresetChannel.objects.bulk_create(
+                        [
+                            PresetChannel(
+                                preset=preset,
+                                position=position,
+                                name=name,
+                            )
+                            for position, name in enumerate(channel_names)
+                        ]
+                    )
+                presets[preset_name] = preset
 
             for index, demo in enumerate(DEMO_ACCOUNTS, start=1):
-                self._seed_account(demo, preset=preset, index=index)
+                self._seed_account(
+                    demo,
+                    preset=presets[demo.preset_name],
+                    index=index,
+                )
 
-        states = ", ".join(demo.state for demo in DEMO_ACCOUNTS)
+        accounts = ", ".join(demo.key for demo in DEMO_ACCOUNTS)
         self.stdout.write(
             self.style.SUCCESS(
-                f"Seeded {len(DEMO_ACCOUNTS)} fake accounts covering: {states}."
+                f"Seeded {len(DEMO_ACCOUNTS)} fake accounts: {accounts}."
             )
         )
 
@@ -84,14 +149,14 @@ class Command(BaseCommand):
     def _seed_account(demo: DemoAccount, *, preset: ChannelPreset, index: int) -> None:
         account, created = MinerAccount.objects.get_or_create(
             config_key=demo.key,
-            defaults={"display_username": f"demo_{demo.state}", "is_active": True},
+            defaults={"display_username": demo.username, "is_active": True},
         )
         if not created and not account.display_username.startswith("demo_"):
             raise CommandError(
                 f"Refusing to replace non-demo account using reserved key {demo.key!r}."
             )
 
-        account.display_username = f"demo_{demo.state}"
+        account.display_username = demo.username
         account.is_active = True
         account.save(update_fields=("display_username", "is_active", "updated_at"))
         AccountCredential.objects.update_or_create(
@@ -100,21 +165,30 @@ class Command(BaseCommand):
         )
 
         selection, _ = AccountChannelSelection.objects.get_or_create(account=account)
-        selection.mode = demo.mode
-        selection.preset = preset if demo.mode == AccountChannelSelection.Mode.PRESET else None
+        selection.mode = demo.next_mode
+        selection.preset = (
+            preset if demo.next_mode == AccountChannelSelection.Mode.PRESET else None
+        )
         selection.save(update_fields=("mode", "preset", "updated_at"))
         account.custom_channels.all().delete()
-        if demo.mode == AccountChannelSelection.Mode.CUSTOM:
+        if demo.next_mode == AccountChannelSelection.Mode.CUSTOM:
             AccountCustomChannel.objects.bulk_create(
                 [
                     AccountCustomChannel(account=account, position=position, name=name)
-                    for position, name in enumerate(demo.channels)
+                    for position, name in enumerate(demo.next_channels)
                 ]
             )
 
         now = timezone.now()
         state, _ = MinerInstanceState.objects.get_or_create(account=account)
         run = state.current_run
+        source_name = (
+            preset.name
+            if demo.mode == AccountChannelSelection.Mode.PRESET
+            else demo.key
+            if demo.mode == AccountChannelSelection.Mode.CUSTOM
+            else "farm defaults"
+        )
         needs_run = demo.state not in {
             MinerInstanceState.ObservedState.STOPPED,
             MinerInstanceState.ObservedState.UNKNOWN,
@@ -122,17 +196,23 @@ class Command(BaseCommand):
         has_live_run = needs_run and demo.state != MinerInstanceState.ObservedState.DEGRADED
         if needs_run and run is None:
             run = account.runs.filter(worker_id="demo-supervisor").first()
+        if needs_run and run is not None and (
+            run.source_mode != demo.mode
+            or run.source_name != source_name
+            or run.channels != list(demo.channels)
+        ):
+            MinerRun.objects.filter(pk=run.pk).update(
+                ended_at=now,
+                exit_code=0,
+                stop_reason=MinerRun.StopReason.CONFIG_RESTART,
+                error="Demo source replaced while refreshing fake data.",
+            )
+            run = None
         if needs_run and run is None:
             run = MinerRun.objects.create(
                 account=account,
                 source_mode=demo.mode,
-                source_name=(
-                    preset.name
-                    if demo.mode == AccountChannelSelection.Mode.PRESET
-                    else demo.key
-                    if demo.mode == AccountChannelSelection.Mode.CUSTOM
-                    else "farm defaults"
-                ),
+                source_name=source_name,
                 channels=list(demo.channels),
                 configuration_fingerprint=f"{index:064x}",
                 channel_revision=account.channel_revision,

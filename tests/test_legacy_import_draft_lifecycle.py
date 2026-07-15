@@ -177,29 +177,31 @@ def test_confirm_is_actor_bound_and_wrong_actor_applies_nothing(staff):
 
 
 @pytest.mark.django_db
-def test_malformed_draft_ids_are_safe_in_confirm_and_cancel_views(staff):
+def test_unknown_draft_ids_are_safe_in_confirm_and_cancel_api(staff):
     draft = prepare_legacy_import(_archive(), staff)
     client = Client()
     client.force_login(staff)
 
+    unknown = "00000000-0000-0000-0000-000000000001"
     confirm_response = client.post(
-        reverse("controller:settings_import_confirm"),
-        {"draft_id": "definitely-not-a-uuid"},
+        reverse("controller:api:settings_import_confirm", args=[unknown]),
+        data="{}",
+        content_type="application/json",
     )
-    cancel_response = client.post(
-        reverse("controller:settings_import_cancel"),
-        {"draft_id": "definitely-not-a-uuid"},
+    cancel_response = client.delete(
+        reverse("controller:api:settings_import_delete", args=[unknown]),
+        data="{}",
+        content_type="application/json",
     )
 
     assert confirm_response.status_code == 400
-    assert cancel_response.status_code == 302
-    assert cancel_response.url == reverse("controller:settings_import")
+    assert cancel_response.status_code == 404
     assert LegacyImportDraft.objects.filter(pk=draft.pk).exists()
     assert not MinerAccount.objects.exists()
 
 
 @pytest.mark.django_db
-def test_cancel_view_cannot_delete_another_actors_draft(staff):
+def test_cancel_api_cannot_delete_another_actors_draft(staff):
     other_staff = get_user_model().objects.create_user(
         username="cancel-operator",
         password="test-password",
@@ -209,10 +211,11 @@ def test_cancel_view_cannot_delete_another_actors_draft(staff):
     client = Client()
     client.force_login(other_staff)
 
-    response = client.post(
-        reverse("controller:settings_import_cancel"),
-        {"draft_id": str(draft.pk)},
+    response = client.delete(
+        reverse("controller:api:settings_import_delete", args=[draft.pk]),
+        data="{}",
+        content_type="application/json",
     )
 
-    assert response.status_code == 302
+    assert response.status_code == 404
     assert LegacyImportDraft.objects.filter(pk=draft.pk).exists()

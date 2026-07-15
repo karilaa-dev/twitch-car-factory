@@ -151,6 +151,7 @@ USE_TZ = True
 
 STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
+CSRF_FAILURE_VIEW = "controller.api.csrf_failure"
 DATA_UPLOAD_MAX_MEMORY_SIZE = 11 * 1024 * 1024
 # Every accepted legacy ZIP stays in memory.  The importer caps the archive at
 # 10 MiB and never needs Django's temporary-file upload handler.
@@ -168,9 +169,9 @@ STORAGES = {
 }
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
-LOGIN_URL = "login"
-LOGIN_REDIRECT_URL = "dashboard"
-LOGOUT_REDIRECT_URL = "login"
+LOGIN_URL = "controller:login"
+LOGIN_REDIRECT_URL = "controller:dashboard"
+LOGOUT_REDIRECT_URL = "controller:login"
 
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 SESSION_COOKIE_SECURE = env_bool("DJANGO_SECURE_COOKIES", not DEBUG)
