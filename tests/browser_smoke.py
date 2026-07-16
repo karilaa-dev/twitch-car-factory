@@ -1,18 +1,70 @@
-"""Manual Playwright smoke for the rendered control room.
+"""Playwright smoke for the Django-hosted React control room.
 
-Run this against a prepared local server; it is intentionally not collected by
-pytest because installing browser binaries is an environment-level operation.
+Run against a disposable, migrated database seeded with ``seed_demo_data`` and
+a staff user. Selectors intentionally follow accessible roles and labels.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
-import re
-from urllib.parse import parse_qs, urlparse
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import Page, sync_playwright
+
+
+def assert_no_horizontal_overflow(page: Page, label: str) -> None:
+    overflow = page.evaluate("document.documentElement.scrollWidth - window.innerWidth")
+    if overflow > 1:
+        offenders = page.evaluate(
+            """
+            [...document.querySelectorAll('*')]
+              .map((element) => ({ element, rect: element.getBoundingClientRect() }))
+              .filter(({ rect }) => rect.right > window.innerWidth + 1 || rect.left < -1)
+              .slice(0, 8)
+              .map(({ element, rect }) => ({
+                tag: element.tagName,
+                slot: element.getAttribute('data-slot'),
+                className: String(element.className).slice(0, 160),
+                text: (element.textContent || '').trim().slice(0, 80),
+                left: rect.left,
+                right: rect.right,
+                width: rect.width,
+              }))
+            """
+        )
+        raise AssertionError(
+            f"{label} overflows horizontally by {overflow}px: {offenders!r}"
+        )
+
+
+def assert_touch_targets(page: Page, label: str) -> None:
+    targets = page.eval_on_selector_all(
+        "main button, header button, header a, main [role='link']",
+        """
+        elements => elements
+          .filter(element => element.getClientRects().length > 0)
+          .map(element => {
+            const rect = element.getBoundingClientRect();
+            return {
+              height: rect.height,
+              name: element.getAttribute('aria-label') || element.textContent || '',
+            };
+          })
+        """,
+    )
+    for index, target in enumerate(targets):
+        # Tiny icon controls inside dense desktop data views expand to 44px on
+        # mobile. Disabled controls still need the same physical hit region.
+        assert target["height"] >= 43.5, (
+            f"{label} target {index} ({target['name']!r}) "
+            f"is only {target['height']}px tall"
+        )
+
+
+def assert_route(page: Page, base_url: str, route: str, heading: str, label: str) -> None:
+    page.goto(f"{base_url}{route}", wait_until="networkidle")
+    assert page.get_by_role("heading", name=heading, exact=True).is_visible()
+    assert_no_horizontal_overflow(page, label)
 
 
 def main() -> None:
@@ -20,7 +72,9 @@ def main() -> None:
     parser.add_argument("--base-url", default="http://127.0.0.1:8765")
     parser.add_argument("--username", default="visualadmin")
     parser.add_argument("--password", default="visual-test-password")
-    parser.add_argument("--output", type=Path, default=Path("/private/tmp/twitch-farm-browser"))
+    parser.add_argument(
+        "--output", type=Path, default=Path("/private/tmp/twitch-farm-browser")
+    )
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
 
@@ -33,297 +87,268 @@ def main() -> None:
         page = context.new_page()
         page.on(
             "console",
-            lambda message: console_errors.append(message.text) if message.type == "error" else None,
+            lambda message: console_errors.append(message.text)
+            if message.type == "error"
+            else None,
         )
         page.on("pageerror", lambda error: page_errors.append(str(error)))
 
-        def validate_channel(route):
-            name = parse_qs(urlparse(route.request.url).query).get("name", [""])[0]
-            if name == "missing_smoke_channel":
-                status = "missing"
-            elif name == "unverified_smoke_channel":
-                status = "unverified"
-            else:
-                status = "exists"
-            route.fulfill(
-                status=200,
-                content_type="application/json",
-                body=json.dumps({"name": name, "status": status}),
-            )
-
-        page.route(re.compile(r".*/channels/validate/\?name=.*"), validate_channel)
-
-        page.goto(f"{args.base_url}/login/", wait_until="networkidle")
+        page.goto(f"{args.base_url}/login", wait_until="networkidle")
         page.screenshot(path=args.output / "login.png", full_page=True)
-        page.get_by_label("Operator ID").fill(args.username)
-        page.get_by_label("Passphrase").fill(args.password)
-        page.get_by_role("button", name="Enter control room").click()
+        try:
+            page.get_by_role("heading", name="Twitch Farm Control Room").wait_for(
+                timeout=10_000
+            )
+        except Exception as exc:
+            raise AssertionError(
+                f"Login did not mount. body={page.locator('body').inner_text()!r}; "
+                f"console={console_errors!r}; page={page_errors!r}"
+            ) from exc
+        page.get_by_label("Username").fill(args.username)
+        page.get_by_label("Password").fill(args.password)
+        page.get_by_role("button", name="Sign in").click()
         page.wait_for_url(f"{args.base_url}/")
-        page.wait_for_load_state("networkidle")
-        assert page.get_by_role("heading", name="Runtime board").is_visible()
-        assert page.locator(".page-header .lede").count() == 0
-        assert page.get_by_text("Degraded / open incidents").is_visible()
-        assert page.get_by_text("Supervisor online").is_visible()
-        assert page.locator(".channel-tag").count() > 0
-        assert page.get_by_role("columnheader", name="Process").count() == 0
-        assert "pid 4321" not in page.locator("[data-live-status]").inner_text().lower()
-        fitted_channels = page.locator("[data-channel-overflow]").first
-        fitted_channels.evaluate("element => { element.style.width = '90px'; }")
-        page.evaluate("window.controlRoomFitChannels(document)")
-        assert fitted_channels.locator("[data-channel-more]").is_visible()
-        assert fitted_channels.evaluate("element => element.scrollWidth <= element.clientWidth + 1")
-        fitted_channels.evaluate("element => { element.style.width = ''; }")
-        page.evaluate("window.controlRoomFitChannels(document)")
-        live_panel = page.locator("[data-live-status]").element_handle()
-        focused_control = page.locator("[data-live-status] button").first
-        focused_handle = focused_control.element_handle()
-        focused_control.focus()
-        page.wait_for_timeout(5500)
-        assert page.evaluate("panel => panel.isConnected", live_panel)
-        assert page.evaluate("control => control.isConnected", focused_handle)
-        assert focused_control.evaluate("control => control === document.activeElement")
-        focused_control.evaluate("control => control.blur()")
-        live_status = page.locator("[data-live-status]")
-        stop_button = live_status.get_by_role("button", name="Stop", exact=True).first
-        start_button = live_status.get_by_role("button", name="Start", exact=True).first
-        assert "button--danger" in stop_button.get_attribute("class").split()
-        assert "button--quiet" not in stop_button.get_attribute("class").split()
-        assert "button--safe" in start_button.get_attribute("class").split()
-        assert "button--quiet" not in start_button.get_attribute("class").split()
-        page.screenshot(path=args.output / "dashboard-desktop.png", full_page=True)
+        page.get_by_role("heading", name="Runtime", exact=True).wait_for()
+        assert page.get_by_role("columnheader", name="Current state").count() == 1
+        assert page.get_by_role("columnheader", name="Desired").count() == 0
+        assert page.get_by_role("columnheader", name="Observed").count() == 0
+        intent = page.get_by_role("button", name="Desired state: running").first
+        intent.hover()
+        page.locator("[data-slot='tooltip-content']").filter(
+            has_text="Desired state: running"
+        ).wait_for(state="visible")
+        page.screenshot(path=args.output / "runtime-desktop.png", full_page=True)
 
-        page.locator(".machine-table tbody tr").filter(has_text="Default").first.locator(
-            ".machine-id a"
-        ).click()
-        page.wait_for_load_state("networkidle")
-        assert page.get_by_role("heading", name="Active launch manifest").is_visible()
-        assert page.get_by_text("Exact channels").is_visible()
-        source_form = page.locator("[data-channel-source-form]")
-        if source_form.count():
-            assert source_form.get_by_role("heading", name="Farm default channels").is_visible()
-            preset_field = source_form.locator('[data-source-field="preset"]')
-            custom_field = source_form.locator('[data-source-field="custom"]')
-            assert preset_field.is_hidden()
-            assert custom_field.is_hidden()
-            source_form.locator('input[name="mode"][value="preset"]').check()
-            assert preset_field.is_visible()
-            preset_field.locator("select").select_option(index=1)
-            assert preset_field.locator("[data-preset-option]:visible").count() == 1
-            source_form.locator('input[name="mode"][value="custom"]').check()
-            assert custom_field.is_visible()
-            assert preset_field.is_hidden()
-            custom_editor = custom_field.locator("[data-channel-editor]")
-            custom_editor.get_by_label("Add channel").fill("smoke_custom_channel")
-            custom_editor.get_by_role("button", name="Add channel").click()
-            custom_editor.get_by_text("smoke_custom_channel", exact=True).wait_for()
-        page.screenshot(path=args.output / "account-detail.png", full_page=True)
+        # Theme state is explicit, persisted, and excludes system mode.
+        theme_toggle = page.get_by_role("button", name="Switch to light theme")
+        theme_toggle.click()
+        assert page.locator("html.light").count() == 1
+        assert page.evaluate("localStorage.getItem('twitch-farm-theme')") == "light"
+        page.get_by_role("button", name="Switch to dark theme").click()
+        assert page.locator("html.dark").count() == 1
 
-        page.get_by_role("link", name="Presets").click()
-        page.wait_for_load_state("networkidle")
-        assert page.get_by_role("heading", name="Preset library").is_visible()
-        assert page.locator(".page-header .lede").count() == 0
-        assert page.locator(".preset-table tbody tr").count() > 0
-        page.set_viewport_size({"width": 900, "height": 900})
-        preset_wrap = page.locator(".preset-table").locator("xpath=..")
-        assert preset_wrap.evaluate("element => element.scrollWidth <= element.clientWidth + 1")
-        preset_channels = page.locator(".preset-table [data-channel-overflow]").first
-        preset_channels.evaluate("element => { element.style.width = '90px'; }")
-        page.evaluate("window.controlRoomFitChannels(document)")
-        assert preset_channels.locator("[data-channel-more]").is_visible()
-        assert preset_channels.evaluate("element => element.scrollWidth <= element.clientWidth + 1")
-        preset_channels.evaluate("element => { element.style.width = ''; }")
-        page.evaluate("window.controlRoomFitChannels(document)")
-        page.screenshot(path=args.output / "presets.png", full_page=True)
+        # Polling updates React data without replacing a focused control.
+        start_all = page.get_by_role("button", name="Start all", exact=True)
+        start_all.focus()
+        focused_handle = start_all.element_handle()
+        page.wait_for_timeout(5_500)
+        assert page.evaluate("element => element.isConnected", focused_handle)
+        assert page.evaluate("element => element === document.activeElement", focused_handle)
 
-        preset_row = page.locator(".preset-table tbody tr").first
-        presets_url = page.url
-        preset_row.click(button="middle")
-        preset_row.click(modifiers=["Meta"])
-        assert page.url == presets_url
-        preset_row.click(position={"x": 4, "y": 4})
-        page.wait_for_load_state("networkidle")
-        assert page.get_by_role("heading", name="Edit preset").is_visible()
-        page.go_back(wait_until="networkidle")
-        page.locator(".preset-table tbody tr").first.locator(
-            'td[data-label="Assignments"] .status-chip'
-        ).click()
-        page.wait_for_load_state("networkidle")
-        assert page.get_by_role("heading", name="Edit preset").is_visible()
-        editor = page.locator("[data-channel-editor]")
-        page.evaluate(
-            """
-            () => {
-              const originalFetch = window.fetch;
-              window.fetch = () => new Promise((resolve) => {
-                window.__completeChannelCheck = () => resolve(new Response(
-                  JSON.stringify({ status: "exists" }),
-                  { status: 200, headers: { "Content-Type": "application/json" } },
-                ));
-              });
-              window.__restoreChannelFetch = () => { window.fetch = originalFetch; };
-            }
-            """
-        )
-        editor.get_by_label("Add channel").fill("pending_smoke_channel")
-        editor.get_by_role("button", name="Add channel").click()
-        assert editor.get_by_role("button", name="Add channel").is_disabled()
-        editor_url = page.url
-        page.get_by_role("button", name="Save preset").click()
-        assert page.url == editor_url
-        assert "Wait for the Twitch channel check" in editor.locator(
-            "[data-channel-feedback]"
-        ).inner_text()
-        page.evaluate("window.__completeChannelCheck()")
-        editor.get_by_text("pending_smoke_channel", exact=True).wait_for()
-        page.evaluate("window.__restoreChannelFetch()")
-        editor.locator(".channel-editor__row").filter(
-            has_text="pending_smoke_channel"
-        ).get_by_role("button", name="Remove").click()
-        editor.get_by_label("Add channel").fill("smoke_staged_channel")
-        editor.get_by_role("button", name="Add channel").click()
-        editor.get_by_text("smoke_staged_channel", exact=True).wait_for()
-        editor.get_by_label("Add channel").fill("smoke_staged_channel")
-        editor.get_by_role("button", name="Add channel").click()
-        assert "already in this list" in editor.locator("[data-channel-feedback]").inner_text()
-        staged_row = editor.locator(".channel-editor__row").filter(has_text="smoke_staged_channel")
-        assert editor.get_by_role("button", name=re.compile(r"Move (up|down)")).count() == 0
-        drag_handle = staged_row.get_by_role(
-            "button", name=re.compile(r"^Drag smoke_staged_channel")
-        )
-        drag_handle.drag_to(
-            editor.locator(".channel-editor__row").first,
-            target_position={"x": 20, "y": 2},
-        )
-        assert "moved to position" in editor.locator("[data-channel-feedback]").inner_text()
-        assert editor.locator(".channel-editor__row").first.get_by_text(
-            "smoke_staged_channel", exact=True
-        ).is_visible()
-        page.screenshot(path=args.output / "preset-drag.png", full_page=True)
-        staged_row = editor.locator(".channel-editor__row").filter(
-            has_text="smoke_staged_channel"
-        )
-        staged_row.get_by_role(
-            "button", name=re.compile(r"^Drag smoke_staged_channel")
-        ).press("ArrowDown")
-        assert "moved to position" in editor.locator("[data-channel-feedback]").inner_text()
-        staged_row = editor.locator(".channel-editor__row").filter(has_text="smoke_staged_channel")
-        staged_row.get_by_role("button", name="Remove").click()
-        assert editor.get_by_text("smoke_staged_channel", exact=True).count() == 0
-        staged_rows = editor.locator(".channel-editor__row")
-        for _ in range(staged_rows.count()):
-            staged_rows.first.get_by_role(
-                "button", name="Remove"
-            ).click()
-        assert staged_rows.count() == 0
-        page.get_by_role("button", name="Save preset").click()
-        page.wait_for_load_state("networkidle")
-        assert page.get_by_text("This field is required.").first.is_visible()
-        expected_validation_error = (
-            "Failed to load resource: the server responded with a status of 400 (Bad Request)"
-        )
-        if expected_validation_error in console_errors:
-            console_errors.remove(expected_validation_error)
-        page.screenshot(path=args.output / "preset-editor.png", full_page=True)
+        # Destructive/global operations use the stock AlertDialog and remain keyboard operable.
+        page.get_by_role("button", name="Restart all", exact=True).click()
+        dialog = page.get_by_role("alertdialog")
+        assert dialog.get_by_role("heading", name="Restart every configured account?").is_visible()
+        dialog.get_by_role("button", name="Cancel").press("Enter")
+        dialog.wait_for(state="hidden")
 
-        page.get_by_role("link", name="Settings").click()
-        page.wait_for_load_state("networkidle")
-        assert page.locator(".page-header .lede").count() == 0
-        assert page.get_by_text("What these settings control").count() == 0
-        assert page.get_by_text("Database authority").count() == 0
-        settings_editor = page.locator("[data-channel-editor]")
-        assert settings_editor.is_visible()
-        settings_editor.get_by_label("Add channel").fill("smoke_default_channel")
-        settings_editor.get_by_role("button", name="Add channel").click()
-        settings_editor.get_by_text("smoke_default_channel", exact=True).wait_for()
-
-        page.get_by_label("Primary navigation").get_by_role("link", name="Accounts").click()
-        page.wait_for_load_state("networkidle")
-        assert page.locator(".page-header .lede").count() == 0
-        account_wrap = page.locator(".account-table").locator("xpath=..")
-        assert account_wrap.evaluate("element => element.scrollWidth <= element.clientWidth + 1")
-        account_channels = page.locator(".account-table [data-channel-overflow]").first
-        account_channels.evaluate("element => { element.style.width = '90px'; }")
-        page.evaluate("window.controlRoomFitChannels(document)")
-        assert account_channels.locator("[data-channel-more]").is_visible()
-        assert account_channels.evaluate("element => element.scrollWidth <= element.clientWidth + 1")
-        account_channels.evaluate("element => { element.style.width = ''; }")
-        page.evaluate("window.controlRoomFitChannels(document)")
-        page.screenshot(path=args.output / "accounts.png", full_page=True)
-        account_row = page.locator(".account-table tbody tr").filter(
-            has_text="demo-running"
-        )
-        account_row.click(position={"x": 4, "y": 4})
-        page.wait_for_load_state("networkidle")
-        assert page.get_by_role("heading", name="Active launch manifest").is_visible()
-        page.go_back(wait_until="networkidle")
-        page.locator(".account-table tbody tr").filter(has_text="demo-running").locator(
-            'td[data-label="Current status"] .status-chip'
-        ).click()
-        page.wait_for_load_state("networkidle")
-        assert page.get_by_role("heading", name="Active launch manifest").is_visible()
-        page.get_by_label("Primary navigation").get_by_role("link", name="Accounts").click()
-        page.wait_for_load_state("networkidle")
-        page.get_by_role("link", name="Bot logs").click()
-        page.wait_for_load_state("networkidle")
-        assert page.get_by_role("heading", name="Bot logs").is_visible()
+        # Every primary route renders from the single React entry point.
+        assert_route(page, args.base_url, "/accounts", "Accounts", "Desktop accounts")
+        assert page.get_by_role("columnheader", name="Current state").count() == 1
+        assert page.get_by_role("columnheader", name="Record").count() == 0
+        assert page.get_by_role("columnheader", name="Desired").count() == 0
+        assert page.get_by_role("columnheader", name="Observed").count() == 0
+        page.screenshot(path=args.output / "accounts-desktop.png", full_page=True)
+        account_link = page.locator("main").get_by_role(
+            "link", name="Open demo_source_change"
+        ).first
+        account_link.click()
+        page.wait_for_url("**/accounts/*")
+        page.get_by_role("heading", name="demo_source_change", exact=True).wait_for()
+        assert page.get_by_role("tab", name="Runtime").get_attribute("data-active") is not None
+        page.get_by_role("tab", name="History").click()
+        assert "tab=history" in page.url
+        page.get_by_role("tab", name="Auth settings").click()
+        assert "tab=auth" in page.url
+        page.get_by_role("tab", name="Runtime").click()
+        assert "tab=" not in page.url
+        page.get_by_text("Launch source change", exact=True).wait_for()
+        source_diff = page.get_by_label("Launch source diff")
+        source_diff.wait_for()
+        source_diff.get_by_text("Account override", exact=True).wait_for()
         assert (
-            page.locator("[data-log-output]").is_visible()
-            or page.locator("[data-log-empty]").is_visible()
+            source_diff.get_by_text("custom", exact=True).get_attribute("data-variant")
+            == "secondary"
         )
-        page.screenshot(path=args.output / "bot-logs.png", full_page=True)
-
-        page.set_viewport_size({"width": 390, "height": 844})
-        page.goto(f"{args.base_url}/", wait_until="networkidle")
-        overflow = page.evaluate("document.documentElement.scrollWidth - window.innerWidth")
-        assert overflow <= 1, f"Mobile layout overflows horizontally by {overflow}px"
-        assert page.locator("[data-channel-overflow]").first.evaluate(
-            "element => element.scrollWidth <= element.clientWidth + 1"
+        assert (
+            source_diff.get_by_text("lirik", exact=True).get_attribute("data-variant")
+            == "destructive"
         )
-        page.screenshot(path=args.output / "dashboard-mobile.png", full_page=True)
-
-        page.goto(f"{args.base_url}/accounts/", wait_until="networkidle")
-        mobile_status = page.locator(
-            '.account-table td[data-label="Current status"] .status-chip'
-        ).first
-        assert mobile_status.evaluate(
-            "element => element.getBoundingClientRect().width < "
-            "element.parentElement.getBoundingClientRect().width - 8"
+        assert (
+            source_diff.get_by_text("twitchgaming", exact=True).get_attribute(
+                "data-variant"
+            )
+            == "success"
         )
+        assert page.get_by_text("Current launch", exact=True).count() == 0
+        assert page.get_by_text("Planned launch", exact=True).count() == 0
+        page.get_by_text("Channel source", exact=True).wait_for()
+        page.screenshot(path=args.output / "account-workspace.png", full_page=True)
 
-        page.goto(f"{args.base_url}/presets/", wait_until="networkidle")
-        mobile_assignment = page.locator(
-            '.preset-table td[data-label="Assignments"] .status-chip'
-        ).first
-        assert mobile_assignment.evaluate(
-            "element => element.getBoundingClientRect().width < "
-            "element.parentElement.getBoundingClientRect().width - 8"
-        )
-
-        page.get_by_role("link", name="Create preset").click()
-        page.wait_for_load_state("networkidle")
-        assert page.get_by_text("Reliability contract").count() == 0
-        assert page.locator(".detail-layout--single").count() == 1
-        new_editor = page.locator("[data-channel-editor]")
-        new_editor.get_by_label("Add channel").fill("missing_smoke_channel")
-        new_editor.get_by_role("button", name="Add channel").click()
-        new_editor.get_by_text("missing_smoke_channel does not exist on Twitch.").wait_for()
-        assert new_editor.locator(".channel-editor__row").count() == 0
-        new_editor.get_by_label("Add channel").fill("unverified_smoke_channel")
-        new_editor.get_by_role("button", name="Add channel").click()
-        new_editor.get_by_text(
-            "unverified_smoke_channel added, but Twitch could not verify it right now."
+        page.set_viewport_size({"width": 900, "height": 1000})
+        page.goto(f"{args.base_url}/accounts", wait_until="networkidle")
+        page.locator("main").get_by_role(
+            "link", name="Open demo_preset_content_change"
+        ).first.click()
+        page.get_by_role(
+            "heading", name="demo_preset_content_change", exact=True
         ).wait_for()
-        new_editor.get_by_text("unverified_smoke_channel", exact=True).wait_for()
-        overflow = page.evaluate("document.documentElement.scrollWidth - window.innerWidth")
-        assert overflow <= 1, f"Mobile channel editor overflows by {overflow}px"
+        preset_content_diff = page.get_by_label("Launch source diff")
+        preset_content_diff.wait_for()
+        assert (
+            preset_content_diff.get_by_text("preset", exact=True).get_attribute(
+                "data-variant"
+            )
+            == "secondary"
+        )
+        assert preset_content_diff.get_by_text(
+            "Demo evolving rotation", exact=True
+        ).count() == 1
+        for unchanged_channel in preset_content_diff.get_by_text(
+            "lirik", exact=True
+        ).all():
+            assert unchanged_channel.get_attribute("data-variant") == "outline"
+        assert (
+            preset_content_diff.get_by_text(
+                "cohhcarnage", exact=True
+            ).get_attribute("data-variant")
+            == "destructive"
+        )
+        assert (
+            preset_content_diff.get_by_text(
+                "twitchgaming", exact=True
+            ).get_attribute("data-variant")
+            == "success"
+        )
+        preset_content_diff.screenshot(
+            path=args.output / "launch-source-preset-content-change.png",
+            animations="disabled",
+        )
 
-        page.set_viewport_size({"width": 320, "height": 720})
-        page.goto(f"{args.base_url}/", wait_until="networkidle")
-        overflow = page.evaluate("document.documentElement.scrollWidth - window.innerWidth")
-        assert overflow <= 1, f"320px layout overflows horizontally by {overflow}px"
+        page.goto(f"{args.base_url}/accounts", wait_until="networkidle")
+        page.locator("main").get_by_role(
+            "link", name="Open demo_custom_to_preset"
+        ).first.click()
+        page.get_by_role(
+            "heading", name="demo_custom_to_preset", exact=True
+        ).wait_for()
+        custom_to_preset_diff = page.get_by_label("Launch source diff")
+        custom_to_preset_diff.wait_for()
+        assert (
+            custom_to_preset_diff.get_by_text("custom", exact=True).get_attribute(
+                "data-variant"
+            )
+            == "destructive"
+        )
+        assert (
+            custom_to_preset_diff.get_by_text("preset", exact=True).get_attribute(
+                "data-variant"
+            )
+            == "success"
+        )
+        custom_to_preset_diff.get_by_text("Account override", exact=True).wait_for()
+        custom_to_preset_diff.get_by_text("Source preset", exact=True).wait_for()
+        custom_to_preset_diff.screenshot(
+            path=args.output / "launch-source-custom-to-preset.png",
+            animations="disabled",
+        )
+        page.set_viewport_size({"width": 1440, "height": 1000})
+
+        assert_route(page, args.base_url, "/presets", "Presets", "Desktop presets")
+        page.get_by_role("link", name="Open Demo drops rotation").click()
+        page.wait_for_url("**/presets/*")
+        page.get_by_role("heading", name="Demo drops rotation", exact=True).wait_for()
+        page.get_by_text("Preset configuration", exact=True).wait_for()
+        page.get_by_text("Account assignments", exact=True).wait_for()
+        assert page.get_by_role("tab", name="Assignments").count() == 0
+        page.screenshot(path=args.output / "preset-workspace.png", full_page=True)
+
+        assert_route(page, args.base_url, "/logs", "Logs", "Desktop logs")
+        log_viewport = page.locator("[data-slot='scroll-area-viewport']")
+        if log_viewport.count():
+            log_viewport.evaluate("element => { element.scrollTop = element.scrollHeight }")
+            page.wait_for_timeout(5_500)
+            distance = log_viewport.evaluate(
+                "element => element.scrollHeight - element.scrollTop - element.clientHeight"
+            )
+            assert distance < 25, f"Log view lost bottom pin by {distance}px"
+
+        assert_route(page, args.base_url, "/settings", "Settings", "Desktop settings")
+        page.get_by_role("tab", name="Import").click()
+        assert "tab=import" in page.url
+        page.get_by_text("Legacy backup import", exact=True).wait_for()
+
+        # Responsive passes exercise the persistent mobile navigation and card layouts.
+        for width, height, suffix in ((390, 844, "390"), (320, 720, "320")):
+            page.set_viewport_size({"width": width, "height": height})
+            assert_route(page, args.base_url, "/", "Runtime", f"{suffix}px runtime")
+            assert_touch_targets(page, f"{suffix}px runtime")
+            page.screenshot(path=args.output / f"runtime-{suffix}.png", full_page=True)
+            if width == 320:
+                page.get_by_role(
+                    "button", name="Desired state: running"
+                ).first.click()
+                page.locator("[data-slot='tooltip-content']").filter(
+                    has_text="Desired state: running"
+                ).wait_for(state="visible")
+                page.keyboard.press("Escape")
+            nav_boxes = []
+            for destination in ("Runtime", "Accounts", "Presets", "Logs", "Settings"):
+                nav_link = page.locator("header").get_by_role("link", name=destination, exact=True)
+                assert nav_link.is_visible()
+                nav_boxes.append(nav_link.bounding_box())
+            assert max(box["y"] for box in nav_boxes) - min(box["y"] for box in nav_boxes) < 1
+            if width == 390:
+                page.locator("main").get_by_role("link", name="Open demo_running").click(position={"x": 20, "y": 20})
+                page.wait_for_url("**/accounts/*")
+                page.get_by_text("Launch source", exact=True).wait_for()
+                assert_no_horizontal_overflow(page, "390px runtime card destination")
+                page.goto(f"{args.base_url}/", wait_until="networkidle")
+            page.locator("header").get_by_role("link", name="Accounts", exact=True).press("Enter")
+            page.wait_for_url(f"{args.base_url}/accounts")
+            page.get_by_role("heading", name="Accounts", exact=True).wait_for()
+            assert_no_horizontal_overflow(page, f"{suffix}px accounts")
+            assert_touch_targets(page, f"{suffix}px accounts")
+            page.screenshot(path=args.output / f"accounts-{suffix}.png", full_page=True)
+            detail_account = (
+                "demo_source_change" if width == 390 else "demo_running"
+            )
+            page.locator("main").get_by_role(
+                "link", name=f"Open {detail_account}"
+            ).click(position={"x": 20, "y": 20})
+            if width == 390:
+                page.get_by_text("Launch source change", exact=True).wait_for()
+                page.get_by_label("Launch source diff").wait_for()
+            else:
+                page.get_by_text("Launch source", exact=True).wait_for()
+            assert_no_horizontal_overflow(page, f"{suffix}px account workspace")
+            assert_touch_targets(page, f"{suffix}px account workspace")
+            page.screenshot(path=args.output / f"account-workspace-{suffix}.png", full_page=True)
+
+            for route, heading in (
+                ("/presets", "Presets"),
+                ("/logs", "Logs"),
+                ("/settings", "Settings"),
+            ):
+                assert_route(page, args.base_url, route, heading, f"{suffix}px {heading}")
+                assert_touch_targets(page, f"{suffix}px {heading}")
+
+            if width == 390:
+                page.goto(f"{args.base_url}/presets", wait_until="networkidle")
+                page.get_by_role("link", name="Open Demo drops rotation").click()
+                page.get_by_role("tab", name="Assignments").click()
+                assert "tab=assignments" in page.url
+                page.get_by_text("Account assignments", exact=True).wait_for()
+                assert_no_horizontal_overflow(page, "390px preset workspace")
+                assert_touch_targets(page, "390px preset workspace")
+                page.screenshot(path=args.output / "preset-workspace-390.png", full_page=True)
 
         browser.close()
 
+    ignored = (
+        "Failed to load resource: the server responded with a status of 400",
+    )
+    console_errors = [error for error in console_errors if not error.startswith(ignored)]
     if console_errors or page_errors:
         raise AssertionError(
             f"Browser errors: console={console_errors!r}, page={page_errors!r}"

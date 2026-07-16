@@ -1,7 +1,0 @@
-{% load control_room %}
-<div class="state-pair" data-state-pair aria-label="Desired {{ desired }}, observed {{ observed }}, {{ convergence }}">
-  <span class="state-block state-pair__state"><small>Desired state</small><strong data-tone="{{ desired|state_tone }}">{{ desired|capfirst }}</strong></span>
-  <span class="state-pair__arrow state-pair__connector" aria-hidden="true">→</span>
-  <span class="state-block state-pair__state"><small>Observed state</small><strong data-tone="{{ observed|state_tone }}">{{ observed|capfirst }}</strong></span>
-  <span class="status-chip state-pair__convergence" data-tone="{{ convergence|state_tone }}">{{ convergence|capfirst }}</span>
-</div>

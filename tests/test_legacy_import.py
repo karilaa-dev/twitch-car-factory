@@ -526,7 +526,7 @@ def test_import_replacement_stops_accounts_affected_by_preset_changes(staff):
 
 
 @pytest.mark.django_db
-def test_settings_import_views_preview_and_confirm_without_rendering_secrets(staff):
+def test_settings_import_api_previews_and_confirms_without_rendering_secrets(staff):
     password = "view-only-password-secret"
     auth_token = "view-only-auth-token-secret"
     archive = _archive(
@@ -545,7 +545,7 @@ def test_settings_import_views_preview_and_confirm_without_rendering_secrets(sta
     client.force_login(staff)
 
     preview_response = client.post(
-        reverse("controller:settings_import"),
+        reverse("controller:api:settings_imports"),
         {
             "archive": SimpleUploadedFile(
                 "legacy-install.zip",
@@ -555,28 +555,27 @@ def test_settings_import_views_preview_and_confirm_without_rendering_secrets(sta
         },
     )
 
-    assert preview_response.status_code == 200
-    preview_html = preview_response.content.decode()
-    assert "Import preview" in preview_html
-    assert "PrimaryUser" in preview_html
-    assert password not in preview_html
-    assert auth_token not in preview_html
+    assert preview_response.status_code == 201
+    preview_json = preview_response.content.decode()
+    assert "PrimaryUser" in preview_json
+    assert password not in preview_json
+    assert auth_token not in preview_json
     assert not MinerAccount.objects.exists()
     draft = LegacyImportDraft.objects.get()
     assert draft.actor == staff
     assert draft.consumed_at is None
 
     confirm_response = client.post(
-        reverse("controller:settings_import_confirm"),
-        {"draft_id": str(draft.pk)},
+        reverse("controller:api:settings_import_confirm", args=[draft.pk]),
+        data=json.dumps({"replace": False, "acknowledged": False, "confirmation": ""}),
+        content_type="application/json",
     )
 
     assert confirm_response.status_code == 200
-    result_html = confirm_response.content.decode()
-    assert "Legacy data imported" in result_html
-    assert "No imported account was started" in result_html
-    assert password not in result_html
-    assert auth_token not in result_html
+    result_json = confirm_response.content.decode()
+    assert '"created_accounts":["primary"]' in result_json
+    assert password not in result_json
+    assert auth_token not in result_json
     account = MinerAccount.objects.get(config_key="primary")
     assert account.runtime_state.desired_state == MinerInstanceState.DesiredState.STOPPED
     draft.refresh_from_db()
@@ -589,7 +588,7 @@ def test_settings_import_preview_and_confirm_require_csrf(staff):
     client.force_login(staff)
 
     preview_response = client.post(
-        reverse("controller:settings_import"),
+        reverse("controller:api:settings_imports"),
         {
             "archive": SimpleUploadedFile(
                 "legacy-install.zip",
@@ -604,8 +603,9 @@ def test_settings_import_preview_and_confirm_require_csrf(staff):
 
     draft = prepare_legacy_import(_archive(), staff)
     confirm_response = client.post(
-        reverse("controller:settings_import_confirm"),
-        {"draft_id": str(draft.pk)},
+        reverse("controller:api:settings_import_confirm", args=[draft.pk]),
+        data=json.dumps({}),
+        content_type="application/json",
     )
 
     assert confirm_response.status_code == 403
@@ -626,13 +626,13 @@ def test_settings_import_confirm_rejects_a_draft_owned_by_another_staff_user(sta
     client.force_login(other_staff)
 
     response = client.post(
-        reverse("controller:settings_import_confirm"),
-        {"draft_id": str(draft.pk)},
-        follow=True,
+        reverse("controller:api:settings_import_confirm", args=[draft.pk]),
+        data=json.dumps({}),
+        content_type="application/json",
     )
 
-    assert response.status_code == 200
-    assert response.redirect_chain == [(reverse("controller:settings_import"), 302)]
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "validation_error"
     assert "belongs to another staff account" in response.content.decode()
     assert not MinerAccount.objects.exists()
     draft.refresh_from_db()

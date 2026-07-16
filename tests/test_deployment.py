@@ -263,37 +263,47 @@ class DockerWorkflowTests(SimpleTestCase):
             check=False,
         )
 
-    def test_smoke_gate_runs_before_registry_login_and_multiarch_publish(self):
+    def test_smoke_gate_runs_before_registry_login_and_amd64_publish(self):
         workflow = self.workflow()
-        steps = workflow["jobs"]["build-and-push"]["steps"]
-        uses = [step.get("uses") for step in steps]
+        smoke_job = workflow["jobs"]["build-smoke"]
+        publish_job = workflow["jobs"]["build-and-push"]
+        smoke_steps = smoke_job["steps"]
+        publish_steps = publish_job["steps"]
+        smoke_uses = [step.get("uses") for step in smoke_steps]
+        publish_uses = [step.get("uses") for step in publish_steps]
 
-        qemu_index = uses.index("docker/setup-qemu-action@v4")
-        buildx_index = uses.index("docker/setup-buildx-action@v3")
-        build_indexes = [
+        self.assertEqual(smoke_job["needs"], "test")
+        self.assertEqual(publish_job["needs"], ["test", "build-smoke"])
+        self.assertEqual(publish_job["if"], "github.event_name != 'pull_request'")
+        self.assertNotIn("docker/setup-qemu-action@v4", smoke_uses + publish_uses)
+
+        smoke_buildx_index = smoke_uses.index("docker/setup-buildx-action@v3")
+        smoke_build_indexes = [
             index
-            for index, value in enumerate(uses)
+            for index, value in enumerate(smoke_uses)
             if value == "docker/build-push-action@v6"
         ]
-        self.assertEqual(len(build_indexes), 2)
-        smoke_build_index, publish_build_index = build_indexes
+        self.assertEqual(len(smoke_build_indexes), 1)
+        smoke_build_index = smoke_build_indexes[0]
         smoke_run_index = next(
             index
-            for index, step in enumerate(steps)
+            for index, step in enumerate(smoke_steps)
             if step.get("name") == "Run fresh-volume crash/recovery smoke"
         )
-        tags_index = next(index for index, step in enumerate(steps) if step.get("id") == "tags")
-        login_index = uses.index("docker/login-action@v3")
+        publish_buildx_index = publish_uses.index("docker/setup-buildx-action@v3")
+        publish_build_index = publish_uses.index("docker/build-push-action@v6")
+        tags_index = next(
+            index for index, step in enumerate(publish_steps) if step.get("id") == "tags"
+        )
+        login_index = publish_uses.index("docker/login-action@v3")
 
-        self.assertLess(qemu_index, buildx_index)
-        self.assertLess(buildx_index, tags_index)
-        self.assertLess(tags_index, smoke_build_index)
+        self.assertLess(smoke_buildx_index, smoke_build_index)
         self.assertLess(smoke_build_index, smoke_run_index)
-        self.assertLess(smoke_run_index, login_index)
+        self.assertLess(publish_buildx_index, tags_index)
+        self.assertLess(tags_index, login_index)
         self.assertLess(login_index, publish_build_index)
-        self.assertEqual(steps[qemu_index]["with"]["platforms"], "arm64")
         self.assertEqual(
-            steps[smoke_build_index]["with"],
+            smoke_steps[smoke_build_index]["with"],
             {
                 "context": ".",
                 "load": True,
@@ -304,19 +314,19 @@ class DockerWorkflowTests(SimpleTestCase):
             },
         )
         self.assertEqual(
-            steps[smoke_run_index]["env"],
+            smoke_steps[smoke_run_index]["env"],
             {"SMOKE_IMAGE": "twitch-farm-smoke:${{ github.sha }}"},
         )
-        self.assertEqual(steps[smoke_run_index]["timeout-minutes"], 5)
+        self.assertEqual(smoke_steps[smoke_run_index]["timeout-minutes"], 5)
         self.assertEqual(
-            steps[smoke_run_index]["run"],
+            smoke_steps[smoke_run_index]["run"],
             'bash tests/docker_crash_recovery_smoke.sh "$SMOKE_IMAGE"',
         )
-        self.assertTrue(steps[publish_build_index]["with"]["push"])
-        self.assertEqual(steps[publish_build_index]["with"]["context"], ".")
+        self.assertTrue(publish_steps[publish_build_index]["with"]["push"])
+        self.assertEqual(publish_steps[publish_build_index]["with"]["context"], ".")
         self.assertEqual(
-            steps[publish_build_index]["with"]["platforms"],
-            "linux/amd64,linux/arm64",
+            publish_steps[publish_build_index]["with"]["platforms"],
+            "linux/amd64",
         )
 
     def test_smoke_gate_seeds_the_database_and_uses_disposable_state(self):
@@ -378,6 +388,10 @@ class DockerWorkflowTests(SimpleTestCase):
             {"contents": "read"},
         )
         self.assertEqual(
+            workflow["jobs"]["build-smoke"]["permissions"],
+            {"contents": "read"},
+        )
+        self.assertEqual(
             workflow["jobs"]["build-and-push"]["permissions"],
             {"contents": "read", "packages": "write"},
         )
@@ -387,7 +401,7 @@ class DockerWorkflowTests(SimpleTestCase):
             for step in job["steps"]
             if step.get("uses") == "actions/checkout@v4"
         ]
-        self.assertEqual(len(checkout_steps), 2)
+        self.assertEqual(len(checkout_steps), 3)
         for step in checkout_steps:
             self.assertEqual(step.get("with"), {"persist-credentials": False})
 
