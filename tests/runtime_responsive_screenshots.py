@@ -16,7 +16,7 @@ def assert_no_horizontal_overflow(page: Page, label: str) -> None:
 
 def assert_mobile_touch_targets(page: Page) -> None:
     targets = page.eval_on_selector_all(
-        "main button, main [role='link'], header button, header a",
+        "main button, main a, main [role='link'], header button, header a",
         """
         elements => elements
           .filter(element => element.getClientRects().length > 0)
@@ -24,12 +24,17 @@ def assert_mobile_touch_targets(page: Page) -> None:
             const rect = element.getBoundingClientRect();
             return {
               height: rect.height,
+              width: rect.width,
               name: element.getAttribute('aria-label') || element.textContent || '',
             };
           })
         """,
     )
-    undersized = [target for target in targets if target["height"] < 43.5]
+    undersized = [
+        target
+        for target in targets
+        if target["height"] < 43.5 or target["width"] < 43.5
+    ]
     if undersized:
         raise AssertionError(f"Undersized mobile touch targets: {undersized[:6]!r}")
 

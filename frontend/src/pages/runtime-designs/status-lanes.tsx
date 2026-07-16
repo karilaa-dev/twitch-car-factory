@@ -29,38 +29,12 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import { formatTime } from "@/lib/api"
+import { needsRuntimeAttention } from "@/lib/runtime-state"
 import { cn } from "@/lib/utils"
-import type { AccountSummary, RuntimeSnapshot, RuntimeStatus } from "@/types"
+import type { AccountSummary, RuntimeSnapshot } from "@/types"
 
 type Action = "start" | "stop" | "restart"
 type Tone = "attention" | "running" | "idle"
-
-const faultStates = new Set<RuntimeStatus>([
-  "degraded",
-  "failed",
-  "offline",
-  "stale",
-  "unknown",
-])
-const transitions = new Set<RuntimeStatus>([
-  "starting",
-  "stopping",
-  "restarting",
-  "queued",
-  "leased",
-])
-
-function needsAttention(account: AccountSummary) {
-  if (account.open_incident || faultStates.has(account.observed)) return true
-  if (
-    account.desired === "running" &&
-    (!account.is_active || !account.has_credentials)
-  )
-    return true
-  return (
-    !transitions.has(account.observed) && account.observed !== account.desired
-  )
-}
 
 function belongsInRunning(account: AccountSummary) {
   return (
@@ -82,8 +56,10 @@ export function MobileStatusLanes({
   onGlobalAction: (value: Action) => void
   onAccountAction: (id: number, value: Action) => void
 }) {
-  const attention = data.accounts.filter(needsAttention)
-  const healthy = data.accounts.filter((account) => !needsAttention(account))
+  const attention = data.accounts.filter(needsRuntimeAttention)
+  const healthy = data.accounts.filter(
+    (account) => !needsRuntimeAttention(account)
+  )
   const running = healthy.filter(belongsInRunning)
   const idle = healthy.filter((account) => !belongsInRunning(account))
   const lanes: Array<{

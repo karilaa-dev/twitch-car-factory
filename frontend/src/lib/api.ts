@@ -1,6 +1,11 @@
 import { toast } from "sonner"
 
-import { ApiError, type ApiResponse } from "@/types"
+import {
+  ApiError,
+  type ApiErrorBody,
+  type ApiNotice,
+  type ApiResponse,
+} from "@/types"
 
 const API_ROOT = "/api/v1"
 
@@ -12,9 +17,50 @@ function csrfToken(): string {
   return token ? decodeURIComponent(token.slice("csrftoken=".length)) : ""
 }
 
+function throwApiError(body: ApiErrorBody, status: number): never {
+  const error = new ApiError(body, status)
+  if (error.status === 401 && window.location.pathname !== "/login") {
+    window.location.assign("/login")
+  }
+  throw error
+}
+
+function invalidResponse(status: number): never {
+  return throwApiError(
+    {
+      code: "invalid_response",
+      message: "The server returned an invalid response.",
+      fields: {},
+    },
+    status
+  )
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null
+}
+
+function isErrorResponse(value: unknown): value is { error: ApiErrorBody } {
+  if (!isRecord(value) || !isRecord(value.error)) return false
+  return (
+    typeof value.error.code === "string" &&
+    typeof value.error.message === "string" &&
+    isRecord(value.error.fields)
+  )
+}
+
+function isNotice(value: unknown): value is ApiNotice {
+  return (
+    isRecord(value) &&
+    typeof value.level === "string" &&
+    ["info", "success", "warning", "error"].includes(value.level) &&
+    typeof value.message === "string"
+  )
+}
+
 export async function api<T>(
   path: string,
-  init: RequestInit & { json?: unknown } = {},
+  init: RequestInit & { json?: unknown } = {}
 ): Promise<T> {
   const headers = new Headers(init.headers)
   let body = init.body
@@ -34,24 +80,40 @@ export async function api<T>(
     headers,
     credentials: "same-origin",
   })
-  const payload = (await response.json()) as
-    | ApiResponse<T>
-    | { error: { code: string; message: string; fields: Record<string, string[]> } }
-  if (!response.ok || "error" in payload) {
-    const error =
-      "error" in payload
-        ? new ApiError(payload.error, response.status)
-        : new ApiError(
-            { code: "request_failed", message: "The request failed.", fields: {} },
-            response.status,
-          )
-    if (error.status === 401 && window.location.pathname !== "/login") {
-      window.location.assign("/login")
-    }
-    throw error
+  if (response.status === 204) return undefined as T
+
+  const text = await response.text()
+  let decoded: unknown
+  try {
+    decoded = JSON.parse(text)
+  } catch {
+    return invalidResponse(response.status)
   }
+  if (isErrorResponse(decoded)) {
+    return throwApiError(decoded.error, response.status)
+  }
+  if (!response.ok) {
+    return throwApiError(
+      { code: "request_failed", message: "The request failed.", fields: {} },
+      response.status
+    )
+  }
+  if (
+    !isRecord(decoded) ||
+    !("data" in decoded) ||
+    !Array.isArray(decoded.notices) ||
+    !decoded.notices.every(isNotice)
+  ) {
+    return invalidResponse(response.status)
+  }
+  const payload = decoded as unknown as ApiResponse<T>
   for (const notice of payload.notices) {
-    const notify = notice.level === "error" ? toast.error : notice.level === "warning" ? toast.warning : toast.success
+    const notify =
+      notice.level === "error"
+        ? toast.error
+        : notice.level === "warning"
+          ? toast.warning
+          : toast.success
     notify(notice.message)
   }
   return payload.data
@@ -66,10 +128,12 @@ export function mutationError(error: unknown) {
   }
 }
 
+const dateTimeFormatter = new Intl.DateTimeFormat(undefined, {
+  dateStyle: "medium",
+  timeStyle: "short",
+})
+
 export function formatTime(value: string | null | undefined): string {
   if (!value) return "—"
-  return new Intl.DateTimeFormat(undefined, {
-    dateStyle: "medium",
-    timeStyle: "short",
-  }).format(new Date(value))
+  return dateTimeFormatter.format(new Date(value))
 }

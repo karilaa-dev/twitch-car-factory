@@ -341,8 +341,25 @@ class ApiContractTests(TestCase):
         )
         error = self.assert_error(response, "validation_error", 400)
         self.assertIn("config_key", error["fields"])
-        self.assertIn("custom_channels", error["fields"])
+        self.assertIn("channels", error["fields"])
+        self.assertNotIn("custom_channels", error["fields"])
         self.assertNotIn("do-not-echo-this", response.content.decode())
+
+        missing_preset = self.json_request(
+            "post",
+            self.api("accounts"),
+            {
+                "config_key": "preset-missing",
+                "username": "preset_user",
+                "password": "do-not-echo-this",
+                "mode": "preset",
+                "preset_id": None,
+                "channels": [],
+            },
+        )
+        preset_error = self.assert_error(missing_preset, "validation_error", 400)
+        self.assertIn("preset_id", preset_error["fields"])
+        self.assertNotIn("preset", preset_error["fields"])
 
     def test_inactive_account_is_read_only_but_stop_remains_available(self):
         self.login()
@@ -402,6 +419,17 @@ class ApiContractTests(TestCase):
         created = self.assert_envelope(created_response, 201)
         preset = ChannelPreset.objects.get(pk=created["id"])
         self.assertEqual(preset.channel_names, ["one", "two"])
+
+        invalid_assignment = self.json_request(
+            "put",
+            self.api("preset_assignments", preset.pk),
+            {"account_ids": [999999]},
+        )
+        assignment_error = self.assert_error(
+            invalid_assignment, "validation_error", 400
+        )
+        self.assertIn("account_ids", assignment_error["fields"])
+        self.assertNotIn("accounts", assignment_error["fields"])
 
         assignment = self.json_request(
             "put",

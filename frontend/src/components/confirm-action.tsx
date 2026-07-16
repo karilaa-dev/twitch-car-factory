@@ -1,4 +1,4 @@
-import type { ReactElement, ReactNode } from "react"
+import type { ReactElement } from "react"
 
 import {
   AlertDialog,
@@ -19,7 +19,7 @@ export function ConfirmAction({
   confirmLabel,
   onConfirm,
 }: {
-  trigger: ReactNode
+  trigger: ReactElement
   title: string
   description: string
   confirmLabel: string
@@ -27,7 +27,7 @@ export function ConfirmAction({
 }) {
   return (
     <AlertDialog>
-      <AlertDialogTrigger render={trigger as ReactElement} />
+      <AlertDialogTrigger render={trigger} />
       <AlertDialogContent>
         <AlertDialogHeader>
           <AlertDialogTitle>{title}</AlertDialogTitle>

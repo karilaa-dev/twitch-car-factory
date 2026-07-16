@@ -7,6 +7,7 @@ validation rules identical while the browser presentation is React-owned.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from functools import wraps
@@ -106,9 +107,12 @@ def _validation_error(exc: ValidationError):
     )
 
 
-def _form_error(form):
+def _form_error(form, *, aliases: Mapping[str, str] | None = None):
+    aliases = aliases or {}
     fields = {
-        ("__all__" if key == "__all__" else key): [item["message"] for item in values]
+        ("__all__" if key == "__all__" else aliases.get(key, key)): [
+            item["message"] for item in values
+        ]
         for key, values in form.errors.get_json_data(escape_html=False).items()
     }
     return _error(
@@ -601,7 +605,9 @@ def accounts(request: HttpRequest):
         payload["preset"] = payload.pop("preset_id")
     form = AccountCreateForm(_form_data(payload))
     if not form.is_valid():
-        return _form_error(form)
+        return _form_error(
+            form, aliases={"custom_channels": "channels", "preset": "preset_id"}
+        )
     mode = form.cleaned_data["mode"]
     account = create_account(
         config_key=form.cleaned_data["config_key"],
@@ -688,7 +694,9 @@ def account_channel_source(request: HttpRequest, pk: int):
         payload["preset"] = payload.pop("preset_id")
     form = AccountChannelSelectionForm(_form_data(payload), account=account)
     if not form.is_valid():
-        return _form_error(form)
+        return _form_error(
+            form, aliases={"custom_channels": "channels", "preset": "preset_id"}
+        )
     mode = form.cleaned_data["mode"]
     set_account_channel_selection(
         account,
@@ -800,7 +808,7 @@ def preset_assignments(request: HttpRequest, pk: int):
         _form_data({"accounts": account_ids}, list_fields=("accounts",)), preset=preset
     )
     if not form.is_valid():
-        return _form_error(form)
+        return _form_error(form, aliases={"accounts": "account_ids"})
     selected = set(form.cleaned_data["accounts"].values_list("pk", flat=True))
     current = {
         item.account_id: item.account

@@ -23,27 +23,11 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { formatTime } from "@/lib/api"
+import { needsRuntimeAttention } from "@/lib/runtime-state"
 import { cn } from "@/lib/utils"
-import type { AccountSummary, RuntimeSnapshot, RuntimeStatus } from "@/types"
+import type { AccountSummary, RuntimeSnapshot } from "@/types"
 
 type Action = "start" | "stop" | "restart"
-
-const problemStates = new Set<RuntimeStatus>([
-  "degraded",
-  "failed",
-  "offline",
-  "stale",
-  "unknown",
-])
-
-function needsAttention(account: AccountSummary) {
-  return Boolean(
-    account.open_incident ||
-    problemStates.has(account.observed) ||
-    (account.desired === "running" && account.observed !== "running") ||
-    (account.desired === "stopped" && account.observed !== "stopped")
-  )
-}
 
 function AccountActions({
   account,
@@ -94,12 +78,12 @@ export function DesktopOperationsGrid({
   onGlobalAction: (value: Action) => void
   onAccountAction: (id: number, value: Action) => void
 }) {
-  const accounts = [...data.accounts].sort(
+  const accounts = data.accounts.toSorted(
     (a, b) =>
-      Number(needsAttention(b)) - Number(needsAttention(a)) ||
+      Number(needsRuntimeAttention(b)) - Number(needsRuntimeAttention(a)) ||
       a.username.localeCompare(b.username)
   )
-  const attention = accounts.filter(needsAttention).length
+  const attention = accounts.filter(needsRuntimeAttention).length
 
   return (
     <div className="grid min-w-0 gap-4">
@@ -217,12 +201,12 @@ export function DesktopOperationsGrid({
                   aria-label={`Open ${account.username}`}
                   className={cn(
                     "h-16",
-                    needsAttention(account) && "bg-destructive/[0.04]"
+                    needsRuntimeAttention(account) && "bg-destructive/[0.04]"
                   )}
                 >
                   <TableCell>
                     <div className="flex items-start gap-2">
-                      {needsAttention(account) ? (
+                      {needsRuntimeAttention(account) ? (
                         <AlertTriangle className="mt-0.5 size-4 text-destructive" />
                       ) : (
                         <span className="mt-1.5 size-2 rounded-full bg-success" />

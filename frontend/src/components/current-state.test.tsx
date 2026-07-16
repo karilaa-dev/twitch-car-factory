@@ -26,13 +26,15 @@ describe("CurrentState", () => {
     expect(await screen.findByText("Desired state: running")).toBeVisible()
   })
 
-  it("keeps stopped and broken states quiet", () => {
+  it("shows startup intent from stopped but keeps broken states quiet", () => {
     const { rerender } = render(
       <TooltipProvider>
         <CurrentState observed="stopped" desired="running" />
       </TooltipProvider>
     )
-    expect(screen.queryByRole("button")).not.toBeInTheDocument()
+    expect(
+      screen.getByRole("button", { name: "Desired state: running" })
+    ).toBeVisible()
 
     rerender(
       <TooltipProvider>

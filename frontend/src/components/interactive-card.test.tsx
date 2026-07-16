@@ -20,7 +20,7 @@ describe("InteractiveCard", () => {
           <button onClick={action}>Restart</button>
         </InteractiveCard>
         <Location />
-      </MemoryRouter>,
+      </MemoryRouter>
     )
 
     await user.click(screen.getByRole("button", { name: "Restart" }))
@@ -28,6 +28,25 @@ describe("InteractiveCard", () => {
     expect(screen.getByRole("status")).toHaveTextContent("/")
 
     await user.click(screen.getByRole("link", { name: "Open account seven" }))
+    expect(screen.getByRole("status")).toHaveTextContent("/accounts/7")
+  })
+
+  it("uses native link keyboard semantics", async () => {
+    const user = userEvent.setup()
+    render(
+      <MemoryRouter>
+        <InteractiveCard to="/accounts/7" aria-label="Open account seven">
+          Account seven
+        </InteractiveCard>
+        <Location />
+      </MemoryRouter>
+    )
+    const card = screen.getByRole("link", { name: "Open account seven" })
+    card.focus()
+
+    await user.keyboard(" ")
+    expect(screen.getByRole("status")).toHaveTextContent("/")
+    await user.keyboard("{Enter}")
     expect(screen.getByRole("status")).toHaveTextContent("/accounts/7")
   })
 })

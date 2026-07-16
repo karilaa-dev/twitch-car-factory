@@ -2,9 +2,12 @@ import "@testing-library/jest-dom/vitest"
 import { cleanup } from "@testing-library/react"
 import { afterEach } from "vitest"
 
-afterEach(() => cleanup())
-
 const values = new Map<string, string>()
+afterEach(() => {
+  cleanup()
+  values.clear()
+})
+
 const storage: Storage = {
   get length() {
     return values.size

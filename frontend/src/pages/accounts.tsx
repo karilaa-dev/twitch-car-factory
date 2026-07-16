@@ -9,6 +9,7 @@ import {
 } from "@tanstack/react-table"
 import {
   Archive,
+  AlertTriangle,
   ArrowLeft,
   History,
   KeyRound,
@@ -20,13 +21,7 @@ import {
   Square,
   UserRound,
 } from "lucide-react"
-import {
-  Controller,
-  useForm,
-  type FieldValues,
-  type Path,
-  type UseFormSetError,
-} from "react-hook-form"
+import { Controller, useForm } from "react-hook-form"
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom"
 import { toast } from "sonner"
 import { z } from "zod"
@@ -90,8 +85,8 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { api, formatTime, mutationError } from "@/lib/api"
+import { applyApiFormErrors } from "@/lib/form-errors"
 import {
-  ApiError,
   type AccountDetail,
   type AccountList,
   type AccountSummary,
@@ -157,6 +152,17 @@ export function AccountsPage() {
   })
 
   if (accounts.isLoading) return <PageSkeleton />
+  if (!accounts.data)
+    return (
+      <Alert variant="destructive">
+        <AlertTriangle />
+        <AlertTitle>Accounts unavailable</AlertTitle>
+        <AlertDescription>
+          The account inventory could not be loaded. Try again before making
+          changes.
+        </AlertDescription>
+      </Alert>
+    )
   return (
     <>
       <PageHeader
@@ -330,7 +336,21 @@ export function NewAccountPage() {
       toast.success(`Account ${account.config_key} created.`)
       navigate(`/accounts/${account.id}`)
     } catch (error) {
-      mapFormError(error, form.setError)
+      applyApiFormErrors(error, form.setError, {
+        fields: [
+          "config_key",
+          "username",
+          "password",
+          "mode",
+          "preset_id",
+          "channels",
+          "start_after_save",
+        ],
+        aliases: {
+          custom_channels: "channels",
+          preset: "preset_id",
+        },
+      })
     } finally {
       setPending(false)
     }
@@ -342,6 +362,19 @@ export function NewAccountPage() {
       preset.name,
     ])
   )
+
+  if (accounts.isLoading) return <PageSkeleton />
+  if (!accounts.data)
+    return (
+      <Alert variant="destructive">
+        <AlertTriangle />
+        <AlertTitle>Account setup unavailable</AlertTitle>
+        <AlertDescription>
+          Presets and farm defaults could not be loaded, so account creation is
+          disabled.
+        </AlertDescription>
+      </Alert>
+    )
 
   return (
     <>
@@ -416,8 +449,11 @@ export function NewAccountPage() {
                 control={form.control}
                 render={({ field }) => (
                   <Field>
-                    <FieldLabel>Initial channel source</FieldLabel>
+                    <FieldLabel id="initial-channel-source-label">
+                      Initial channel source
+                    </FieldLabel>
                     <ToggleGroup
+                      aria-labelledby="initial-channel-source-label"
                       value={[field.value]}
                       onValueChange={(values) =>
                         values[0] && field.onChange(values[0])
@@ -457,7 +493,12 @@ export function NewAccountPage() {
                   control={form.control}
                   render={({ field, fieldState }) => (
                     <Field data-invalid={Boolean(fieldState.error)}>
-                      <FieldLabel>Preset</FieldLabel>
+                      <FieldLabel
+                        id="initial-preset-label"
+                        htmlFor="initial-preset"
+                      >
+                        Preset
+                      </FieldLabel>
                       <Select
                         items={presetItems}
                         value={field.value ? String(field.value) : null}
@@ -465,7 +506,11 @@ export function NewAccountPage() {
                           field.onChange(value ? Number(value) : null)
                         }
                       >
-                        <SelectTrigger className="w-full">
+                        <SelectTrigger
+                          id="initial-preset"
+                          aria-labelledby="initial-preset-label"
+                          className="w-full"
+                        >
                           <SelectValue placeholder="Select a preset" />
                         </SelectTrigger>
                         <SelectContent>
@@ -750,18 +795,35 @@ const identitySchema = z.object({
 })
 type IdentityValues = z.infer<typeof identitySchema>
 
+type AccountSourceDraft = {
+  mode: AccountDetail["configuration"]["mode"]
+  presetId: number | null
+  channels: string[]
+}
+
+function updateAccountSourceDraft(
+  current: AccountSourceDraft,
+  update: Partial<AccountSourceDraft>
+) {
+  return { ...current, ...update }
+}
+
 function AccountChannelSourceSettings({ account }: { account: AccountDetail }) {
   const queryClient = useQueryClient()
-  const [mode, setMode] = React.useState(account.configuration.mode)
-  const [presetId, setPresetId] = React.useState<number | null>(
-    account.configuration.preset_id
-  )
-  const [channels, setChannels] = React.useState(account.configuration.channels)
+  const [source, updateSource] = React.useReducer(updateAccountSourceDraft, {
+    mode: account.configuration.mode,
+    presetId: account.configuration.preset_id,
+    channels: account.configuration.channels,
+  })
   const sourceMutation = useMutation({
     mutationFn: () =>
       api<AccountDetail>(`/accounts/${account.id}/channel-source`, {
         method: "PUT",
-        json: { mode, preset_id: presetId, channels },
+        json: {
+          mode: source.mode,
+          preset_id: source.presetId,
+          channels: source.channels,
+        },
       }),
     onSuccess: async () => {
       toast.success("Channel source updated.")
@@ -789,11 +851,15 @@ function AccountChannelSourceSettings({ account }: { account: AccountDetail }) {
       <CardContent>
         <FieldGroup>
           <Field data-disabled={disabled}>
-            <FieldLabel>Source mode</FieldLabel>
+            <FieldLabel id="account-source-mode-label">Source mode</FieldLabel>
             <ToggleGroup
-              value={[mode]}
+              aria-labelledby="account-source-mode-label"
+              value={[source.mode]}
               onValueChange={(values) =>
-                values[0] && setMode(values[0] as typeof mode)
+                values[0] &&
+                updateSource({
+                  mode: values[0] as AccountSourceDraft["mode"],
+                })
               }
               variant="outline"
               className="flex-wrap"
@@ -810,18 +876,27 @@ function AccountChannelSourceSettings({ account }: { account: AccountDetail }) {
               ))}
             </ToggleGroup>
           </Field>
-          {mode === "preset" ? (
+          {source.mode === "preset" ? (
             <Field data-disabled={disabled}>
-              <FieldLabel>Preset</FieldLabel>
+              <FieldLabel
+                id="account-source-preset-label"
+                htmlFor="account-source-preset"
+              >
+                Preset
+              </FieldLabel>
               <Select
                 items={presetItems}
-                value={presetId ? String(presetId) : null}
+                value={source.presetId ? String(source.presetId) : null}
                 onValueChange={(value) =>
-                  setPresetId(value ? Number(value) : null)
+                  updateSource({ presetId: value ? Number(value) : null })
                 }
                 disabled={disabled}
               >
-                <SelectTrigger className="w-full">
+                <SelectTrigger
+                  id="account-source-preset"
+                  aria-labelledby="account-source-preset-label"
+                  className="w-full"
+                >
                   <SelectValue placeholder="Select a preset" />
                 </SelectTrigger>
                 <SelectContent>
@@ -836,15 +911,15 @@ function AccountChannelSourceSettings({ account }: { account: AccountDetail }) {
               </Select>
             </Field>
           ) : null}
-          {mode === "custom" ? (
+          {source.mode === "custom" ? (
             <ChannelEditor
               id="account-channels"
-              value={channels}
-              onChange={setChannels}
+              value={source.channels}
+              onChange={(channels) => updateSource({ channels })}
               disabled={disabled}
             />
           ) : null}
-          {mode === "default" ? (
+          {source.mode === "default" ? (
             <Alert>
               <Settings2 />
               <AlertTitle>Farm defaults</AlertTitle>
@@ -889,7 +964,9 @@ function AccountAuthSettings({ account }: { account: AccountDetail }) {
       await queryClient.invalidateQueries({ queryKey: ["account", account.id] })
     } catch (error) {
       identity.setValue("password", "")
-      mapFormError(error, identity.setError)
+      applyApiFormErrors(error, identity.setError, {
+        fields: ["username", "password"],
+      })
     } finally {
       setIdentityPending(false)
     }
@@ -1047,20 +1124,4 @@ function HistoryCard({
       </CardContent>
     </Card>
   )
-}
-
-function mapFormError<T extends FieldValues>(
-  error: unknown,
-  setError: UseFormSetError<T>
-) {
-  if (error instanceof ApiError) {
-    for (const [field, messages] of Object.entries(error.fields))
-      setError((field === "__all__" ? "root" : field) as Path<T>, {
-        message: messages[0],
-      })
-    if (!Object.keys(error.fields).length)
-      setError("root", { message: error.message })
-  } else {
-    setError("root", { message: "The operation could not be completed." })
-  }
 }

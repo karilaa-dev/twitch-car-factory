@@ -46,6 +46,8 @@ provisioning remain deployment operations.
 Requires Python 3.13, [uv](https://docs.astral.sh/uv/), and Node 24 with npm
 for control-room frontend development. Production images build the frontend in
 a Node stage and contain only the generated assets and Python runtime.
+If you use nvm, run `nvm use` inside `frontend/` to select the version in
+`.nvmrc`; other Node version managers can select Node 24 directly.
 
 ```bash
 uv sync --frozen
@@ -53,7 +55,6 @@ export TWITCH_FARM_CREDENTIAL_KEYS="$(uv run python -c 'from cryptography.fernet
 uv run python manage.py migrate
 uv run python manage.py createsuperuser
 cd frontend
-nvm use
 npm ci
 npm run build
 cd ..

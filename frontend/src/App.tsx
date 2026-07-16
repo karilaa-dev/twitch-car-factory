@@ -133,7 +133,7 @@ function AppShell({ session }: { session: SessionData }) {
         <div className="mx-auto flex h-14 max-w-[1600px] items-center gap-3 px-3 sm:px-5 lg:px-8">
           <Link
             to="/"
-            className="flex min-h-11 min-w-0 items-center gap-2 rounded-lg font-medium focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none"
+            className="flex min-h-11 min-w-11 items-center gap-2 rounded-lg font-medium focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none"
           >
             <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground">
               <Bot className="size-4" />

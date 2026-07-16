@@ -21,11 +21,7 @@ function shouldShowDesiredState(
   observed: RuntimeStatus,
   desired: "running" | "stopped"
 ) {
-  return (
-    observed !== desired &&
-    observed !== "stopped" &&
-    !brokenStates.has(observed)
-  )
+  return observed !== desired && !brokenStates.has(observed)
 }
 
 export function CurrentState({

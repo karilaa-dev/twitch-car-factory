@@ -16,10 +16,22 @@ import {
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable"
 import { CSS } from "@dnd-kit/utilities"
-import { CheckCircle2, CircleHelp, GripVertical, Plus, Trash2, XCircle } from "lucide-react"
+import {
+  CheckCircle2,
+  CircleHelp,
+  GripVertical,
+  Plus,
+  Trash2,
+  XCircle,
+} from "lucide-react"
 
 import { Button } from "@/components/ui/button"
-import { Field, FieldDescription, FieldError, FieldLabel } from "@/components/ui/field"
+import {
+  Field,
+  FieldDescription,
+  FieldError,
+  FieldLabel,
+} from "@/components/ui/field"
 import {
   InputGroup,
   InputGroupAddon,
@@ -28,11 +40,28 @@ import {
 } from "@/components/ui/input-group"
 import { api } from "@/lib/api"
 
-type ValidationStatus = "idle" | "checking" | "exists" | "missing" | "unverified"
+type ValidationStatus =
+  "idle" | "checking" | "exists" | "missing" | "unverified"
 type ChannelItem = { id: string; name: string; status: ValidationStatus }
 
 function makeId() {
-  return globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)
+  return (
+    globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)
+  )
+}
+
+function normalizedChannels(items: ChannelItem[]) {
+  const normalized: string[] = []
+  const seen = new Set<string>()
+  for (const item of items) {
+    const name = item.name.trim()
+    const folded = name.toLocaleLowerCase()
+    if (name && !seen.has(folded)) {
+      normalized.push(name)
+      seen.add(folded)
+    }
+  }
+  return normalized
 }
 
 function SortableChannel({
@@ -50,7 +79,14 @@ function SortableChannel({
   onRemove: () => void
   onValidate: () => void
 }) {
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({
     id: item.id,
     disabled,
   })
@@ -126,64 +162,94 @@ export function ChannelEditor({
   error?: string
 }) {
   const [items, setItems] = React.useState<ChannelItem[]>(() =>
-    (value.length ? value : [""]).map((name) => ({ id: makeId(), name, status: "idle" })),
+    (value.length ? value : [""]).map((name) => ({
+      id: makeId(),
+      name,
+      status: "idle",
+    }))
   )
+  const itemsRef = React.useRef(items)
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
-    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
   )
 
-  const publish = React.useCallback(
-    (next: ChannelItem[]) => {
+  const commit = React.useCallback(
+    (next: ChannelItem[], notify = true) => {
+      itemsRef.current = next
       setItems(next)
-      const normalized: string[] = []
-      const seen = new Set<string>()
-      for (const item of next) {
-        const name = item.name.trim()
-        const folded = name.toLocaleLowerCase()
-        if (name && !seen.has(folded)) {
-          normalized.push(name)
-          seen.add(folded)
-        }
-      }
-      onChange(normalized)
+      if (notify) onChange(normalizedChannels(next))
     },
-    [onChange],
+    [onChange]
   )
 
-  const update = (index: number, patch: Partial<ChannelItem>) => {
-    publish(items.map((item, itemIndex) => (itemIndex === index ? { ...item, ...patch } : item)))
+  const update = (
+    itemId: string,
+    patch: Partial<ChannelItem>,
+    options: { expectedName?: string; notify?: boolean } = {}
+  ) => {
+    const current = itemsRef.current
+    const target = current.find((item) => item.id === itemId)
+    if (
+      !target ||
+      (options.expectedName !== undefined &&
+        target.name !== options.expectedName)
+    ) {
+      return false
+    }
+    commit(
+      current.map((item) =>
+        item.id === itemId ? { ...item, ...patch } : item
+      ),
+      options.notify
+    )
+    return true
   }
 
-  const validate = async (index: number) => {
-    const item = items[index]
+  const validate = async (itemId: string) => {
+    const item = itemsRef.current.find((candidate) => candidate.id === itemId)
     if (!item?.name.trim()) return
-    update(index, { status: "checking" })
+    const requestedName = item.name
+    update(
+      item.id,
+      { status: "checking" },
+      { expectedName: requestedName, notify: false }
+    )
     try {
       const result = await api<{ name: string; status: ValidationStatus }>(
-        `/channels/validate?name=${encodeURIComponent(item.name)}`,
+        `/channels/validate?name=${encodeURIComponent(requestedName)}`
       )
-      setItems((current) =>
-        current.map((candidate) =>
-          candidate.id === item.id ? { ...candidate, name: result.name, status: result.status } : candidate,
-        ),
+      update(
+        item.id,
+        { name: result.name, status: result.status },
+        { expectedName: requestedName }
       )
     } catch {
-      update(index, { status: "unverified" })
+      update(
+        item.id,
+        { status: "unverified" },
+        { expectedName: requestedName, notify: false }
+      )
     }
   }
 
   const dragEnd = ({ active, over }: DragEndEvent) => {
     if (!over || active.id === over.id) return
-    const oldIndex = items.findIndex((item) => item.id === active.id)
-    const newIndex = items.findIndex((item) => item.id === over.id)
-    publish(arrayMove(items, oldIndex, newIndex))
+    const current = itemsRef.current
+    const oldIndex = current.findIndex((item) => item.id === active.id)
+    const newIndex = current.findIndex((item) => item.id === over.id)
+    if (oldIndex < 0 || newIndex < 0) return
+    commit(arrayMove(current, oldIndex, newIndex))
   }
 
   return (
     <Field data-invalid={Boolean(error)}>
       <FieldLabel htmlFor={id}>{label}</FieldLabel>
-      <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={dragEnd}>
+      <DndContext
+        sensors={sensors}
+        collisionDetection={closestCenter}
+        onDragEnd={dragEnd}
+      >
         <SortableContext items={items} strategy={verticalListSortingStrategy}>
           <div className="grid gap-2.5">
             {items.map((item, index) => (
@@ -192,9 +258,15 @@ export function ChannelEditor({
                 item={item}
                 inputId={index === 0 ? id : `${id}-${index + 1}`}
                 disabled={disabled}
-                onChange={(name) => update(index, { name, status: "idle" })}
-                onRemove={() => publish(items.filter((candidate) => candidate.id !== item.id))}
-                onValidate={() => void validate(index)}
+                onChange={(name) => update(item.id, { name, status: "idle" })}
+                onRemove={() =>
+                  commit(
+                    itemsRef.current.filter(
+                      (candidate) => candidate.id !== item.id
+                    )
+                  )
+                }
+                onValidate={() => void validate(item.id)}
               />
             ))}
           </div>
@@ -205,7 +277,12 @@ export function ChannelEditor({
         variant="outline"
         className="min-h-11 self-start sm:min-h-8"
         disabled={disabled}
-        onClick={() => setItems((current) => [...current, { id: makeId(), name: "", status: "idle" }])}
+        onClick={() =>
+          commit(
+            [...itemsRef.current, { id: makeId(), name: "", status: "idle" }],
+            false
+          )
+        }
       >
         <Plus /> Add channel
       </Button>

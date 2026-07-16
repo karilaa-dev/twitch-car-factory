@@ -5,7 +5,8 @@ import { Card } from "@/components/ui/card"
 import { TableRow } from "@/components/ui/table"
 import { cn } from "@/lib/utils"
 
-const nestedControlSelector = "a, button, input, select, textarea, [role='button'], [role='checkbox'], [role='switch']"
+const nestedControlSelector =
+  "a, button, input, select, textarea, [role='button'], [role='checkbox'], [role='switch']"
 
 function useOpenItem(to: string) {
   const navigate = useNavigate()
@@ -18,7 +19,7 @@ function useOpenItem(to: string) {
       if (!control || control === event.currentTarget) navigate(to)
     },
     onKeyDown: (event: React.KeyboardEvent<HTMLElement>) => {
-      if (event.target !== event.currentTarget || !["Enter", " "].includes(event.key)) return
+      if (event.target !== event.currentTarget || event.key !== "Enter") return
       event.preventDefault()
       navigate(to)
     },
@@ -35,7 +36,7 @@ export function InteractiveCard({
     <Card
       className={cn(
         "cursor-pointer transition-shadow hover:ring-primary/40 focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none",
-        className,
+        className
       )}
       {...activation}
       {...props}
@@ -51,7 +52,10 @@ export function InteractiveTableRow({
   const activation = useOpenItem(to)
   return (
     <TableRow
-      className={cn("cursor-pointer focus-visible:bg-accent focus-visible:outline-none", className)}
+      className={cn(
+        "cursor-pointer focus-visible:bg-accent focus-visible:outline-none",
+        className
+      )}
       {...activation}
       {...props}
     />
