@@ -99,6 +99,7 @@ export function MobileStatusLanes({
       accounts: idle,
     },
   ]
+  const populatedLanes = lanes.filter((lane) => lane.accounts.length > 0)
 
   return (
     <div className="grid gap-4">
@@ -189,7 +190,7 @@ export function MobileStatusLanes({
         className="grid items-start gap-3"
         aria-label="Accounts by operating state"
       >
-        {lanes.map(
+        {populatedLanes.map(
           ({ id, title, description, empty, tone, icon: Icon, accounts }) => (
             <section
               key={id}

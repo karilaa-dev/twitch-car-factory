@@ -1,0 +1,108 @@
+import { render, screen } from "@testing-library/react"
+import { describe, expect, it, vi } from "vitest"
+import { MemoryRouter } from "react-router-dom"
+
+import { MobileStatusLanes } from "@/pages/runtime-designs/status-lanes"
+import type { AccountSummary, RuntimeSnapshot } from "@/types"
+
+function account(
+  id: number,
+  overrides: Partial<AccountSummary> = {}
+): AccountSummary {
+  return {
+    id,
+    config_key: `account_${id}`,
+    username: `account_${id}`,
+    is_active: true,
+    has_credentials: true,
+    desired: "running",
+    observed: "running",
+    source: {
+      mode: "default",
+      name: "Farm defaults",
+      channels: ["channel_one"],
+    },
+    pid: id,
+    last_heartbeat: "2026-07-15T12:00:00Z",
+    open_incident: null,
+    updated_at: "2026-07-15T12:00:00Z",
+    ...overrides,
+  }
+}
+
+function snapshot(accounts: AccountSummary[]): RuntimeSnapshot {
+  return {
+    supervisor: {
+      status: "healthy",
+      label: "Supervisor online",
+      owner_id: "worker-1",
+      pid: 100,
+      heartbeat_at: "2026-07-15T12:00:00Z",
+      expires_at: "2026-07-15T12:01:00Z",
+    },
+    summary: {
+      total: accounts.length,
+      desired_running: accounts.filter((item) => item.desired === "running")
+        .length,
+      observed_running: accounts.filter((item) => item.observed === "running")
+        .length,
+      degraded: 0,
+      open_incidents: 0,
+    },
+    accounts,
+    incidents: [],
+    command_faults: [],
+    activity: [],
+    generated_at: "2026-07-15T12:00:00Z",
+  }
+}
+
+describe("MobileStatusLanes", () => {
+  it("omits operating-state lanes that have no accounts", () => {
+    render(
+      <MemoryRouter>
+        <MobileStatusLanes
+          data={snapshot([account(1)])}
+          globalPending={false}
+          accountPending={false}
+          onGlobalAction={vi.fn()}
+          onAccountAction={vi.fn()}
+        />
+      </MemoryRouter>
+    )
+
+    expect(screen.getByRole("heading", { name: "Running" })).toBeVisible()
+    expect(
+      screen.queryByRole("heading", { name: "Needs attention" })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole("heading", { name: "Stopped or idle" })
+    ).not.toBeInTheDocument()
+  })
+
+  it("keeps each populated lane visible", () => {
+    render(
+      <MemoryRouter>
+        <MobileStatusLanes
+          data={snapshot([
+            account(1, { observed: "degraded" }),
+            account(2),
+            account(3, { desired: "stopped", observed: "stopped" }),
+          ])}
+          globalPending={false}
+          accountPending={false}
+          onGlobalAction={vi.fn()}
+          onAccountAction={vi.fn()}
+        />
+      </MemoryRouter>
+    )
+
+    expect(
+      screen.getByRole("heading", { name: "Needs attention" })
+    ).toBeVisible()
+    expect(screen.getByRole("heading", { name: "Running" })).toBeVisible()
+    expect(
+      screen.getByRole("heading", { name: "Stopped or idle" })
+    ).toBeVisible()
+  })
+})
