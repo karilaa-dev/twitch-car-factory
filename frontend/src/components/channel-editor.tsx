@@ -43,7 +43,12 @@ import { api } from "@/lib/api"
 
 type ValidationStatus =
   "idle" | "checking" | "exists" | "missing" | "unverified"
-type ChannelItem = { id: string; name: string; status: ValidationStatus }
+type ChannelItem = {
+  id: string
+  name: string
+  status: ValidationStatus
+  isDraft: boolean
+}
 
 function makeId() {
   return (
@@ -128,21 +133,25 @@ function SortableChannel({
           </InputGroupButton>
         </InputGroupAddon>
         <InputGroupInput
-          className="font-mono"
+          className="font-mono read-only:cursor-default read-only:text-foreground"
           id={inputId}
           value={item.name}
           placeholder="twitch_channel"
           spellCheck={false}
           disabled={disabled}
+          readOnly={!item.isDraft}
           aria-invalid={item.status === "missing"}
           onChange={(event) => onChange(event.target.value)}
-          onBlur={onValidate}
+          onBlur={item.isDraft ? onValidate : undefined}
         />
         <InputGroupAddon align="inline-end">
           {statusIcon}
           <InputGroupButton
             size={removeArmed ? "xs" : "icon-sm"}
             variant={removeArmed ? "destructive" : "ghost"}
+            className={
+              removeArmed ? "min-w-20 justify-center px-2 text-xs" : undefined
+            }
             aria-label={`${removeArmed ? "Confirm remove" : "Remove"} ${item.name || "channel"}`}
             aria-pressed={removeArmed}
             disabled={disabled}
@@ -156,7 +165,7 @@ function SortableChannel({
           >
             {removeArmed ? (
               <>
-                <Check /> Confirm
+                <Check className="size-3.5" /> Confirm
               </>
             ) : (
               <Trash2 />
@@ -190,6 +199,7 @@ export function ChannelEditor({
       id: makeId(),
       name,
       status: "idle",
+      isDraft: !name,
     }))
   )
   const itemsRef = React.useRef(items)
@@ -232,7 +242,7 @@ export function ChannelEditor({
 
   const validate = async (itemId: string) => {
     const item = itemsRef.current.find((candidate) => candidate.id === itemId)
-    if (!item?.name.trim()) return
+    if (!item?.isDraft || !item.name.trim()) return
     const requestedName = item.name
     update(
       item.id,
@@ -245,7 +255,11 @@ export function ChannelEditor({
       )
       update(
         item.id,
-        { name: result.name, status: result.status },
+        {
+          name: result.name,
+          status: result.status,
+          isDraft: result.status !== "exists",
+        },
         { expectedName: requestedName }
       )
     } catch {
@@ -282,7 +296,9 @@ export function ChannelEditor({
                 item={item}
                 inputId={index === 0 ? id : `${id}-${index + 1}`}
                 disabled={disabled}
-                onChange={(name) => update(item.id, { name, status: "idle" })}
+                onChange={(name) =>
+                  update(item.id, { name, status: "idle", isDraft: true })
+                }
                 onRemove={() =>
                   commit(
                     itemsRef.current.filter(
@@ -303,14 +319,20 @@ export function ChannelEditor({
         disabled={disabled}
         onClick={() =>
           commit(
-            [...itemsRef.current, { id: makeId(), name: "", status: "idle" }],
+            [
+              ...itemsRef.current,
+              { id: makeId(), name: "", status: "idle", isDraft: true },
+            ],
             false
           )
         }
       >
         <Plus /> Add channel
       </Button>
-      <FieldDescription>{description}</FieldDescription>
+      <FieldDescription>
+        {description} Added channels are read-only; remove and re-add one to
+        change its name.
+      </FieldDescription>
       <FieldError>{error}</FieldError>
     </Field>
   )
