@@ -17,6 +17,7 @@ import {
 } from "@dnd-kit/sortable"
 import { CSS } from "@dnd-kit/utilities"
 import {
+  Check,
   CheckCircle2,
   CircleHelp,
   GripVertical,
@@ -79,6 +80,7 @@ function SortableChannel({
   onRemove: () => void
   onValidate: () => void
 }) {
+  const [removeArmed, setRemoveArmed] = React.useState(false)
   const {
     attributes,
     listeners,
@@ -90,6 +92,14 @@ function SortableChannel({
     id: item.id,
     disabled,
   })
+
+  React.useEffect(() => {
+    if (!removeArmed) return
+
+    const timeout = window.setTimeout(() => setRemoveArmed(false), 5_000)
+    return () => window.clearTimeout(timeout)
+  }, [removeArmed])
+
   const statusIcon =
     item.status === "exists" ? (
       <CheckCircle2 aria-label="Channel exists" />
@@ -131,12 +141,26 @@ function SortableChannel({
         <InputGroupAddon align="inline-end">
           {statusIcon}
           <InputGroupButton
-            size="icon-sm"
-            aria-label={`Remove ${item.name || "channel"}`}
+            size={removeArmed ? "xs" : "icon-sm"}
+            variant={removeArmed ? "destructive" : "ghost"}
+            aria-label={`${removeArmed ? "Confirm remove" : "Remove"} ${item.name || "channel"}`}
+            aria-pressed={removeArmed}
             disabled={disabled}
-            onClick={onRemove}
+            onClick={() => {
+              if (removeArmed) {
+                onRemove()
+                return
+              }
+              setRemoveArmed(true)
+            }}
           >
-            <Trash2 />
+            {removeArmed ? (
+              <>
+                <Check /> Confirm
+              </>
+            ) : (
+              <Trash2 />
+            )}
           </InputGroupButton>
         </InputGroupAddon>
       </InputGroup>

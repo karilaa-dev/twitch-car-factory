@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { ChannelEditor } from "@/components/channel-editor"
 import { api } from "@/lib/api"
@@ -13,6 +13,42 @@ describe("ChannelEditor", () => {
   beforeEach(() => {
     apiMock.mockReset()
     apiMock.mockResolvedValue({ name: "alpha", status: "exists" })
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it("removes a channel only after confirmation within five seconds", () => {
+    vi.useFakeTimers()
+    const onChange = vi.fn()
+    render(
+      <ChannelEditor
+        id="channels"
+        value={["alpha", "beta"]}
+        onChange={onChange}
+      />
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove alpha" }))
+
+    expect(
+      screen.getByRole("button", { name: "Confirm remove alpha" })
+    ).toHaveTextContent("Confirm")
+    expect(onChange).not.toHaveBeenCalled()
+
+    act(() => vi.advanceTimersByTime(5_000))
+
+    expect(screen.getByRole("button", { name: "Remove alpha" })).toBeVisible()
+    expect(onChange).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove alpha" }))
+    fireEvent.click(
+      screen.getByRole("button", { name: "Confirm remove alpha" })
+    )
+
+    expect(screen.queryByDisplayValue("alpha")).not.toBeInTheDocument()
+    expect(onChange).toHaveBeenLastCalledWith(["beta"])
   })
 
   it("normalizes case-insensitive duplicates without changing order", async () => {
