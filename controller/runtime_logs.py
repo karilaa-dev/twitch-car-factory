@@ -144,9 +144,17 @@ def summarize_run_log(account_id: int, run_id: int) -> RunLogSummary:
     parts = _run_parts(account_id, run_id)
     compressed = [part for part in parts if part.compressed]
     plaintext = [part for part in parts if not part.compressed]
+
+    def safe_size(part: LogPart) -> int:
+        try:
+            return part.path.stat().st_size
+        except OSError:
+            # Retention can remove an archive between discovery and summary.
+            return 0
+
     return RunLogSummary(
         available=bool(parts),
-        compressed_bytes=sum(part.path.stat().st_size for part in compressed),
+        compressed_bytes=sum(safe_size(part) for part in compressed),
         compressed_parts=len(compressed),
         plaintext_parts=len(plaintext),
         truncated=bool(parts and parts[0].sequence > 0),
@@ -287,7 +295,7 @@ class AccountRunLogWriter:
         self._path = path
 
     def _render(self, message: str, *, level: str, kind: str) -> str:
-        clean_message = str(message).replace("\x00", "")[:8000]
+        clean_message = re.sub(r"[\x00-\x1f\x7f]", " ", str(message))[:8000]
         return (
             f"{_format_timestamp()} {level.upper()} {kind} "
             f"account={self.account_key} run={self.run_id}: {clean_message}"

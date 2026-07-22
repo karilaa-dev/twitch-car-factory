@@ -201,6 +201,65 @@ def make_supervisor(clock: FakeClock, factory: ProcessFactory, **option_override
 
 
 @pytest.mark.django_db
+def test_startup_continues_when_account_log_recovery_raises(
+    tmp_path,
+    settings,
+    monkeypatch,
+    caplog,
+):
+    settings.TWITCH_FARM_LOG_FILE = tmp_path / "logs" / "twitch-farm.log"
+    settings.TWITCH_FARM_LOG_WRITER = True
+    configure_farm()
+    clock = FakeClock()
+    supervisor = make_supervisor(clock, ProcessFactory())
+
+    def fail_recovery(**_kwargs):
+        raise OSError("simulated archive scan failure")
+
+    monkeypatch.setattr(
+        "controller.miner_supervisor.recover_account_log_archives",
+        fail_recovery,
+    )
+
+    supervisor.startup()
+    try:
+        assert supervisor._started
+        assert WorkerLease.objects.filter(owner_id=supervisor.worker_id).exists()
+        assert "Account log archive recovery failed during startup" in caplog.text
+    finally:
+        supervisor.shutdown()
+
+
+@pytest.mark.django_db
+def test_run_loop_continues_when_account_log_recovery_raises(
+    tmp_path,
+    settings,
+    monkeypatch,
+    caplog,
+):
+    settings.TWITCH_FARM_LOG_FILE = tmp_path / "logs" / "twitch-farm.log"
+    settings.TWITCH_FARM_LOG_WRITER = True
+    configure_farm()
+    clock = FakeClock()
+    supervisor = make_supervisor(clock, ProcessFactory())
+    supervisor.startup()
+
+    def fail_recovery(**_kwargs):
+        raise OSError("simulated archive scan failure")
+
+    monkeypatch.setattr(
+        "controller.miner_supervisor.recover_account_log_archives",
+        fail_recovery,
+    )
+    try:
+        supervisor.run_once(force_checks=True)
+        assert supervisor._started
+        assert "Account log archive recovery failed" in caplog.text
+    finally:
+        supervisor.shutdown()
+
+
+@pytest.mark.django_db
 def test_start_uses_snapshot_only_and_manual_stop_never_restarts(tmp_path, settings):
     settings.TWITCH_FARM_LOG_FILE = tmp_path / "logs" / "twitch-farm.log"
     settings.TWITCH_FARM_LOG_WRITER = True
@@ -308,7 +367,7 @@ def test_log_finalization_waits_for_late_output_after_the_bounded_join(tmp_path,
 
         def join(self, timeout=None):
             self.join_timeouts.append(timeout)
-            if timeout is None:
+            if len(self.join_timeouts) == 2:
                 writer.write("late buffered miner output")
                 self.alive = False
 
@@ -330,9 +389,49 @@ def test_log_finalization_waits_for_late_output_after_the_bounded_join(tmp_path,
     supervisor._wait_for_pending_log_finalizations()
 
     contents = "\n".join(read_run_log_page(account_id=1, run_id=77)["lines"])
-    assert output_thread.join_timeouts == [1.0, None]
+    assert output_thread.join_timeouts == [1.0, 1.0]
     assert contents.index("late buffered miner output") < contents.index("final_exit")
     assert managed.log_writer is None
+
+
+def test_log_finalization_abandons_a_leaked_output_pipe_for_startup_recovery(
+    tmp_path,
+    settings,
+):
+    settings.TWITCH_FARM_LOG_FILE = tmp_path / "logs" / "twitch-farm.log"
+    settings.TWITCH_FARM_LOG_WRITER = True
+    clock = FakeClock()
+    supervisor = make_supervisor(clock, ProcessFactory())
+    writer = AccountRunLogWriter(account_id=1, run_id=78, account_key="primary")
+
+    class LeakedOutputThread:
+        def __init__(self):
+            self.join_timeouts: list[float | None] = []
+
+        def join(self, timeout=None):
+            self.join_timeouts.append(timeout)
+
+        def is_alive(self):
+            return True
+
+    output_thread = LeakedOutputThread()
+    managed = ManagedProcess(
+        process=FakeProcess(),
+        account_id=1,
+        account_key="primary",
+        run_id=78,
+        spawned_monotonic=clock.monotonic(),
+        output_thread=output_thread,  # type: ignore[arg-type]
+        log_writer=writer,
+    )
+
+    supervisor._finalize_managed_log(managed, "run_finished", reason="admin_stop")
+    supervisor._wait_for_pending_log_finalizations()
+
+    assert output_thread.join_timeouts == [1.0, 1.0]
+    assert supervisor._pending_log_finalizations == {}
+    assert managed.log_writer is writer
+    writer.finalize("test_cleanup")
 
 
 @pytest.mark.django_db

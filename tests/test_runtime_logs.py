@@ -141,6 +141,35 @@ def test_account_writer_collects_redacted_output_and_lifecycle_in_gzip(tmp_path)
     assert stat.S_IMODE(archive.stat().st_mode) == 0o600
 
 
+def test_account_writer_keeps_each_rendered_message_on_one_line(tmp_path):
+    path = tmp_path / "logs" / "twitch-farm.log"
+    with override_settings(TWITCH_FARM_LOG_FILE=path):
+        writer = AccountRunLogWriter(account_id=7, run_id=12, account_key="primary")
+        writer.write("first\nsecond\rthird\tfourth\x7f")
+        writer.finalize("run_finished")
+        page = read_run_log_page(account_id=7, run_id=12)
+
+    assert len(page["lines"]) == 2
+    assert "first second third fourth " in page["lines"][0]
+
+
+def test_run_summary_tolerates_archive_removed_after_discovery(tmp_path):
+    path = tmp_path / "logs" / "twitch-farm.log"
+    with override_settings(TWITCH_FARM_LOG_FILE=path):
+        writer = AccountRunLogWriter(account_id=7, run_id=13, account_key="primary")
+        writer.write("retained until the summary starts")
+        writer.finalize("run_finished")
+        discovered = runtime_logs._run_parts(7, 13)
+        assert len(discovered) == 1
+        discovered[0].path.unlink()
+        with patch("controller.runtime_logs._run_parts", return_value=discovered):
+            summary = summarize_run_log(7, 13)
+
+    assert summary.available
+    assert summary.compressed_parts == 1
+    assert summary.compressed_bytes == 0
+
+
 def test_account_archives_rotate_prune_and_stay_isolated(tmp_path):
     path = tmp_path / "logs" / "twitch-farm.log"
     with override_settings(

@@ -392,8 +392,13 @@ class MinerSupervisor:
             services.purge_expired_legacy_import_drafts(at=self.now())
             self.reconcile_startup()
             if getattr(settings, "TWITCH_FARM_LOG_WRITER", False):
-                for recovery_error in recover_account_log_archives():
-                    logger.error("Account log recovery is pending: %s", recovery_error)
+                try:
+                    recovery_errors = recover_account_log_archives()
+                except Exception:
+                    logger.exception("Account log archive recovery failed during startup")
+                else:
+                    for recovery_error in recovery_errors:
+                        logger.error("Account log recovery is pending: %s", recovery_error)
             self.heartbeat(force=True)
             self._started = True
             # Recovered queued admin intent wins before automatic convergence.
@@ -774,7 +779,15 @@ class MinerSupervisor:
 
             def finish_after_drain() -> None:
                 try:
-                    output_thread.join()
+                    output_thread.join(timeout=max(1.0, self.options.stop_timeout_seconds))
+                    if output_thread.is_alive():
+                        logger.error(
+                            "Miner output drain did not finish for %s run %s; "
+                            "log finalization was left for startup recovery.",
+                            managed.account_key,
+                            run_id,
+                        )
+                        return
                     self._complete_managed_log_finalization(
                         managed,
                         writer,
@@ -800,6 +813,7 @@ class MinerSupervisor:
             finalizer.start()
 
     def _wait_for_pending_log_finalizations(self) -> None:
+        deadline = time.monotonic() + max(1.0, self.options.stop_timeout_seconds)
         while True:
             with self._pending_log_finalizations_lock:
                 pending = list(self._pending_log_finalizations.values())
@@ -807,7 +821,15 @@ class MinerSupervisor:
                 return
             for finalizer in pending:
                 if finalizer is not threading.current_thread():
-                    finalizer.join()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        logger.error("Timed out waiting for pending account log finalizations.")
+                        return
+                    finalizer.join(timeout=remaining)
+            if any(finalizer.is_alive() for finalizer in pending):
+                if time.monotonic() >= deadline:
+                    logger.error("Timed out waiting for pending account log finalizations.")
+                    return
 
     def build_process_command(self, run: MinerRun) -> list[str]:
         """Return argv containing identifiers only, never secrets or channels."""
@@ -1791,6 +1813,7 @@ class MinerSupervisor:
                 returncode=returncode,
             )
             managed.crash_logged = True
+        recovery_lifecycle_details: dict[str, object] | None = None
         try:
             with transaction.atomic():
                 # Keep the exact dead process handle until all run/incident/state
@@ -1890,12 +1913,10 @@ class MinerSupervisor:
                             )
                     else:
                         attempt = self._schedule_recovery(state, incident)
-                        self._write_managed_lifecycle(
-                            managed,
-                            "recovery_scheduled",
-                            attempt=attempt.attempt_number,
-                            scheduled_at=attempt.scheduled_at.isoformat(),
-                        )
+                        recovery_lifecycle_details = {
+                            "attempt": attempt.attempt_number,
+                            "scheduled_at": attempt.scheduled_at.isoformat(),
+                        }
         except Exception as exc:
             logger.exception(
                 "Unexpected-exit bookkeeping remains pending for run %s: %s",
@@ -1903,6 +1924,13 @@ class MinerSupervisor:
                 safe_error(exc),
             )
             return False
+
+        if recovery_lifecycle_details is not None:
+            self._write_managed_lifecycle(
+                managed,
+                "recovery_scheduled",
+                **recovery_lifecycle_details,
+            )
 
         if self.processes.get(managed.account_id) is managed:
             self._finalize_managed_log(
@@ -1927,7 +1955,6 @@ class MinerSupervisor:
                 raise RuntimeError(
                     f"Run {managed.run_id} could not be confirmed because it is no longer active."
                 )
-            self._write_managed_lifecycle(managed, "startup_confirmed")
 
             state = MinerInstanceState.objects.select_for_update().get(
                 account_id=managed.account_id
@@ -1991,6 +2018,8 @@ class MinerSupervisor:
                     account_id=managed.account_id,
                     status=MinerIncident.Status.OPEN,
                 ).update(status=MinerIncident.Status.RECOVERED, recovered_at=now)
+
+        self._write_managed_lifecycle(managed, "startup_confirmed")
 
         # Only publish in-memory confirmation after every durable record
         # commits. A transient SQLite error leaves this child eligible for the
@@ -2537,10 +2566,15 @@ class MinerSupervisor:
                 active_run_ids = {managed.run_id for managed in self.processes.values()}
                 with self._pending_log_finalizations_lock:
                     active_run_ids.update(self._pending_log_finalizations)
-                for recovery_error in recover_account_log_archives(
-                    active_run_ids=active_run_ids
-                ):
-                    logger.error("Account log recovery is pending: %s", recovery_error)
+                try:
+                    recovery_errors = recover_account_log_archives(
+                        active_run_ids=active_run_ids
+                    )
+                except Exception:
+                    logger.exception("Account log archive recovery failed")
+                else:
+                    for recovery_error in recovery_errors:
+                        logger.error("Account log recovery is pending: %s", recovery_error)
             self._last_fingerprint = current
 
     def run_forever(self, *, should_stop: Callable[[], bool] | None = None) -> None:
