@@ -12,6 +12,7 @@ from django.test import Client, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
+from controller import runtime_logs
 from controller.crypto import decrypt_text, encrypt_text
 from controller.models import (
     AccountChannelSelection,
@@ -619,6 +620,42 @@ class ApiContractTests(TestCase):
 
         self.assertEqual(detail_data["run"]["archive_state"], "compression_pending")
         self.assertTrue(any("readable pending line" in line for line in detail_data["lines"]))
+        self.assert_error(download, "log_unavailable", 409)
+
+    def test_log_download_returns_redacted_error_when_retention_wins_open_race(self):
+        self.login()
+        run = self.create_run()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "logs" / "twitch-farm.log"
+            with override_settings(TWITCH_FARM_LOG_FILE=path):
+                writer = AccountRunLogWriter(
+                    account_id=self.account.pk,
+                    run_id=run.pk,
+                    account_key=self.account.config_key,
+                )
+                writer.write("removed during download setup")
+                writer.finalize("final_exit")
+                MinerRun.objects.filter(pk=run.pk).update(
+                    ended_at=timezone.now(),
+                    stop_reason=MinerRun.StopReason.ADMIN_STOP,
+                )
+                original_parts = runtime_logs._run_parts
+                calls = 0
+
+                def prune_before_download_open(account_id, run_id):
+                    nonlocal calls
+                    calls += 1
+                    parts = original_parts(account_id, run_id)
+                    if calls == 2:
+                        parts[0].path.unlink()
+                    return parts
+
+                with patch(
+                    "controller.runtime_logs._run_parts",
+                    side_effect=prune_before_download_open,
+                ):
+                    download = self.client.get(self.api("log_run_download", run.pk))
+
         self.assert_error(download, "log_unavailable", 409)
 
     def test_truncated_download_filename_labels_the_retained_suffix(self):

@@ -253,6 +253,34 @@ def test_account_live_cursor_and_run_paging_follow_rotated_parts(tmp_path):
     assert "line-after-cursor" in gzip.decompress(payload).decode("utf-8")
 
 
+def test_run_download_survives_retention_after_parts_are_opened(tmp_path):
+    path = tmp_path / "logs" / "twitch-farm.log"
+    with override_settings(TWITCH_FARM_LOG_FILE=path):
+        writer = AccountRunLogWriter(account_id=4, run_id=42, account_key="download-race")
+        writer.write("download remains readable")
+        writer.finalize("run_finished")
+        archive = runtime_logs._run_parts(4, 42)[0].path
+        chunks, size = iter_run_gzip(4, 42)
+        archive.unlink()
+        payload = b"".join(chunks)
+
+    assert size == len(payload)
+    assert "download remains readable" in gzip.decompress(payload).decode("utf-8")
+
+
+def test_run_download_reports_a_part_pruned_before_it_can_be_opened(tmp_path):
+    path = tmp_path / "logs" / "twitch-farm.log"
+    with override_settings(TWITCH_FARM_LOG_FILE=path):
+        writer = AccountRunLogWriter(account_id=4, run_id=43, account_key="download-race")
+        writer.write("pruned before download")
+        writer.finalize("run_finished")
+        discovered = runtime_logs._run_parts(4, 43)
+        discovered[0].path.unlink()
+        with patch("controller.runtime_logs._run_parts", return_value=discovered):
+            with pytest.raises(LogStorageError, match="no longer available"):
+                iter_run_gzip(4, 43)
+
+
 def test_account_initial_cursor_keeps_a_line_appended_after_page_read(tmp_path):
     path = tmp_path / "logs" / "twitch-farm.log"
     with override_settings(TWITCH_FARM_LOG_FILE=path):

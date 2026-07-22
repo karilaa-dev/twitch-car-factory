@@ -710,16 +710,35 @@ def read_account_live(
 
 
 def iter_run_gzip(account_id: int, run_id: int) -> tuple[Iterator[bytes], int]:
-    parts = _run_parts(account_id, run_id)
+    """Open retained gzip members for one stable, symlink-safe download."""
+
+    try:
+        parts = _run_parts(account_id, run_id)
+    except OSError as exc:
+        raise LogStorageError("The retained run archive changed while it was opened.") from exc
     if not parts or any(not part.compressed for part in parts):
         raise LogStorageError("The completed run archive is not ready for download.")
-    total = sum(part.path.stat().st_size for part in parts)
     streams = []
+    total = 0
     try:
         for part in parts:
-            if not _safe_regular_file(part.path):
-                raise LogStorageError("A retained log part is no longer available.")
-            streams.append(part.path.open("rb"))
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                descriptor = os.open(part.path, flags)
+            except OSError as exc:
+                raise LogStorageError("A retained log part is no longer available.") from exc
+            try:
+                file_stat = os.fstat(descriptor)
+                if not stat.S_ISREG(file_stat.st_mode):
+                    raise LogStorageError("A retained log part is unsafe.")
+                stream = os.fdopen(descriptor, "rb")
+            except Exception:
+                os.close(descriptor)
+                raise
+            streams.append(stream)
+            total += file_stat.st_size
     except Exception:
         for stream in streams:
             stream.close()
