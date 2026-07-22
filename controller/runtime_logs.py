@@ -405,24 +405,48 @@ def _read_file_tail(path: Path, limit: int) -> bytes:
         return b""
 
 
-def read_runtime_log_tail() -> list[str]:
-    """Return the newest bounded lines across the current and rotated files."""
+def _decode_runtime_tail(chunks: list[bytes]) -> list[str]:
+    if not chunks:
+        return []
+    text = b"\n".join(chunks).decode("utf-8", errors="replace")
+    text = text.encode("utf-8")[-MAX_LOG_BYTES:].decode("utf-8", errors="ignore")
+    return text.splitlines()[-MAX_LOG_LINES:]
 
+
+def _read_runtime_log_snapshot() -> tuple[list[str], list[int], int]:
     path = Path(settings.TWITCH_FARM_LOG_FILE)
     chunks: list[bytes] = []
     remaining = MAX_LOG_BYTES
-    for candidate in (path, Path(f"{path}.1"), Path(f"{path}.2"), Path(f"{path}.3")):
+    identity = [0, 0]
+    offset = 0
+    try:
+        with path.open("rb") as stream:
+            file_stat = os.fstat(stream.fileno())
+            identity = [file_stat.st_dev, file_stat.st_ino]
+            offset = file_stat.st_size
+            amount = min(remaining, offset)
+            stream.seek(offset - amount)
+            chunk = stream.read(amount)
+            if chunk:
+                chunks.insert(0, chunk)
+                remaining -= len(chunk)
+    except (FileNotFoundError, IsADirectoryError, PermissionError, OSError):
+        pass
+    for candidate in (Path(f"{path}.1"), Path(f"{path}.2"), Path(f"{path}.3")):
         if remaining <= 0:
             break
         chunk = _read_file_tail(candidate, remaining)
         if chunk:
             chunks.insert(0, chunk)
             remaining -= len(chunk)
-    if not chunks:
-        return []
-    text = b"\n".join(chunks).decode("utf-8", errors="replace")
-    text = text.encode("utf-8")[-MAX_LOG_BYTES:].decode("utf-8", errors="ignore")
-    return text.splitlines()[-MAX_LOG_LINES:]
+    return _decode_runtime_tail(chunks), identity, offset
+
+
+def read_runtime_log_tail() -> list[str]:
+    """Return the newest bounded lines across the current and rotated files."""
+
+    lines, _identity, _offset = _read_runtime_log_snapshot()
+    return lines
 
 
 def _sign_cursor(payload: dict[str, Any], *, salt: str) -> str:
@@ -458,14 +482,7 @@ def _read_binary_lines(stream, *, max_lines: int, max_bytes: int) -> tuple[list[
 def read_combined_live(cursor: str | None = None) -> dict[str, Any]:
     path = Path(settings.TWITCH_FARM_LOG_FILE)
     if not cursor:
-        lines = read_runtime_log_tail()
-        try:
-            file_stat = path.stat()
-            offset = file_stat.st_size
-            identity = [file_stat.st_dev, file_stat.st_ino]
-        except OSError:
-            offset = 0
-            identity = [0, 0]
+        lines, identity, offset = _read_runtime_log_snapshot()
         return {
             "lines": lines,
             "cursor": _sign_cursor(
@@ -533,10 +550,17 @@ def _run_page_from_position(
     remaining_lines = max(1, min(max_lines, MAX_LOG_LINES))
     remaining_bytes = max_bytes
     next_before: str | None = None
+    end_sequence = sequence
+    end_line = 0
+    captured_end = False
     while remaining_lines > 0 and remaining_bytes > 0:
         part = by_sequence[sequence]
         lines = _read_part_lines(part)
         end = len(lines) if start_line is None else min(max(start_line, 0), len(lines))
+        if not captured_end:
+            end_sequence = sequence
+            end_line = end
+            captured_end = True
         start = end
         used_bytes = 0
         while start > 0 and end - start < remaining_lines:
@@ -565,6 +589,8 @@ def _run_page_from_position(
         "lines": [line for chunk in chunks for line in chunk],
         "before": next_before,
         "has_older": next_before is not None,
+        "_end_sequence": end_sequence,
+        "_end_line": end_line,
     }
 
 
@@ -590,14 +616,7 @@ def read_run_log_page(
     )
 
 
-def _account_live_cursor(run_id: int, parts: list[LogPart]) -> str:
-    if not parts:
-        sequence = 0
-        line = 0
-    else:
-        newest = parts[-1]
-        sequence = newest.sequence
-        line = len(_read_part_lines(newest))
+def _account_live_cursor(run_id: int, sequence: int, line: int) -> str:
     return _sign_cursor(
         {"kind": "account", "run_id": run_id, "sequence": sequence, "line": line},
         salt=LIVE_CURSOR_SALT,
@@ -611,7 +630,7 @@ def read_account_live(
     if not parts:
         return {
             "lines": [],
-            "cursor": _account_live_cursor(run_id, parts),
+            "cursor": _account_live_cursor(run_id, 0, 0),
             "reset": False,
             "run_id": run_id,
         }
@@ -619,7 +638,11 @@ def read_account_live(
         page = read_run_log_page(account_id=account_id, run_id=run_id)
         return {
             "lines": page["lines"],
-            "cursor": _account_live_cursor(run_id, parts),
+            "cursor": _account_live_cursor(
+                run_id,
+                page["_end_sequence"],
+                page["_end_line"],
+            ),
             "reset": False,
             "run_id": run_id,
         }

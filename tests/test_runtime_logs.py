@@ -11,6 +11,7 @@ import pytest
 from django.test import override_settings
 
 from controller.miner_supervisor import _drain_miner_output
+from controller import runtime_logs
 from controller.runtime_logs import (
     MAX_LOG_BYTES,
     MAX_LOG_LINES,
@@ -18,6 +19,7 @@ from controller.runtime_logs import (
     LogStorageError,
     iter_run_gzip,
     read_account_live,
+    read_combined_live,
     read_run_log_page,
     read_runtime_log_tail,
     recover_account_log_archives,
@@ -81,6 +83,29 @@ def test_runtime_log_tail_enforces_byte_cap_after_utf8_replacement(tmp_path):
 
     assert lines
     assert len("\n".join(lines).encode("utf-8")) <= MAX_LOG_BYTES
+
+
+def test_combined_initial_cursor_keeps_an_append_after_its_snapshot(tmp_path):
+    path = tmp_path / "twitch-farm.log"
+    path.write_text("initial-line\n", encoding="utf-8")
+    original_snapshot = runtime_logs._read_runtime_log_snapshot
+
+    def snapshot_then_append():
+        snapshot = original_snapshot()
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write("line-appended-after-snapshot\n")
+        return snapshot
+
+    with override_settings(TWITCH_FARM_LOG_FILE=path):
+        with patch(
+            "controller.runtime_logs._read_runtime_log_snapshot",
+            side_effect=snapshot_then_append,
+        ):
+            initial = read_combined_live()
+        incremental = read_combined_live(initial["cursor"])
+
+    assert initial["lines"] == ["initial-line"]
+    assert incremental["lines"] == ["line-appended-after-snapshot"]
 
 
 def test_account_writer_collects_redacted_output_and_lifecycle_in_gzip(tmp_path):
@@ -197,6 +222,36 @@ def test_account_live_cursor_and_run_paging_follow_rotated_parts(tmp_path):
     assert complete_page["before"] is None
     assert size == len(payload)
     assert "line-after-cursor" in gzip.decompress(payload).decode("utf-8")
+
+
+def test_account_initial_cursor_keeps_a_line_appended_after_page_read(tmp_path):
+    path = tmp_path / "logs" / "twitch-farm.log"
+    with override_settings(TWITCH_FARM_LOG_FILE=path):
+        writer = AccountRunLogWriter(account_id=4, run_id=41, account_key="cursor-race")
+        writer.write("initial-account-line")
+        original_page_reader = runtime_logs._run_page_from_position
+
+        def page_then_append(**kwargs):
+            page = original_page_reader(**kwargs)
+            writer.write("account-line-appended-after-page")
+            return page
+
+        with patch(
+            "controller.runtime_logs._run_page_from_position",
+            side_effect=page_then_append,
+        ):
+            initial = read_account_live(account_id=4, run_id=41)
+        incremental = read_account_live(
+            account_id=4,
+            run_id=41,
+            cursor=initial["cursor"],
+        )
+        writer.finalize("run_finished")
+
+    assert any("initial-account-line" in line for line in initial["lines"])
+    assert not any("account-line-appended-after-page" in line for line in initial["lines"])
+    assert len(incremental["lines"]) == 1
+    assert "account-line-appended-after-page" in incremental["lines"][0]
 
 
 def test_recovery_skips_active_plaintext_and_rejects_symlinked_run_roots(tmp_path):
