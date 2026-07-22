@@ -175,15 +175,29 @@ hostname is permanently HTTPS. The proxy must replace `X-Forwarded-Proto` with
 the actual client scheme; Django trusts that header to identify secure requests.
 
 The services share `./data`; only the worker mounts `./runtime`. The worker is
-the sole writer for `./data/logs/twitch-farm.log`: it sends supervisor output
-and prefixed miner stdout/stderr to both Docker logs and a 5 MiB rotating file
-with three backups. The staff-only **Logs** page reads at most the latest 400
-lines/256 KiB. The web service
-therefore cannot read refreshable Twitch session files. Compose runs every
-service as the non-root `PUID`/`PGID` that owns the bind mounts. SQLite must
-remain on local storage, and only one worker replica is supported. The worker
-has a two-minute stop grace period so sequential miner shutdown and durable
-bookkeeping can finish before Docker sends `SIGKILL`.
+the sole log writer. It sends supervisor output and prefixed miner stdout/stderr
+to Docker logs and the existing 5 MiB combined rotating file with three
+backups. It also writes a private log for every miner run beneath
+`./data/logs/accounts/<account-id>/runs/<run-id>/`. Active parts are bounded at
+5 MiB, then compressed with gzip. Each account keeps at most 50 MiB of
+published compressed parts; the oldest parts expire first, and the UI marks a
+run when only its retained suffix remains. Completed run downloads are standard
+multi-member `.log.gz` files.
+
+The staff-only **Logs** page polls the live tail every two seconds and bounds
+each response to 400 lines/256 KiB. Its History tab reads compressed parts by
+account and run without exposing filesystem paths. If compression is
+interrupted, the plaintext source remains in place, is shown as pending, and is
+retried during worker reconciliation. New per-account collection starts after
+deployment; existing combined rotations are not backfilled. The web service
+can read `./data/logs` but remains unable to access refreshable Twitch session
+files under `./runtime`.
+
+Compose runs every service as the non-root `PUID`/`PGID` that owns the bind
+mounts. SQLite must remain on local storage, and only one worker replica is
+supported. The worker has a two-minute stop grace period so sequential miner
+shutdown, log compression, and durable bookkeeping can finish before Docker
+sends `SIGKILL`.
 
 ## Safe validation
 

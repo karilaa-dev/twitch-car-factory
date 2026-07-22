@@ -239,6 +239,54 @@ export interface LogTail {
   line_count: number
   max_lines: number
   max_bytes: number
+  cursor: string | null
+  reset: boolean
+  run_id: number | null
+  source: {
+    kind: "combined" | "account"
+    account_id: number | null
+    account_key: string | null
+    username: string | null
+  }
   supervisor: Supervisor
+  generated_at: string
+}
+
+export interface LogRunSummary {
+  run_id: number
+  account: {
+    id: number
+    config_key: string
+    username: string
+    is_active: boolean
+  }
+  started_at: string
+  ended_at: string | null
+  stop_reason: string
+  exit_code: number | null
+  exit_signal: number | null
+  archive_state: "active" | "compression_pending" | "ready"
+  compressed_bytes: number
+  compressed_parts: number
+  plaintext_parts: number
+  truncated: boolean
+  downloadable: boolean
+}
+
+export interface LogRunList {
+  runs: LogRunSummary[]
+  next_before: string | null
+  retention_bytes: number
+  generated_at: string
+}
+
+export interface LogRunDetail {
+  run: LogRunSummary
+  lines: string[]
+  line_count: number
+  before: string | null
+  has_older: boolean
+  max_lines: number
+  max_bytes: number
   generated_at: string
 }

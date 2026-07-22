@@ -37,6 +37,7 @@ from controller.models import (
     WorkerLease,
 )
 from controller import services
+from controller.runtime_logs import AccountRunLogWriter, recover_account_log_archives
 
 
 logger = logging.getLogger(__name__)
@@ -178,6 +179,8 @@ class ManagedProcess:
     pending_stop_reason: str = ""
     pending_stop_forced: bool = False
     output_thread: threading.Thread | None = None
+    log_writer: AccountRunLogWriter | None = None
+    crash_logged: bool = False
 
 
 _SENSITIVE_VALUE = re.compile(
@@ -213,7 +216,11 @@ def safe_error(value: object, *, limit: int = 2000) -> str:
     return text[:limit]
 
 
-def _drain_miner_output(stream: IO[str], account_key: str) -> None:
+def _drain_miner_output(
+    stream: IO[str],
+    account_key: str,
+    log_writer: AccountRunLogWriter | None = None,
+) -> None:
     """Forward one child's output through the worker's console/file handlers."""
 
     try:
@@ -222,6 +229,8 @@ def _drain_miner_output(stream: IO[str], account_key: str) -> None:
             line = safe_error(unstyled_line, limit=8000)
             if line:
                 miner_output_logger.info("miner[%s] %s", account_key, line)
+                if log_writer is not None:
+                    log_writer.write(line)
     except (OSError, ValueError):
         logger.exception("Miner output stream failed for %s", account_key)
     finally:
@@ -258,6 +267,8 @@ class MinerSupervisor:
         self.pending_run_finalizations: dict[
             int, tuple[int, int | None, str, str]
         ] = {}
+        self._pending_log_finalizations: dict[int, threading.Thread] = {}
+        self._pending_log_finalizations_lock = threading.Lock()
         self._lock_handle: IO[str] | None = None
         self._started = False
         self._shutdown_incomplete = False
@@ -380,6 +391,9 @@ class MinerSupervisor:
             self._acquire_database_lease()
             services.purge_expired_legacy_import_drafts(at=self.now())
             self.reconcile_startup()
+            if getattr(settings, "TWITCH_FARM_LOG_WRITER", False):
+                for recovery_error in recover_account_log_archives():
+                    logger.error("Account log recovery is pending: %s", recovery_error)
             self.heartbeat(force=True)
             self._started = True
             # Recovered queued admin intent wins before automatic convergence.
@@ -688,6 +702,113 @@ class MinerSupervisor:
 
     # -- process lifecycle ---------------------------------------------------
 
+    def _write_managed_lifecycle(
+        self,
+        managed: ManagedProcess,
+        event: str,
+        **details,
+    ) -> None:
+        if managed.log_writer is not None:
+            managed.log_writer.lifecycle(event, **details)
+
+    def _finalize_managed_log(
+        self,
+        managed: ManagedProcess,
+        event: str,
+        **details,
+    ) -> None:
+        writer = managed.log_writer
+        if writer is None:
+            return
+        thread = managed.output_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(1.0, self.options.stop_timeout_seconds))
+            if thread.is_alive():
+                logger.warning(
+                    "Miner output drain is still finishing for %s; log finalization was deferred.",
+                    managed.account_key,
+                )
+                self._defer_managed_log_finalization(
+                    managed,
+                    writer,
+                    thread,
+                    event,
+                    details,
+                )
+                return
+        self._complete_managed_log_finalization(managed, writer, event, details)
+
+    def _complete_managed_log_finalization(
+        self,
+        managed: ManagedProcess,
+        writer: AccountRunLogWriter,
+        event: str,
+        details: dict,
+    ) -> None:
+        if details.get("forced"):
+            writer.lifecycle("forced_termination", **details)
+        writer.lifecycle(event, **details)
+        writer.finalize("final_exit", outcome=event, **details)
+        if managed.log_writer is writer:
+            managed.log_writer = None
+        if writer.last_error:
+            logger.error(
+                "Account log finalization is pending for %s run %s: %s",
+                managed.account_key,
+                managed.run_id,
+                writer.last_error,
+            )
+
+    def _defer_managed_log_finalization(
+        self,
+        managed: ManagedProcess,
+        writer: AccountRunLogWriter,
+        output_thread: threading.Thread,
+        event: str,
+        details: dict,
+    ) -> None:
+        run_id = managed.run_id
+        with self._pending_log_finalizations_lock:
+            if run_id in self._pending_log_finalizations:
+                return
+
+            def finish_after_drain() -> None:
+                try:
+                    output_thread.join()
+                    self._complete_managed_log_finalization(
+                        managed,
+                        writer,
+                        event,
+                        details,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Deferred account log finalization failed for %s run %s",
+                        managed.account_key,
+                        run_id,
+                    )
+                finally:
+                    with self._pending_log_finalizations_lock:
+                        self._pending_log_finalizations.pop(run_id, None)
+
+            finalizer = threading.Thread(
+                target=finish_after_drain,
+                name=f"miner-log-finalize-{managed.account_id}-{run_id}",
+                daemon=True,
+            )
+            self._pending_log_finalizations[run_id] = finalizer
+            finalizer.start()
+
+    def _wait_for_pending_log_finalizations(self) -> None:
+        while True:
+            with self._pending_log_finalizations_lock:
+                pending = list(self._pending_log_finalizations.values())
+            if not pending:
+                return
+            for finalizer in pending:
+                if finalizer is not threading.current_thread():
+                    finalizer.join()
+
     def build_process_command(self, run: MinerRun) -> list[str]:
         """Return argv containing identifiers only, never secrets or channels."""
 
@@ -804,7 +925,25 @@ class MinerSupervisor:
         command_id: int | None = None,
         restart_attempt_id: int | None = None,
     ) -> ManagedProcess:
+        log_writer: AccountRunLogWriter | None = None
         try:
+            if getattr(settings, "TWITCH_FARM_LOG_WRITER", False):
+                log_writer = AccountRunLogWriter(
+                    account_id=run.account_id,
+                    run_id=run.pk,
+                    account_key=run.account.config_key,
+                )
+                log_writer.lifecycle(
+                    "launch_requested",
+                    source_mode=run.source_mode,
+                    source_name=run.source_name,
+                    channels=run.channels,
+                )
+                if restart_attempt_id is not None:
+                    log_writer.lifecycle(
+                        "recovery_started",
+                        restart_attempt_id=restart_attempt_id,
+                    )
             runtime_dir = Path(
                 getattr(settings, "TWITCH_FARM_RUNTIME_DIR", settings.BASE_DIR / "runtime")
             )
@@ -841,6 +980,16 @@ class MinerSupervisor:
             process = self.process_factory(self.build_process_command(run), **popen_options)
         except Exception as exc:
             error = safe_error(exc)
+            if log_writer is not None:
+                log_writer.lifecycle("start_failed", error=error)
+                log_writer.finalize("final_exit", outcome="start_failed", error=error)
+                if log_writer.last_error:
+                    logger.error(
+                        "Account log finalization is pending for %s run %s: %s",
+                        run.account.config_key,
+                        run.pk,
+                        log_writer.last_error,
+                    )
             self._finalize_or_remember(
                 run_id=run.pk,
                 account_id=run.account_id,
@@ -878,6 +1027,7 @@ class MinerSupervisor:
             spawned_monotonic=self.monotonic(),
             command_id=command_id,
             restart_attempt_id=restart_attempt_id,
+            log_writer=log_writer,
         )
         # Register ownership immediately after Popen. If any following database
         # write fails, cleanup can still signal this exact child and a failed
@@ -887,7 +1037,7 @@ class MinerSupervisor:
         if output_stream is not None:
             managed.output_thread = threading.Thread(
                 target=_drain_miner_output,
-                args=(output_stream, run.account.config_key),
+                args=(output_stream, run.account.config_key, log_writer),
                 name=f"miner-log-{run.account_id}",
                 daemon=True,
             )
@@ -898,6 +1048,7 @@ class MinerSupervisor:
             run.pk,
             process.pid,
         )
+        self._write_managed_lifecycle(managed, "process_started", pid=process.pid)
         try:
             MinerRun.objects.filter(pk=run.pk).update(pid=process.pid, worker_id=self.worker_id)
             state, _ = MinerInstanceState.objects.get_or_create(account=run.account)
@@ -967,6 +1118,13 @@ class MinerSupervisor:
                     )
                 else:
                     if self.processes.get(run.account_id) is managed:
+                        self._finalize_managed_log(
+                            managed,
+                            "start_failed",
+                            returncode=returncode,
+                            forced=forced,
+                            error=error,
+                        )
                         self.processes.pop(run.account_id, None)
             raise
         return managed
@@ -1301,6 +1459,7 @@ class MinerSupervisor:
         returncode: int | None = None
         if managed is not None:
             self._cancel_attached_start(managed, except_command_id)
+            self._write_managed_lifecycle(managed, "stop_requested", reason=reason)
             try:
                 returncode, forced_now = self._terminate_owned_process(managed.process)
                 forced = managed.pending_stop_forced or forced_now
@@ -1348,6 +1507,13 @@ class MinerSupervisor:
                 )
                 raise
             if self.processes.get(account.pk) is managed:
+                self._finalize_managed_log(
+                    managed,
+                    "run_finished",
+                    reason=managed.pending_stop_reason,
+                    returncode=returncode,
+                    forced=forced,
+                )
                 self.processes.pop(account.pk, None)
         elif state.current_run_id:
             # PIDs are advisory.  Never signal an arbitrary persisted PID.
@@ -1427,6 +1593,12 @@ class MinerSupervisor:
             recovery_taken_over = True
             state.observed_state = MinerInstanceState.ObservedState.RESTARTING
             state.save(update_fields=("observed_state", "updated_at"))
+            if existing is not None:
+                self._write_managed_lifecycle(
+                    existing,
+                    "restart_requested",
+                    reason=reason,
+                )
             self.stop_account(
                 account,
                 reason=reason,
@@ -1612,6 +1784,13 @@ class MinerSupervisor:
         schedule_recovery: bool = True,
         record_when_stopped: bool = False,
     ) -> bool:
+        if not managed.crash_logged:
+            self._write_managed_lifecycle(
+                managed,
+                "crash_detected",
+                returncode=returncode,
+            )
+            managed.crash_logged = True
         try:
             with transaction.atomic():
                 # Keep the exact dead process handle until all run/incident/state
@@ -1710,7 +1889,13 @@ class MinerSupervisor:
                                 )
                             )
                     else:
-                        self._schedule_recovery(state, incident)
+                        attempt = self._schedule_recovery(state, incident)
+                        self._write_managed_lifecycle(
+                            managed,
+                            "recovery_scheduled",
+                            attempt=attempt.attempt_number,
+                            scheduled_at=attempt.scheduled_at.isoformat(),
+                        )
         except Exception as exc:
             logger.exception(
                 "Unexpected-exit bookkeeping remains pending for run %s: %s",
@@ -1720,6 +1905,12 @@ class MinerSupervisor:
             return False
 
         if self.processes.get(managed.account_id) is managed:
+            self._finalize_managed_log(
+                managed,
+                "unexpected_exit",
+                returncode=returncode,
+                recovery_requested=schedule_recovery,
+            )
             self.processes.pop(managed.account_id, None)
         return True
 
@@ -1736,6 +1927,7 @@ class MinerSupervisor:
                 raise RuntimeError(
                     f"Run {managed.run_id} could not be confirmed because it is no longer active."
                 )
+            self._write_managed_lifecycle(managed, "startup_confirmed")
 
             state = MinerInstanceState.objects.select_for_update().get(
                 account_id=managed.account_id
@@ -1885,6 +2077,13 @@ class MinerSupervisor:
             return
 
         if self.processes.get(managed.account_id) is managed:
+            self._finalize_managed_log(
+                managed,
+                "start_failed",
+                returncode=returncode,
+                forced=forced,
+                error=managed.cleanup_error,
+            )
             self.processes.pop(managed.account_id, None)
         if managed.command_id:
             self._finish_command(
@@ -2332,6 +2531,16 @@ class MinerSupervisor:
         ):
             services.purge_expired_legacy_import_drafts(at=self.now())
             self.reconcile_fingerprints()
+            if getattr(settings, "TWITCH_FARM_LOG_WRITER", False):
+                # Every registered handle may still own an open writer, including
+                # dead-process tombstones awaiting durable database finalization.
+                active_run_ids = {managed.run_id for managed in self.processes.values()}
+                with self._pending_log_finalizations_lock:
+                    active_run_ids.update(self._pending_log_finalizations)
+                for recovery_error in recover_account_log_archives(
+                    active_run_ids=active_run_ids
+                ):
+                    logger.error("Account log recovery is pending: %s", recovery_error)
             self._last_fingerprint = current
 
     def run_forever(self, *, should_stop: Callable[[], bool] | None = None) -> None:
@@ -2379,6 +2588,13 @@ class MinerSupervisor:
             updated_at=now,
         )
         if self.processes.get(managed.account_id) is managed:
+            self._finalize_managed_log(
+                managed,
+                "run_finished",
+                reason=reason,
+                returncode=returncode,
+                forced=forced,
+            )
             self.processes.pop(managed.account_id, None)
 
     def shutdown(self) -> None:
@@ -2417,6 +2633,10 @@ class MinerSupervisor:
                             self._cleanup_released_shutdown_process(managed)
                 except BaseException as exc:
                     errors.append(exc)
+            try:
+                self._wait_for_pending_log_finalizations()
+            except BaseException as exc:
+                errors.append(exc)
         finally:
             try:
                 try:

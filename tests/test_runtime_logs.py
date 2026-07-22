@@ -1,12 +1,28 @@
 from __future__ import annotations
 
+import gzip
 import io
 import logging
+import os
+import stat
+from unittest.mock import patch
 
+import pytest
 from django.test import override_settings
 
 from controller.miner_supervisor import _drain_miner_output
-from controller.runtime_logs import MAX_LOG_BYTES, MAX_LOG_LINES, read_runtime_log_tail
+from controller.runtime_logs import (
+    MAX_LOG_BYTES,
+    MAX_LOG_LINES,
+    AccountRunLogWriter,
+    LogStorageError,
+    iter_run_gzip,
+    read_account_live,
+    read_run_log_page,
+    read_runtime_log_tail,
+    recover_account_log_archives,
+    summarize_run_log,
+)
 
 
 def test_miner_output_is_prefixed_redacted_and_emitted_once(caplog):
@@ -65,3 +81,180 @@ def test_runtime_log_tail_enforces_byte_cap_after_utf8_replacement(tmp_path):
 
     assert lines
     assert len("\n".join(lines).encode("utf-8")) <= MAX_LOG_BYTES
+
+
+def test_account_writer_collects_redacted_output_and_lifecycle_in_gzip(tmp_path):
+    path = tmp_path / "logs" / "twitch-farm.log"
+    with override_settings(
+        TWITCH_FARM_LOG_FILE=path,
+        TWITCH_FARM_ACCOUNT_LOG_PART_BYTES=1024 * 1024,
+        TWITCH_FARM_ACCOUNT_LOG_ARCHIVE_BYTES=50 * 1024 * 1024,
+    ):
+        writer = AccountRunLogWriter(account_id=7, run_id=11, account_key="primary")
+        writer.lifecycle("launch_requested", channels=["one", "two"])
+        _drain_miner_output(
+            io.StringIO("connected\npassword=hunter2\nAuthorization: Bearer secret\n"),
+            "primary",
+            writer,
+        )
+        writer.finalize("run_finished", reason="admin_stop")
+        summary = summarize_run_log(7, 11)
+        archive = path.parent / "accounts" / "7" / "runs" / "11" / "part-000000.log.gz"
+
+    assert summary.compressed_parts == 1
+    assert not summary.compression_pending
+    with gzip.open(archive, "rt", encoding="utf-8") as stream:
+        contents = stream.read()
+    assert "launch_requested" in contents
+    assert "connected" in contents
+    assert "password=[redacted]" in contents
+    assert "Authorization: [redacted]" in contents
+    assert "hunter2" not in contents
+    assert "Bearer secret" not in contents
+    assert "run_finished" in contents
+    assert stat.S_IMODE(archive.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(archive.stat().st_mode) == 0o600
+
+
+def test_account_archives_rotate_prune_and_stay_isolated(tmp_path):
+    path = tmp_path / "logs" / "twitch-farm.log"
+    with override_settings(
+        TWITCH_FARM_LOG_FILE=path,
+        TWITCH_FARM_ACCOUNT_LOG_PART_BYTES=180,
+        TWITCH_FARM_ACCOUNT_LOG_ARCHIVE_BYTES=230,
+    ):
+        primary = AccountRunLogWriter(account_id=1, run_id=10, account_key="primary")
+        secondary = AccountRunLogWriter(account_id=2, run_id=20, account_key="secondary")
+        for index in range(30):
+            primary.write(f"primary-{index:03d}-abcdefghijklmnopqrstuvwxyz-{index * 7919}")
+            secondary.write(f"secondary-{index:03d}-zyxwvutsrqponmlkjihgfedcba-{index * 6151}")
+        primary.finalize("run_finished")
+        secondary.finalize("run_finished")
+        primary_summary = summarize_run_log(1, 10)
+        secondary_summary = summarize_run_log(2, 20)
+        primary_page = read_run_log_page(account_id=1, run_id=10, limit=400)
+        secondary_page = read_run_log_page(account_id=2, run_id=20, limit=400)
+
+    assert primary_summary.compressed_bytes <= 230
+    assert secondary_summary.compressed_bytes <= 230
+    assert primary_summary.truncated
+    assert secondary_summary.truncated
+    assert all("secondary-" not in line for line in primary_page["lines"])
+    assert all("primary-" not in line for line in secondary_page["lines"])
+
+
+def test_compression_failure_leaves_plaintext_pending_and_recovery_retries(tmp_path):
+    path = tmp_path / "logs" / "twitch-farm.log"
+    with override_settings(TWITCH_FARM_LOG_FILE=path):
+        writer = AccountRunLogWriter(account_id=3, run_id=30, account_key="pending")
+        writer.write("keep this line")
+        with patch("controller.runtime_logs._compress_plain_part", side_effect=OSError("disk")):
+            writer.finalize("run_finished")
+        pending = summarize_run_log(3, 30)
+        errors = recover_account_log_archives()
+        recovered = summarize_run_log(3, 30)
+
+    assert pending.compression_pending
+    assert writer.last_error == "OSError"
+    assert errors == []
+    assert not recovered.compression_pending
+    assert recovered.compressed_parts == 1
+
+
+def test_account_live_cursor_and_run_paging_follow_rotated_parts(tmp_path):
+    path = tmp_path / "logs" / "twitch-farm.log"
+    with override_settings(
+        TWITCH_FARM_LOG_FILE=path,
+        TWITCH_FARM_ACCOUNT_LOG_PART_BYTES=240,
+    ):
+        writer = AccountRunLogWriter(account_id=4, run_id=40, account_key="cursor")
+        for index in range(18):
+            writer.write(f"line-{index:02d}-abcdefghijk")
+        initial = read_account_live(account_id=4, run_id=40)
+        writer.write("line-after-cursor")
+        incremental = read_account_live(
+            account_id=4,
+            run_id=40,
+            cursor=initial["cursor"],
+        )
+        newest = read_run_log_page(account_id=4, run_id=40, limit=5)
+        older = read_run_log_page(
+            account_id=4,
+            run_id=40,
+            before=newest["before"],
+            limit=5,
+        )
+        writer.finalize("run_finished")
+        complete_page = read_run_log_page(account_id=4, run_id=40, limit=400)
+        chunks, size = iter_run_gzip(4, 40)
+        payload = b"".join(chunks)
+
+    assert len(incremental["lines"]) == 1
+    assert "line-after-cursor" in incremental["lines"][0]
+    assert len(newest["lines"]) == 5
+    assert older["lines"]
+    assert complete_page["has_older"] is False
+    assert complete_page["before"] is None
+    assert size == len(payload)
+    assert "line-after-cursor" in gzip.decompress(payload).decode("utf-8")
+
+
+def test_recovery_skips_active_plaintext_and_rejects_symlinked_run_roots(tmp_path):
+    path = tmp_path / "logs" / "twitch-farm.log"
+    with override_settings(TWITCH_FARM_LOG_FILE=path):
+        writer = AccountRunLogWriter(account_id=5, run_id=50, account_key="active")
+        writer.write("still active")
+        assert recover_account_log_archives(active_run_ids=[50]) == []
+        assert summarize_run_log(5, 50).compression_pending
+
+        writer.finalize("run_finished")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        unsafe_parent = path.parent / "accounts" / "6" / "runs"
+        unsafe_parent.mkdir(parents=True)
+        (unsafe_parent / "60").symlink_to(outside, target_is_directory=True)
+        with pytest.raises(LogStorageError, match="unsafe"):
+            summarize_run_log(6, 60)
+
+
+def test_recovery_prunes_an_older_pending_candidate_before_newer_archives(tmp_path):
+    path = tmp_path / "logs" / "twitch-farm.log"
+    with override_settings(
+        TWITCH_FARM_LOG_FILE=path,
+        TWITCH_FARM_ACCOUNT_LOG_ARCHIVE_BYTES=50 * 1024 * 1024,
+    ):
+        old = AccountRunLogWriter(account_id=8, run_id=80, account_key="ordered")
+        old.write("same-size-retention-payload")
+        with patch("controller.runtime_logs._compress_plain_part", side_effect=OSError("disk")):
+            old.finalize("run_finished")
+        old_plaintext = path.parent / "accounts" / "8" / "runs" / "80" / "part-000000.log"
+        old_timestamp = 1_000_000_000
+        os.utime(old_plaintext, ns=(old_timestamp, old_timestamp))
+        candidate_buffer = io.BytesIO()
+        with gzip.GzipFile(
+            filename=old_plaintext.name,
+            fileobj=candidate_buffer,
+            mode="wb",
+            mtime=0,
+        ) as compressed_candidate:
+            compressed_candidate.write(old_plaintext.read_bytes())
+        candidate_size = len(candidate_buffer.getvalue())
+
+        new = AccountRunLogWriter(account_id=8, run_id=81, account_key="ordered")
+        new.write("same-size-retention-payload")
+        new.finalize("run_finished")
+        new_summary = summarize_run_log(8, 81)
+
+        with override_settings(
+            TWITCH_FARM_LOG_FILE=path,
+            TWITCH_FARM_ACCOUNT_LOG_ARCHIVE_BYTES=max(
+                candidate_size,
+                new_summary.compressed_bytes,
+            ),
+        ):
+            assert recover_account_log_archives() == []
+            old_summary = summarize_run_log(8, 80)
+            retained_new = summarize_run_log(8, 81)
+
+    assert not old_summary.available
+    assert retained_new.available

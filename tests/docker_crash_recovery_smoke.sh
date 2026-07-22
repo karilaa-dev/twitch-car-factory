@@ -207,6 +207,7 @@ run_with_timeout "$DOCKER_TIMEOUT_SECONDS" "seed database account and enqueue st
 run_with_timeout "$DOCKER_TIMEOUT_SECONDS" "start miner worker" \
   docker run --detach --name "$WORKER" "${COMMON_ARGS[@]}" \
   --env TWITCH_FARM_FAKE_MINER=1 \
+  --env TWITCH_FARM_LOG_WRITER=1 \
   --env TWITCH_FARM_FAKE_MINER_MODE=normal \
   --env TWITCH_FARM_FAKE_MINER_RECORD_FILE=/app/runtime/fake-miner.jsonl \
   --env MINER_COMMAND_POLL_SECONDS=0.1 \
@@ -257,6 +258,11 @@ run_with_timeout "$DOCKER_TIMEOUT_SECONDS" "enqueue manual stop" \
 
 wait_for_state "durable manual-stop convergence" 30 \
   "from controller.models import MinerCommand,MinerIncident,MinerInstanceState,MinerRun; s=MinerInstanceState.objects.get(account__config_key='primary'); replacement=MinerRun.objects.exclude(pk=$FIRST_RUN_ID).order_by('-id').first(); ok=s.desired_state=='stopped' and s.observed_state=='stopped' and s.current_run_id is None and s.advisory_pid is None and replacement is not None and replacement.ended_at is not None and replacement.stop_reason=='admin_stop' and MinerCommand.objects.filter(account=s.account,action='stop',status='succeeded').exists() and MinerIncident.objects.filter(account=s.account,kind='unexpected_exit',status='recovered').count()==1; print('READY' if ok else 'WAIT')"
+
+run_with_timeout "$DOCKER_TIMEOUT_SECONDS" "verify per-run gzip lifecycle archives" \
+  docker exec "$WORKER" python manage.py shell -c \
+  "import gzip; from pathlib import Path; from controller.models import MinerAccount,MinerRun; account=MinerAccount.objects.get(config_key='primary'); runs=list(MinerRun.objects.filter(account=account).order_by('id')); assert len(runs)==2, runs; root=Path('/app/data/logs/accounts')/str(account.pk)/'runs'; parts_by_run=[sorted((root/str(run.pk)).glob('part-*.log.gz')) for run in runs]; assert all(parts_by_run), parts_by_run; assert not list(root.rglob('part-*.log')); texts=[gzip.decompress(b''.join(part.read_bytes() for part in parts)).decode('utf-8') for parts in parts_by_run]; assert all(marker in texts[0] for marker in ('crash_detected','recovery_scheduled','unexpected_exit','final_exit')), texts[0]; assert all(marker in texts[1] for marker in ('recovery_started','startup_confirmed','stop_requested','final_exit')), texts[1]" \
+  >/dev/null
 
 run_with_timeout "$DOCKER_TIMEOUT_SECONDS" "stop miner worker" \
   docker stop --time 5 "$WORKER" >/dev/null

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+import gzip
 import json
 from pathlib import Path
 import tempfile
@@ -27,6 +28,7 @@ from controller.models import (
     WorkerLease,
 )
 from controller.twitch_lookup import TwitchLookupStatus
+from controller.runtime_logs import AccountRunLogWriter
 
 
 class ApiContractTests(TestCase):
@@ -204,6 +206,9 @@ class ApiContractTests(TestCase):
             self.api("presets"),
             self.api("settings_general"),
             self.api("logs"),
+            self.api("log_runs"),
+            self.api("log_run_detail", 1),
+            self.api("log_run_download", 1),
             self.api("channel_validate"),
         )
         for url in urls:
@@ -506,7 +511,145 @@ class ApiContractTests(TestCase):
         data = self.assert_envelope(response)
         self.assertEqual(data["line_count"], 400)
         self.assertEqual(data["lines"][0], "line-50")
+        self.assertEqual(data["source"]["kind"], "combined")
+        self.assertIsNotNone(data["cursor"])
+        self.assertFalse(data["reset"])
         self.assertIn("no-cache", response.headers["Cache-Control"])
+
+    def test_account_live_history_detail_and_gzip_download(self):
+        self.login()
+        run = self.create_run()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "logs" / "twitch-farm.log"
+            with override_settings(TWITCH_FARM_LOG_FILE=path):
+                writer = AccountRunLogWriter(
+                    account_id=self.account.pk,
+                    run_id=run.pk,
+                    account_key=self.account.config_key,
+                )
+                writer.lifecycle("process_started", pid=4321)
+                writer.write("account-specific-line")
+
+                live = self.client.get(
+                    self.api("logs"),
+                    {"account_id": self.account.pk},
+                )
+                live_data = self.assert_envelope(live)
+                self.assertEqual(live_data["source"]["account_id"], self.account.pk)
+                self.assertEqual(live_data["run_id"], run.pk)
+                self.assertTrue(
+                    any("account-specific-line" in line for line in live_data["lines"])
+                )
+
+                writer.finalize("run_finished", reason="admin_stop")
+                ended_at = timezone.now()
+                MinerRun.objects.filter(pk=run.pk).update(
+                    ended_at=ended_at,
+                    exit_code=0,
+                    stop_reason=MinerRun.StopReason.ADMIN_STOP,
+                )
+                self.state.current_run = None
+                self.state.advisory_pid = None
+                self.state.observed_state = MinerInstanceState.ObservedState.STOPPED
+                self.state.save()
+                self.account.is_active = False
+                self.account.save(update_fields=("is_active", "updated_at"))
+
+                history = self.client.get(
+                    self.api("log_runs"),
+                    {"account_id": self.account.pk},
+                )
+                history_data = self.assert_envelope(history)
+                self.assertEqual(history_data["runs"][0]["run_id"], run.pk)
+                self.assertTrue(history_data["runs"][0]["downloadable"])
+                self.assertFalse(history_data["runs"][0]["account"]["is_active"])
+
+                detail = self.client.get(self.api("log_run_detail", run.pk))
+                detail_data = self.assert_envelope(detail)
+                self.assertEqual(detail_data["run"]["stop_reason"], "admin_stop")
+                self.assertTrue(
+                    any("account-specific-line" in line for line in detail_data["lines"])
+                )
+
+                download = self.client.get(self.api("log_run_download", run.pk))
+                compressed = b"".join(download.streaming_content)
+
+        self.assertEqual(download.status_code, 200)
+        self.assertEqual(download["Content-Type"], "application/gzip")
+        self.assertIn(f"run-{run.pk}.log.gz", download["Content-Disposition"])
+        self.assertIn("account-specific-line", gzip.decompress(compressed).decode("utf-8"))
+        self.assertIn("no-cache", history.headers["Cache-Control"])
+        self.assertIn("no-cache", detail.headers["Cache-Control"])
+        self.assertIn("no-cache", download.headers["Cache-Control"])
+
+    def test_log_api_rejects_invalid_cursor_and_active_download(self):
+        self.login()
+        invalid = self.client.get(self.api("logs"), {"cursor": "not-a-signed-cursor"})
+        self.assert_error(invalid, "log_unavailable", 409)
+
+        run = self.create_run()
+        active = self.client.get(self.api("log_run_download", run.pk))
+        self.assert_error(active, "log_still_active", 409)
+
+    def test_log_api_exposes_pending_plaintext_and_blocks_its_download(self):
+        self.login()
+        run = self.create_run()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "logs" / "twitch-farm.log"
+            with override_settings(TWITCH_FARM_LOG_FILE=path):
+                writer = AccountRunLogWriter(
+                    account_id=self.account.pk,
+                    run_id=run.pk,
+                    account_key=self.account.config_key,
+                )
+                writer.write("readable pending line")
+                with patch(
+                    "controller.runtime_logs._compress_plain_part",
+                    side_effect=OSError("simulated compression failure"),
+                ):
+                    writer.finalize("final_exit")
+                MinerRun.objects.filter(pk=run.pk).update(
+                    ended_at=timezone.now(),
+                    stop_reason=MinerRun.StopReason.ADMIN_STOP,
+                )
+
+                detail = self.client.get(self.api("log_run_detail", run.pk))
+                detail_data = self.assert_envelope(detail)
+                download = self.client.get(self.api("log_run_download", run.pk))
+
+        self.assertEqual(detail_data["run"]["archive_state"], "compression_pending")
+        self.assertTrue(any("readable pending line" in line for line in detail_data["lines"]))
+        self.assert_error(download, "log_unavailable", 409)
+
+    def test_truncated_download_filename_labels_the_retained_suffix(self):
+        self.login()
+        run = self.create_run()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "logs" / "twitch-farm.log"
+            with override_settings(
+                TWITCH_FARM_LOG_FILE=path,
+                TWITCH_FARM_ACCOUNT_LOG_PART_BYTES=180,
+                TWITCH_FARM_ACCOUNT_LOG_ARCHIVE_BYTES=240,
+            ):
+                writer = AccountRunLogWriter(
+                    account_id=self.account.pk,
+                    run_id=run.pk,
+                    account_key=self.account.config_key,
+                )
+                for index in range(40):
+                    writer.write(f"retention-{index:03d}-{index * 7919}-abcdefghijklmnopqrstuvwxyz")
+                writer.finalize("final_exit")
+                MinerRun.objects.filter(pk=run.pk).update(
+                    ended_at=timezone.now(),
+                    stop_reason=MinerRun.StopReason.ADMIN_STOP,
+                )
+
+                download = self.client.get(self.api("log_run_download", run.pk))
+                compressed = b"".join(download.streaming_content)
+
+        self.assertEqual(download.status_code, 200)
+        self.assertIn("-truncated.log.gz", download["Content-Disposition"])
+        self.assertTrue(gzip.decompress(compressed))
 
     def test_api_methods_return_json_405_and_allow_header(self):
         self.login()
