@@ -15,6 +15,7 @@ from django.urls import reverse
 
 from controller.crypto import decrypt_json, decrypt_text, encrypt_text
 from controller.legacy_import import (
+    DesiredAccount,
     LegacyArchiveError,
     LegacyImportConflict,
     LegacyImportError,
@@ -23,6 +24,7 @@ from controller.legacy_import import (
     confirm_legacy_import,
     parse_legacy_archive,
     prepare_legacy_import,
+    _write_desired_account,
 )
 from controller.models import (
     AccountCredential,
@@ -449,6 +451,37 @@ def test_ui_touched_unchanged_account_does_not_regain_import_ownership(staff):
         conflict["code"] == "unowned_account"
         for conflict in third.preview["conflicts"]
     )
+
+
+@pytest.mark.django_db
+def test_imported_password_restores_legacy_auth_method(staff):
+    account = MinerAccount.objects.create(
+        config_key="primary",
+        display_username="PrimaryUser",
+        is_active=True,
+    )
+    credential = AccountCredential.objects.create(
+        account=account,
+        auth_method=AccountCredential.AuthMethod.TWITCH_TV,
+        password_ciphertext="",
+    )
+    MinerInstanceState.objects.create(account=account)
+
+    _write_desired_account(
+        DesiredAccount(
+            config_key="primary",
+            username="PrimaryUser",
+            password="replacement-password",
+            is_active=True,
+        ),
+        current=account,
+        preset_map={},
+        actor=staff,
+    )
+
+    credential.refresh_from_db()
+    assert credential.auth_method == AccountCredential.AuthMethod.LEGACY_PASSWORD
+    assert decrypt_text(credential.password_ciphertext) == "replacement-password"
 
 
 @pytest.mark.django_db

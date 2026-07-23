@@ -76,6 +76,44 @@ def assert_log_run_cards_do_not_overlap(page: Page, label: str) -> None:
         )
 
 
+def assert_no_browser_errors(
+    console_errors: list[str], page_errors: list[str]
+) -> None:
+    ignored = (
+        "Failed to load resource: the server responded with a status of 400",
+    )
+    filtered = [
+        error for error in console_errors if not error.startswith(ignored)
+    ]
+    if filtered or page_errors:
+        raise AssertionError(
+            f"Browser errors: console={filtered!r}, page={page_errors!r}"
+        )
+
+
+def run_tv_auth_smoke(page: Page, args, account_id: int) -> None:
+    page.goto(
+        f"{args.base_url}/accounts/{account_id}?tab=auth",
+        wait_until="networkidle",
+    )
+    page.get_by_role("heading", name="tv_smoke", exact=True).wait_for()
+    page.get_by_role("button", name="Connect Twitch", exact=True).click()
+    page.get_by_text("FAKE-CODE", exact=True).wait_for(timeout=15_000)
+    assert page.get_by_role(
+        "link", name="Open twitch.tv/activate", exact=True
+    ).get_attribute("href") == "https://www.twitch.tv/activate"
+    page.screenshot(path=args.output / "tv-auth-desktop.png", full_page=True)
+    for width in (390, 320):
+        page.set_viewport_size({"width": width, "height": 900})
+        assert_no_horizontal_overflow(page, f"TV auth {width}px")
+        assert_tv_auth_targets(page, f"TV auth {width}px")
+        page.screenshot(
+            path=args.output / f"tv-auth-{width}.png",
+            full_page=True,
+        )
+    page.set_viewport_size({"width": 1440, "height": 1000})
+
+
 def assert_tv_auth_targets(page: Page, label: str) -> None:
     for target in (
         page.get_by_role("button", name="Copy activation code"),
@@ -162,33 +200,14 @@ def main() -> None:
                 page.screenshot(
                     path=args.output / f"logs-history-{width}.png", full_page=True
                 )
-            assert not console_errors, console_errors
-            assert not page_errors, page_errors
+            assert_no_browser_errors(console_errors, page_errors)
             browser.close()
             return
         if args.tv_only:
             if args.tv_account_id is None:
                 raise AssertionError("--tv-only requires --tv-account-id")
-            page.goto(
-                f"{args.base_url}/accounts/{args.tv_account_id}?tab=auth",
-                wait_until="networkidle",
-            )
-            page.get_by_role("heading", name="tv_smoke", exact=True).wait_for()
-            page.get_by_role("button", name="Connect Twitch", exact=True).click()
-            page.get_by_text("FAKE-CODE", exact=True).wait_for(timeout=15_000)
-            assert page.get_by_role(
-                "link", name="Open twitch.tv/activate", exact=True
-            ).get_attribute("href") == "https://www.twitch.tv/activate"
-            page.screenshot(path=args.output / "tv-auth-desktop.png", full_page=True)
-            for width in (390, 320):
-                page.set_viewport_size({"width": width, "height": 900})
-                assert_no_horizontal_overflow(page, f"TV auth {width}px")
-                assert_tv_auth_targets(page, f"TV auth {width}px")
-                page.screenshot(
-                    path=args.output / f"tv-auth-{width}.png", full_page=True
-                )
-            assert not console_errors, console_errors
-            assert not page_errors, page_errors
+            run_tv_auth_smoke(page, args, args.tv_account_id)
+            assert_no_browser_errors(console_errors, page_errors)
             browser.close()
             return
         assert page.get_by_role("columnheader", name="Current state").count() == 1
@@ -225,26 +244,7 @@ def main() -> None:
         dialog.wait_for(state="hidden")
 
         if args.tv_account_id is not None:
-            page.goto(
-                f"{args.base_url}/accounts/{args.tv_account_id}?tab=auth",
-                wait_until="networkidle",
-            )
-            page.get_by_role("heading", name="tv_smoke", exact=True).wait_for()
-            page.get_by_role("button", name="Connect Twitch", exact=True).click()
-            page.get_by_text("FAKE-CODE", exact=True).wait_for(timeout=15_000)
-            assert page.get_by_role(
-                "link", name="Open twitch.tv/activate", exact=True
-            ).get_attribute("href") == "https://www.twitch.tv/activate"
-            page.screenshot(path=args.output / "tv-auth-desktop.png", full_page=True)
-            for width in (390, 320):
-                page.set_viewport_size({"width": width, "height": 900})
-                assert_no_horizontal_overflow(page, f"TV auth {width}px")
-                assert_tv_auth_targets(page, f"TV auth {width}px")
-                page.screenshot(
-                    path=args.output / f"tv-auth-{width}.png",
-                    full_page=True,
-                )
-            page.set_viewport_size({"width": 1440, "height": 1000})
+            run_tv_auth_smoke(page, args, args.tv_account_id)
 
         # Every primary route renders from the single React entry point.
         assert_route(page, args.base_url, "/accounts", "Accounts", "Desktop accounts")
@@ -449,14 +449,7 @@ def main() -> None:
 
         browser.close()
 
-    ignored = (
-        "Failed to load resource: the server responded with a status of 400",
-    )
-    console_errors = [error for error in console_errors if not error.startswith(ignored)]
-    if console_errors or page_errors:
-        raise AssertionError(
-            f"Browser errors: console={console_errors!r}, page={page_errors!r}"
-        )
+    assert_no_browser_errors(console_errors, page_errors)
 
 
 if __name__ == "__main__":

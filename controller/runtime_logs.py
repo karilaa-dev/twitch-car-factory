@@ -480,7 +480,16 @@ def _read_binary_lines(stream, *, max_lines: int, max_bytes: int) -> tuple[list[
         if not raw:
             break
         if consumed + len(raw) > max_bytes:
-            stream.seek(position)
+            if consumed:
+                stream.seek(position)
+                break
+            # A single oversized record must not pin the cursor forever. Skip
+            # its remainder and report the physical bytes consumed so the next
+            # poll can continue with the following record.
+            consumed = len(raw)
+            while raw and not raw.endswith(b"\n"):
+                raw = stream.readline(64 * 1024)
+                consumed += len(raw)
             break
         consumed += len(raw)
         lines.append(raw.rstrip(b"\r\n").decode("utf-8", errors="replace"))

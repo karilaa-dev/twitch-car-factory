@@ -166,6 +166,22 @@ def test_combined_initial_cursor_keeps_an_append_after_its_snapshot(tmp_path):
     assert incremental["lines"] == ["line-appended-after-snapshot"]
 
 
+def test_combined_cursor_advances_past_one_oversized_record(tmp_path):
+    path = tmp_path / "twitch-farm.log"
+    path.write_text("initial-line\n", encoding="utf-8")
+
+    with override_settings(TWITCH_FARM_LOG_FILE=path):
+        initial = read_combined_live()
+        with path.open("ab") as stream:
+            stream.write(b"x" * (MAX_LOG_BYTES + 1) + b"\nnext-line\n")
+        oversized = read_combined_live(initial["cursor"])
+        following = read_combined_live(oversized["cursor"])
+
+    assert oversized["lines"] == []
+    assert oversized["cursor"] != initial["cursor"]
+    assert following["lines"] == ["next-line"]
+
+
 def test_account_writer_collects_redacted_output_and_lifecycle_in_gzip(tmp_path):
     path = tmp_path / "logs" / "twitch-farm.log"
     with override_settings(
