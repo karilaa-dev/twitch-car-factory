@@ -6,13 +6,13 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "colorama>=0.4.6",
-    "cryptography>=44.0.0",
-    "django>=5.2,<5.3",
-    "gunicorn>=23.0.0",
-    "pyyaml>=6.0.1",
-    "twitch-channel-points-miner-v2",
+    "cryptography>=49.0.0",
+    "django>=6.0.7,<6.1",
+    "gunicorn>=26.0.0",
+    "pyyaml>=6.0.3",
+    "twitch-channel-points-miner-v2>=2.0.7",
     "validators>=0.35.0",
-    "whitenoise>=6.9.0",
+    "whitenoise>=6.12.0",
 ]
 
 [tool.uv.sources]
@@ -20,9 +20,9 @@ twitch-channel-points-miner-v2 = { git = "https://github.com/rdavydov/Twitch-Cha
 
 [dependency-groups]
 dev = [
-    "playwright>=1.60.0",
-    "pytest>=8.3.0",
-    "pytest-django>=4.11.0",
+    "playwright>=1.61.0",
+    "pytest>=9.1.1",
+    "pytest-django>=4.12.0",
 ]
 
 [tool.pytest.ini_options]
