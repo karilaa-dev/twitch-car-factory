@@ -70,6 +70,7 @@ def assert_log_run_cards_do_not_overlap(page: Page, label: str) -> None:
         })
         """
     )
+    assert cards, f"{label} has no run cards"
     for previous, current in zip(cards, cards[1:], strict=False):
         assert previous["bottom"] <= current["top"] + 1, (
             f"{label} run cards overlap: {previous!r}, {current!r}"
@@ -85,6 +86,7 @@ def assert_log_run_cards_are_compact(page: Page, label: str) -> None:
         }))
         """
     )
+    assert cards, f"{label} has no run cards"
     for card in cards:
         assert 43.5 <= card["height"] <= 56, (
             f"{label} run card {card['id']} is {card['height']}px tall"
@@ -200,8 +202,8 @@ def main() -> None:
             page.get_by_text("Twitch library", exact=True).first.wait_for()
             assert_no_horizontal_overflow(page, "Desktop log source filters")
             live_console = page.get_by_label("Live farmer log lines")
-            if live_console.count():
-                assert "twitch_farm.miner_output" not in live_console.inner_text()
+            live_console.wait_for()
+            assert "twitch_farm.miner_output" not in live_console.inner_text()
             page.screenshot(
                 path=args.output / "logs-filter-desktop.png", full_page=True
             )
@@ -210,8 +212,8 @@ def main() -> None:
             assert_log_run_cards_do_not_overlap(page, "Desktop log history")
             assert_log_run_cards_are_compact(page, "Desktop log history")
             archived_console = page.get_by_label("Archived farmer log lines")
-            if archived_console.count():
-                assert " INFO library account=" not in archived_console.inner_text()
+            archived_console.wait_for()
+            assert " INFO library account=" not in archived_console.inner_text()
             page.screenshot(
                 path=args.output / "logs-history-desktop.png", full_page=True
             )
