@@ -17,10 +17,11 @@ from typing import Any, Callable
 import uuid
 
 from django.contrib.auth import login, logout
+from django.core import signing
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.db import transaction
-from django.db.models import Prefetch
-from django.http import Http404, HttpRequest, JsonResponse, QueryDict
+from django.db.models import Prefetch, Q
+from django.http import Http404, HttpRequest, JsonResponse, QueryDict, StreamingHttpResponse
 from django.middleware.csrf import get_token
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -41,6 +42,7 @@ from .forms import (
     StaffAuthenticationForm,
 )
 from .models import (
+    AccountCredential,
     AccountChannelSelection,
     ActionLog,
     ChannelPreset,
@@ -53,13 +55,24 @@ from .models import (
     MinerRun,
     WorkerLease,
 )
-from .runtime_logs import MAX_LOG_BYTES, MAX_LOG_LINES, read_runtime_log_tail
+from .runtime_logs import (
+    ACCOUNT_LOG_ARCHIVE_BYTES,
+    MAX_LOG_BYTES,
+    MAX_LOG_LINES,
+    LogStorageError,
+    iter_run_gzip,
+    read_account_live,
+    read_combined_live,
+    read_run_log_page,
+    summarize_run_log,
+)
 from .services import (
     create_account,
     delete_preset,
     enqueue_all,
     enqueue_command,
     normalize_channels,
+    request_tv_authentication,
     save_preset,
     set_account_channel_selection,
     update_account,
@@ -70,6 +83,7 @@ from .twitch_lookup import TwitchLookupStatus, lookup_twitch_names
 
 logger = logging.getLogger(__name__)
 ApiView = Callable[..., JsonResponse]
+LOG_HISTORY_CURSOR_SALT = "twitch-farm.log-history.v1"
 
 
 def _success(data: Any, *, notices: list[dict[str, str]] | None = None, status: int = 200):
@@ -404,12 +418,52 @@ def _serialize_action(item: ActionLog) -> dict[str, Any]:
 
 def _serialize_account(row: AccountTelemetry) -> dict[str, Any]:
     account = row.account
+    state = row.state
+    try:
+        credential = account.credential
+        auth_method = credential.auth_method
+    except ObjectDoesNotExist:
+        auth_method = AccountCredential.AuthMethod.TWITCH_TV
+    auth_status = (
+        state.authentication_status
+        if state is not None
+        else MinerInstanceState.AuthenticationStatus.UNLINKED
+    )
+    expired = bool(
+        state
+        and state.authentication_expires_at
+        and state.authentication_expires_at <= timezone.now()
+    )
+    if expired and auth_status == MinerInstanceState.AuthenticationStatus.PENDING:
+        auth_status = MinerInstanceState.AuthenticationStatus.REAUTH_REQUIRED
     return {
         "id": account.pk,
         "config_key": account.config_key,
         "username": account.display_username,
         "is_active": account.is_active,
         "has_credentials": account.has_credentials,
+        "authentication": {
+            "method": auth_method,
+            "status": auth_status,
+            "activation_url": (
+                state.authentication_uri
+                if state and auth_status == MinerInstanceState.AuthenticationStatus.PENDING
+                else ""
+            ),
+            "user_code": (
+                state.authentication_code
+                if state and auth_status == MinerInstanceState.AuthenticationStatus.PENDING
+                else ""
+            ),
+            "expires_at": (
+                _iso(state.authentication_expires_at)
+                if state and auth_status == MinerInstanceState.AuthenticationStatus.PENDING
+                else None
+            ),
+            "error": state.authentication_error if state else "",
+            "updated_at": _iso(state.authentication_updated_at) if state else None,
+            "can_reconnect": bool(account.is_active),
+        },
         "desired": row.desired,
         "observed": row.observed,
         "source": {
@@ -470,6 +524,8 @@ def _serialize_run(run: MinerRun) -> dict[str, Any]:
         "source_name": run.source_name,
         "channels": list(run.channels),
         "channel_revision": run.channel_revision,
+        "auth_method": run.auth_method,
+        "reset_session": run.reset_session,
         "pid": run.pid,
         "started_at": _iso(run.started_at),
         "ended_at": _iso(run.ended_at),
@@ -613,6 +669,11 @@ def accounts(request: HttpRequest):
         config_key=form.cleaned_data["config_key"],
         username=form.cleaned_data["username"],
         password=form.cleaned_data["password"],
+        auth_method=(
+            AccountCredential.AuthMethod.LEGACY_PASSWORD
+            if form.cleaned_data["password"]
+            else AccountCredential.AuthMethod.TWITCH_TV
+        ),
         mode=mode,
         channels=(form.cleaned_data["custom_channel_names"] if mode == "custom" else None),
         preset=form.cleaned_data.get("preset"),
@@ -722,6 +783,21 @@ def account_actions(request: HttpRequest, pk: int):
         reason="Requested from the web control room.",
     )
     return _success({"command": _serialize_command(command)}, status=202)
+
+
+@never_cache
+@api_endpoint("POST")
+def account_tv_authentication(request: HttpRequest, pk: int):
+    account = get_object_or_404(MinerAccount, pk=pk)
+    command = request_tv_authentication(account, actor=request.user)
+    account = get_object_or_404(_account_queryset(), pk=pk)
+    return _success(
+        {
+            "command": _serialize_command(command),
+            "account": _serialize_account(_as_telemetry(account)),
+        },
+        status=202,
+    )
 
 
 @api_endpoint("GET", "POST")
@@ -924,17 +1000,231 @@ def settings_import_delete(request: HttpRequest, draft_id: uuid.UUID):
 @never_cache
 @api_endpoint("GET")
 def logs(request: HttpRequest):
-    lines = read_runtime_log_tail()
+    account_value = request.GET.get("account_id", "").strip()
+    cursor = request.GET.get("cursor", "").strip() or None
+    try:
+        if account_value:
+            try:
+                account_id = int(account_value)
+            except ValueError:
+                raise ValidationError({"account_id": ["Choose a valid account."]}) from None
+            account = get_object_or_404(MinerAccount, pk=account_id)
+            try:
+                state = account.runtime_state
+            except MinerInstanceState.DoesNotExist:
+                state = None
+            run = state.current_run if state else None
+            if run is None:
+                live = {"lines": [], "cursor": None, "reset": bool(cursor), "run_id": None}
+            else:
+                live = read_account_live(
+                    account_id=account.pk,
+                    run_id=run.pk,
+                    cursor=cursor,
+                )
+            source = {
+                "kind": "account",
+                "account_id": account.pk,
+                "account_key": account.config_key,
+                "username": account.display_username,
+            }
+        else:
+            live = read_combined_live(cursor)
+            source = {
+                "kind": "combined",
+                "account_id": None,
+                "account_key": None,
+                "username": None,
+            }
+    except LogStorageError as exc:
+        return _error("log_unavailable", str(exc), status=409)
+    lines = live["lines"]
     return _success(
         {
             "lines": lines,
             "line_count": len(lines),
             "max_lines": MAX_LOG_LINES,
             "max_bytes": MAX_LOG_BYTES,
+            "cursor": live["cursor"],
+            "reset": live["reset"],
+            "run_id": live["run_id"],
+            "source": source,
             "supervisor": _supervisor(),
             "generated_at": _iso(timezone.now()),
         }
     )
+
+
+def _log_limit(request: HttpRequest, *, default: int, maximum: int) -> int:
+    raw = request.GET.get("limit", str(default))
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValidationError({"limit": ["Enter a valid result limit."]}) from None
+    if value < 1 or value > maximum:
+        raise ValidationError({"limit": [f"Choose a limit from 1 to {maximum}."]})
+    return value
+
+
+def _encode_history_cursor(run: MinerRun) -> str:
+    return signing.dumps(
+        {"started_at": run.started_at.isoformat(), "id": run.pk},
+        salt=LOG_HISTORY_CURSOR_SALT,
+        compress=True,
+    )
+
+
+def _decode_history_cursor(value: str) -> tuple[datetime, int]:
+    try:
+        payload = signing.loads(
+            value,
+            salt=LOG_HISTORY_CURSOR_SALT,
+            max_age=30 * 24 * 60 * 60,
+        )
+        started_at = datetime.fromisoformat(payload["started_at"])
+        run_id = int(payload["id"])
+    except (signing.BadSignature, KeyError, TypeError, ValueError) as exc:
+        raise ValidationError({"before": ["The history cursor is invalid or expired."]}) from exc
+    return started_at, run_id
+
+
+def _serialize_log_run(run: MinerRun) -> dict[str, Any] | None:
+    try:
+        summary = summarize_run_log(run.account_id, run.pk)
+    except LogStorageError:
+        return None
+    if not summary.available:
+        return None
+    if run.ended_at is None:
+        archive_state = "active"
+    elif summary.compression_pending:
+        archive_state = "compression_pending"
+    else:
+        archive_state = "ready"
+    return {
+        "run_id": run.pk,
+        "account": {
+            "id": run.account_id,
+            "config_key": run.account.config_key,
+            "username": run.account.display_username,
+            "is_active": run.account.is_active,
+        },
+        "started_at": _iso(run.started_at),
+        "ended_at": _iso(run.ended_at),
+        "stop_reason": run.stop_reason,
+        "exit_code": run.exit_code,
+        "exit_signal": run.exit_signal,
+        "archive_state": archive_state,
+        "compressed_bytes": summary.compressed_bytes,
+        "compressed_parts": summary.compressed_parts,
+        "plaintext_parts": summary.plaintext_parts,
+        "truncated": summary.truncated,
+        "downloadable": run.ended_at is not None and not summary.compression_pending,
+    }
+
+
+@never_cache
+@api_endpoint("GET")
+def log_runs(request: HttpRequest):
+    limit = _log_limit(request, default=25, maximum=100)
+    queryset = MinerRun.objects.select_related("account").filter(ended_at__isnull=False)
+    account_value = request.GET.get("account_id", "").strip()
+    if account_value:
+        try:
+            account_id = int(account_value)
+        except ValueError:
+            raise ValidationError({"account_id": ["Choose a valid account."]}) from None
+        if not MinerAccount.objects.filter(pk=account_id).exists():
+            raise Http404
+        queryset = queryset.filter(account_id=account_id)
+    before = request.GET.get("before", "").strip()
+    if before:
+        started_at, run_id = _decode_history_cursor(before)
+        queryset = queryset.filter(
+            Q(started_at__lt=started_at) | Q(started_at=started_at, pk__lt=run_id)
+        )
+
+    rows: list[dict[str, Any]] = []
+    last_returned: MinerRun | None = None
+    has_more = False
+    for run in queryset.order_by("-started_at", "-id").iterator():
+        serialized = _serialize_log_run(run)
+        if serialized is None:
+            continue
+        if len(rows) == limit:
+            has_more = True
+            break
+        rows.append(serialized)
+        last_returned = run
+    next_before = (
+        _encode_history_cursor(last_returned) if has_more and last_returned else None
+    )
+    return _success(
+        {
+            "runs": rows,
+            "next_before": next_before,
+            "retention_bytes": ACCOUNT_LOG_ARCHIVE_BYTES,
+            "generated_at": _iso(timezone.now()),
+        }
+    )
+
+
+@never_cache
+@api_endpoint("GET")
+def log_run_detail(request: HttpRequest, run_id: int):
+    run = get_object_or_404(MinerRun.objects.select_related("account"), pk=run_id)
+    serialized = _serialize_log_run(run)
+    if serialized is None:
+        return _error("log_not_found", "No retained log is available for this run.", status=404)
+    limit = _log_limit(request, default=MAX_LOG_LINES, maximum=MAX_LOG_LINES)
+    before = request.GET.get("before", "").strip() or None
+    try:
+        page = read_run_log_page(
+            account_id=run.account_id,
+            run_id=run.pk,
+            before=before,
+            limit=limit,
+        )
+    except LogStorageError as exc:
+        return _error("log_unavailable", str(exc), status=409)
+    return _success(
+        {
+            "run": serialized,
+            "lines": page["lines"],
+            "line_count": len(page["lines"]),
+            "before": page["before"],
+            "has_older": page["has_older"],
+            "max_lines": MAX_LOG_LINES,
+            "max_bytes": MAX_LOG_BYTES,
+            "generated_at": _iso(timezone.now()),
+        }
+    )
+
+
+@never_cache
+@api_endpoint("GET")
+def log_run_download(request: HttpRequest, run_id: int):
+    run = get_object_or_404(MinerRun.objects.select_related("account"), pk=run_id)
+    if run.ended_at is None:
+        return _error(
+            "log_still_active",
+            "Active run logs can be downloaded after the run finishes.",
+            status=409,
+        )
+    serialized = _serialize_log_run(run)
+    if serialized is None:
+        return _error("log_not_found", "No retained log is available for this run.", status=404)
+    try:
+        chunks, content_length = iter_run_gzip(run.account_id, run.pk)
+    except LogStorageError as exc:
+        return _error("log_unavailable", str(exc), status=409)
+    response = StreamingHttpResponse(chunks, content_type="application/gzip")
+    response["Content-Length"] = str(content_length)
+    retention_label = "-truncated" if serialized["truncated"] else ""
+    response["Content-Disposition"] = (
+        f'attachment; filename="account-{run.account_id}-run-{run.pk}{retention_label}.log.gz"'
+    )
+    return response
 
 
 @never_cache

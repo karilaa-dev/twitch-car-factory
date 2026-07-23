@@ -221,7 +221,8 @@ class AccountCreateForm(ChannelValidationMixin, forms.Form):
     )
     password = forms.CharField(
         max_length=4096,
-        label="Twitch password",
+        required=False,
+        label="Legacy Twitch password",
         strip=False,
         widget=forms.PasswordInput(
             render_value=False,

@@ -16,6 +16,7 @@ from controller.crypto import encrypt_json, encrypt_text
 from controller import miner_runner
 from controller.miner_runner import LaunchPayload, load_launch_payload, prepare_runtime_cookie
 from controller.miner_supervisor import (
+    ManagedProcess,
     MinerSupervisor,
     SupervisorAlreadyRunning,
     SupervisorOptions,
@@ -34,6 +35,7 @@ from controller.models import (
     WorkerLease,
 )
 from controller.services import create_launch_snapshot, enqueue_command
+from controller.runtime_logs import AccountRunLogWriter, read_run_log_page, summarize_run_log
 
 
 def upsert_account(
@@ -179,6 +181,7 @@ def runtime_options(**overrides) -> SupervisorOptions:
         "command_lease_seconds": 5,
         "worker_lease_seconds": 20,
         "worker_heartbeat_seconds": 0,
+        "require_authentication_events": False,
         "fake_miner": False,
         "lock_path": None,
     }
@@ -198,8 +201,149 @@ def make_supervisor(clock: FakeClock, factory: ProcessFactory, **option_override
     )
 
 
+def configure_tv_account() -> MinerAccount:
+    account = configure_farm()
+    credential = account.credential
+    credential.auth_method = AccountCredential.AuthMethod.TWITCH_TV
+    credential.password_ciphertext = ""
+    credential.save(update_fields=("auth_method", "password_ciphertext", "updated_at"))
+    return account
+
+
+@pytest.mark.django_db
+def test_tv_authentication_stays_starting_until_validated_event(tmp_path, settings):
+    settings.TWITCH_FARM_RUNTIME_DIR = tmp_path / "runtime"
+    account = configure_tv_account()
+    command = enqueue_command(account, MinerCommand.Action.AUTHENTICATE)
+    clock = FakeClock()
+    supervisor = make_supervisor(clock, ProcessFactory())
+    leased = supervisor._lease_next_command()
+    assert leased is not None and leased.pk == command.pk
+    assert supervisor.execute_command(leased) is True
+    managed = supervisor.processes[account.pk]
+
+    supervisor.check_health()
+    account.runtime_state.refresh_from_db()
+    assert account.runtime_state.observed_state == MinerInstanceState.ObservedState.STARTING
+    assert managed.confirmed is False
+
+    managed.auth_events.put(
+        {
+            "event": "device_code",
+            "user_code": "ABCD-1234",
+            "verification_uri": "https://www.twitch.tv/activate",
+            "expires_in": 1800,
+        }
+    )
+    supervisor.check_health()
+    account.runtime_state.refresh_from_db()
+    assert account.runtime_state.authentication_status == MinerInstanceState.AuthenticationStatus.PENDING
+    assert account.runtime_state.authentication_code == "ABCD-1234"
+    assert managed.confirmed is False
+
+    managed.auth_events.put({"event": "authenticated"})
+    supervisor.check_health()
+    account.runtime_state.refresh_from_db()
+    command.refresh_from_db()
+    run = MinerRun.objects.get(pk=managed.run_id)
+    assert managed.confirmed is True
+    assert run.reset_session is True
+    assert run.auth_method == AccountCredential.AuthMethod.TWITCH_TV
+    assert account.runtime_state.authentication_status == MinerInstanceState.AuthenticationStatus.AUTHENTICATED
+    assert account.runtime_state.authentication_code == ""
+    assert command.status == MinerCommand.Status.SUCCEEDED
+
+
+@pytest.mark.django_db
+def test_tv_authentication_failure_stops_without_recovery(tmp_path, settings):
+    settings.TWITCH_FARM_RUNTIME_DIR = tmp_path / "runtime"
+    account = configure_tv_account()
+    command = enqueue_command(account, MinerCommand.Action.AUTHENTICATE)
+    clock = FakeClock()
+    supervisor = make_supervisor(clock, ProcessFactory())
+    leased = supervisor._lease_next_command()
+    assert leased is not None
+    supervisor.execute_command(leased)
+    managed = supervisor.processes[account.pk]
+    managed.auth_events.put({"event": "authentication_failed", "error": "Code expired."})
+
+    supervisor.check_health()
+
+    account.runtime_state.refresh_from_db()
+    command.refresh_from_db()
+    run = MinerRun.objects.get(pk=managed.run_id)
+    assert account.runtime_state.desired_state == MinerInstanceState.DesiredState.STOPPED
+    assert account.runtime_state.authentication_status == MinerInstanceState.AuthenticationStatus.REAUTH_REQUIRED
+    assert account.runtime_state.authentication_code == ""
+    assert run.stop_reason == MinerRun.StopReason.AUTHENTICATION_FAILED
+    assert command.status == MinerCommand.Status.FAILED
+    assert account.pk not in supervisor.processes
+    assert not RestartAttempt.objects.filter(incident__account=account).exists()
+
+
+@pytest.mark.django_db
+def test_startup_continues_when_account_log_recovery_raises(
+    tmp_path,
+    settings,
+    monkeypatch,
+    caplog,
+):
+    settings.TWITCH_FARM_LOG_FILE = tmp_path / "logs" / "twitch-farm.log"
+    settings.TWITCH_FARM_LOG_WRITER = True
+    configure_farm()
+    clock = FakeClock()
+    supervisor = make_supervisor(clock, ProcessFactory())
+
+    def fail_recovery(**_kwargs):
+        raise OSError("simulated archive scan failure")
+
+    monkeypatch.setattr(
+        "controller.miner_supervisor.recover_account_log_archives",
+        fail_recovery,
+    )
+
+    supervisor.startup()
+    try:
+        assert supervisor._started
+        assert WorkerLease.objects.filter(owner_id=supervisor.worker_id).exists()
+        assert "Account log archive recovery failed during startup" in caplog.text
+    finally:
+        supervisor.shutdown()
+
+
+@pytest.mark.django_db
+def test_run_loop_continues_when_account_log_recovery_raises(
+    tmp_path,
+    settings,
+    monkeypatch,
+    caplog,
+):
+    settings.TWITCH_FARM_LOG_FILE = tmp_path / "logs" / "twitch-farm.log"
+    settings.TWITCH_FARM_LOG_WRITER = True
+    configure_farm()
+    clock = FakeClock()
+    supervisor = make_supervisor(clock, ProcessFactory())
+    supervisor.startup()
+
+    def fail_recovery(**_kwargs):
+        raise OSError("simulated archive scan failure")
+
+    monkeypatch.setattr(
+        "controller.miner_supervisor.recover_account_log_archives",
+        fail_recovery,
+    )
+    try:
+        supervisor.run_once(force_checks=True)
+        assert supervisor._started
+        assert "Account log archive recovery failed" in caplog.text
+    finally:
+        supervisor.shutdown()
+
+
 @pytest.mark.django_db
 def test_start_uses_snapshot_only_and_manual_stop_never_restarts(tmp_path, settings):
+    settings.TWITCH_FARM_LOG_FILE = tmp_path / "logs" / "twitch-farm.log"
+    settings.TWITCH_FARM_LOG_WRITER = True
     configure_farm()
     clock = FakeClock()
     factory = ProcessFactory(ignore_terminate=True)
@@ -241,6 +385,11 @@ def test_start_uses_snapshot_only_and_manual_stop_never_restarts(tmp_path, setti
         assert run.stop_reason == MinerRun.StopReason.ADMIN_STOP
         assert factory.processes[0].killed is True
         assert MinerIncident.objects.filter(account=account).count() == 0
+        forced_log = "\n".join(
+            read_run_log_page(account_id=account.pk, run_id=run.pk)["lines"]
+        )
+        assert "forced_termination" in forced_log
+        assert "final_exit" in forced_log
 
         clock.advance(1000)
         supervisor.run_once(force_checks=True)
@@ -250,7 +399,162 @@ def test_start_uses_snapshot_only_and_manual_stop_never_restarts(tmp_path, setti
 
 
 @pytest.mark.django_db
+def test_supervisor_finalizes_account_lifecycle_archive_on_normal_stop(tmp_path, settings):
+    settings.TWITCH_FARM_LOG_FILE = tmp_path / "logs" / "twitch-farm.log"
+    settings.TWITCH_FARM_LOG_WRITER = True
+    settings.TWITCH_FARM_ACCOUNT_LOG_PART_BYTES = 1024 * 1024
+    configure_farm()
+    clock = FakeClock()
+    factory = ProcessFactory()
+    supervisor = make_supervisor(clock, factory)
+    supervisor.startup()
+    try:
+        account = MinerAccount.objects.get(config_key="primary")
+        enqueue_command(account, MinerCommand.Action.START)
+        supervisor.run_once(force_checks=True)
+        run = MinerInstanceState.objects.get(account=account).current_run
+        assert run is not None
+
+        enqueue_command(account, MinerCommand.Action.STOP)
+        supervisor.run_once(force_checks=True)
+
+        summary = summarize_run_log(account.pk, run.pk)
+        page = read_run_log_page(account_id=account.pk, run_id=run.pk)
+        contents = "\n".join(page["lines"])
+        assert summary.compressed_parts == 1
+        assert not summary.compression_pending
+        assert "launch_requested" in contents
+        assert "process_started" in contents
+        assert "startup_confirmed" in contents
+        assert "stop_requested" in contents
+        assert "run_finished" in contents
+        assert "final_exit" in contents
+        assert "reason=\"admin_stop\"" in contents
+    finally:
+        supervisor.shutdown()
+
+
+def test_log_finalization_waits_for_late_output_after_the_bounded_join(tmp_path, settings):
+    settings.TWITCH_FARM_LOG_FILE = tmp_path / "logs" / "twitch-farm.log"
+    settings.TWITCH_FARM_LOG_WRITER = True
+    clock = FakeClock()
+    supervisor = make_supervisor(clock, ProcessFactory())
+    writer = AccountRunLogWriter(account_id=1, run_id=77, account_key="primary")
+
+    class DeferredOutputThread:
+        def __init__(self):
+            self.alive = True
+            self.join_timeouts: list[float | None] = []
+
+        def join(self, timeout=None):
+            self.join_timeouts.append(timeout)
+            if len(self.join_timeouts) == 2:
+                writer.write("late buffered miner output")
+                self.alive = False
+
+        def is_alive(self):
+            return self.alive
+
+    output_thread = DeferredOutputThread()
+    managed = ManagedProcess(
+        process=FakeProcess(),
+        account_id=1,
+        account_key="primary",
+        run_id=77,
+        spawned_monotonic=clock.monotonic(),
+        output_thread=output_thread,  # type: ignore[arg-type]
+        log_writer=writer,
+    )
+
+    supervisor._finalize_managed_log(managed, "run_finished", reason="admin_stop")
+    supervisor._wait_for_pending_log_finalizations()
+
+    contents = "\n".join(read_run_log_page(account_id=1, run_id=77)["lines"])
+    assert output_thread.join_timeouts == [1.0, 1.0]
+    assert contents.index("late buffered miner output") < contents.index("final_exit")
+    assert managed.log_writer is None
+
+
+def test_log_finalization_abandons_a_leaked_output_pipe_for_startup_recovery(
+    tmp_path,
+    settings,
+):
+    settings.TWITCH_FARM_LOG_FILE = tmp_path / "logs" / "twitch-farm.log"
+    settings.TWITCH_FARM_LOG_WRITER = True
+    clock = FakeClock()
+    supervisor = make_supervisor(clock, ProcessFactory())
+    writer = AccountRunLogWriter(account_id=1, run_id=78, account_key="primary")
+
+    class LeakedOutputThread:
+        def __init__(self):
+            self.join_timeouts: list[float | None] = []
+
+        def join(self, timeout=None):
+            self.join_timeouts.append(timeout)
+
+        def is_alive(self):
+            return True
+
+    output_thread = LeakedOutputThread()
+    managed = ManagedProcess(
+        process=FakeProcess(),
+        account_id=1,
+        account_key="primary",
+        run_id=78,
+        spawned_monotonic=clock.monotonic(),
+        output_thread=output_thread,  # type: ignore[arg-type]
+        log_writer=writer,
+    )
+
+    supervisor._finalize_managed_log(managed, "run_finished", reason="admin_stop")
+    supervisor._wait_for_pending_log_finalizations()
+
+    assert output_thread.join_timeouts == [1.0, 1.0]
+    assert supervisor._pending_log_finalizations == {}
+    assert managed.log_writer is writer
+    writer.finalize("test_cleanup")
+
+
+@pytest.mark.django_db
+def test_supervisor_records_explicit_restart_in_old_and_new_run_logs(tmp_path, settings):
+    settings.TWITCH_FARM_LOG_FILE = tmp_path / "logs" / "twitch-farm.log"
+    settings.TWITCH_FARM_LOG_WRITER = True
+    configure_farm()
+    clock = FakeClock()
+    factory = ProcessFactory()
+    supervisor = make_supervisor(clock, factory)
+    supervisor.startup()
+    try:
+        account = MinerAccount.objects.get(config_key="primary")
+        enqueue_command(account, MinerCommand.Action.START)
+        supervisor.run_once(force_checks=True)
+        old_run = MinerInstanceState.objects.get(account=account).current_run
+
+        enqueue_command(account, MinerCommand.Action.RESTART)
+        supervisor.run_once(force_checks=True)
+        new_run = MinerInstanceState.objects.get(account=account).current_run
+
+        assert old_run is not None and new_run is not None
+        assert old_run.pk != new_run.pk
+        old_log = "\n".join(
+            read_run_log_page(account_id=account.pk, run_id=old_run.pk)["lines"]
+        )
+        new_log = "\n".join(
+            read_run_log_page(account_id=account.pk, run_id=new_run.pk)["lines"]
+        )
+        assert "restart_requested" in old_log
+        assert "stop_requested" in old_log
+        assert "reason=\"admin_restart\"" in old_log
+        assert "final_exit" in old_log
+        assert "launch_requested" in new_log
+    finally:
+        supervisor.shutdown()
+
+
+@pytest.mark.django_db
 def test_unexpected_exit_records_incident_attempt_and_recovery(tmp_path, settings):
+    settings.TWITCH_FARM_LOG_FILE = tmp_path / "logs" / "twitch-farm.log"
+    settings.TWITCH_FARM_LOG_WRITER = True
     configure_farm()
     clock = FakeClock()
     factory = ProcessFactory()
@@ -281,6 +585,18 @@ def test_unexpected_exit_records_incident_attempt_and_recovery(tmp_path, setting
         assert state.observed_state == MinerInstanceState.ObservedState.RUNNING
         assert state.retry_count == 1
         assert len(factory.processes) == 2
+
+        failed_log = "\n".join(
+            read_run_log_page(account_id=account.pk, run_id=failed_run.pk)["lines"]
+        )
+        recovery_log = "\n".join(
+            read_run_log_page(account_id=account.pk, run_id=state.current_run_id)["lines"]
+        )
+        assert "crash_detected" in failed_log
+        assert "recovery_scheduled" in failed_log
+        assert "unexpected_exit" in failed_log
+        assert "final_exit" in failed_log
+        assert "recovery_started" in recovery_log
     finally:
         supervisor.shutdown()
 
@@ -1381,6 +1697,35 @@ def test_runner_configures_linux_parent_death_signal_after_exec(monkeypatch):
     assert "TWITCH_FARM_SUPERVISOR_PID" not in os.environ
 
 
+def test_runner_replaces_inherited_handlers_and_disables_debug(monkeypatch):
+    removed = []
+    disabled = []
+    inherited_handlers = [object(), object()]
+
+    class FakeRootLogger:
+        handlers = inherited_handlers
+
+        @staticmethod
+        def removeHandler(handler):
+            removed.append(handler)
+
+    class FakeLogging:
+        DEBUG = 10
+
+        @staticmethod
+        def getLogger():
+            return FakeRootLogger()
+
+        disable = staticmethod(disabled.append)
+
+    monkeypatch.setattr(miner_runner, "logging", FakeLogging)
+
+    miner_runner.prepare_upstream_logging()
+
+    assert disabled == [FakeLogging.DEBUG]
+    assert removed == inherited_handlers
+
+
 @pytest.mark.django_db
 def test_runner_and_fake_miner_read_exact_snapshot_without_persisting_password(
     tmp_path,
@@ -1512,6 +1857,8 @@ def test_spawn_persistence_failure_terminates_child_before_losing_handle(
 
 @pytest.mark.django_db
 def test_runtime_directory_failure_finalizes_unspawned_run(tmp_path, settings):
+    settings.TWITCH_FARM_LOG_FILE = tmp_path / "logs" / "twitch-farm.log"
+    settings.TWITCH_FARM_LOG_WRITER = True
     configure_farm()
     invalid_runtime = tmp_path / "runtime-is-a-file"
     invalid_runtime.write_text("not a directory", encoding="utf-8")
@@ -1533,6 +1880,11 @@ def test_runtime_directory_failure_finalizes_unspawned_run(tmp_path, settings):
         assert run.stop_reason == MinerRun.StopReason.START_FAILED
         assert run.ended_at is not None
         assert supervisor.pending_run_finalizations == {}
+        contents = "\n".join(
+            read_run_log_page(account_id=account.pk, run_id=run.pk)["lines"]
+        )
+        assert "start_failed" in contents
+        assert "final_exit" in contents
     finally:
         supervisor.shutdown()
 

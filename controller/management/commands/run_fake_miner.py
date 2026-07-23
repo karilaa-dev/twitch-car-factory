@@ -11,8 +11,8 @@ from pathlib import Path
 from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
-from controller.miner_runner import configure_linux_parent_death_signal
-from controller.models import MinerRun
+from controller.miner_runner import configure_linux_parent_death_signal, emit_control_event
+from controller.models import AccountCredential, MinerRun
 
 
 def _env_float(name: str, default: float) -> float:
@@ -97,6 +97,27 @@ class Command(BaseCommand):
                 stream.write(json.dumps(record, sort_keys=True) + "\n")
 
         self.stdout.write(json.dumps(record, sort_keys=True))
+
+        if run.auth_method == AccountCredential.AuthMethod.TWITCH_TV:
+            tv_mode = os.environ.get("TWITCH_FARM_FAKE_TV_AUTH_MODE", "success")
+            if run.reset_session:
+                emit_control_event(
+                    "device_code",
+                    user_code="FAKE-CODE",
+                    verification_uri="https://www.twitch.tv/activate",
+                    expires_in=(1 if tv_mode == "expired" else 1800),
+                )
+            if tv_mode == "failed":
+                emit_control_event("authentication_failed", error="Fake Twitch authentication failed.")
+                raise SystemExit(18)
+            if tv_mode == "expired":
+                time.sleep(1.05)
+                emit_control_event("authentication_failed", error="Fake Twitch activation code expired.")
+                raise SystemExit(19)
+            if tv_mode != "pending":
+                emit_control_event("authenticated")
+        else:
+            emit_control_event("authenticated")
 
         exit_code = options["exit_code"]
         if mode == "exit-immediately":

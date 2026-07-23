@@ -2255,7 +2255,10 @@ def _write_desired_account(
     else:
         AccountCredential.objects.update_or_create(
             account=current,
-            defaults={"password_ciphertext": encrypt_text(wanted.password)},
+            defaults={
+                "auth_method": AccountCredential.AuthMethod.LEGACY_PASSWORD,
+                "password_ciphertext": encrypt_text(wanted.password),
+            },
         )
     _write_account_selection(current, wanted, preset_map)
     MinerAccount.objects.filter(pk=current.pk).update(

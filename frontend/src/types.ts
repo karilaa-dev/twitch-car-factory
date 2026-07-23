@@ -68,6 +68,16 @@ export interface AccountSummary {
   username: string
   is_active: boolean
   has_credentials: boolean
+  authentication: {
+    method: "twitch_tv" | "legacy_password"
+    status: "unlinked" | "pending" | "authenticated" | "reauth_required"
+    activation_url: string
+    user_code: string
+    expires_at: string | null
+    error: string
+    updated_at: string | null
+    can_reconnect: boolean
+  }
   desired: "running" | "stopped"
   observed: RuntimeStatus
   source: ChannelSource
@@ -99,7 +109,7 @@ export interface Command {
   id: number
   account_id: number
   account_key: string
-  action: "start" | "stop" | "restart"
+  action: "start" | "stop" | "restart" | "authenticate"
   status: RuntimeStatus
   reason: string
   attempts: number
@@ -177,6 +187,8 @@ export interface AccountDetail extends AccountSummary {
     source_name: string
     channels: string[]
     channel_revision: number
+    auth_method: "twitch_tv" | "legacy_password"
+    reset_session: boolean
     pid: number | null
     started_at: string
     ended_at: string | null
@@ -239,6 +251,54 @@ export interface LogTail {
   line_count: number
   max_lines: number
   max_bytes: number
+  cursor: string | null
+  reset: boolean
+  run_id: number | null
+  source: {
+    kind: "combined" | "account"
+    account_id: number | null
+    account_key: string | null
+    username: string | null
+  }
   supervisor: Supervisor
+  generated_at: string
+}
+
+export interface LogRunSummary {
+  run_id: number
+  account: {
+    id: number
+    config_key: string
+    username: string
+    is_active: boolean
+  }
+  started_at: string
+  ended_at: string | null
+  stop_reason: string
+  exit_code: number | null
+  exit_signal: number | null
+  archive_state: "active" | "compression_pending" | "ready"
+  compressed_bytes: number
+  compressed_parts: number
+  plaintext_parts: number
+  truncated: boolean
+  downloadable: boolean
+}
+
+export interface LogRunList {
+  runs: LogRunSummary[]
+  next_before: string | null
+  retention_bytes: number
+  generated_at: string
+}
+
+export interface LogRunDetail {
+  run: LogRunSummary
+  lines: string[]
+  line_count: number
+  before: string | null
+  has_older: boolean
+  max_lines: number
+  max_bytes: number
   generated_at: string
 }
