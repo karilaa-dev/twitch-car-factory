@@ -49,4 +49,10 @@ def test_upstream_miner_supports_runner_configuration():
         logger_settings=logger_settings,
         streamer_settings=streamer_settings,
     )
-    assert callable(TwitchLogin.send_oauth_request)
+    oauth_request = TwitchLogin.send_oauth_request
+    assert callable(oauth_request)
+    inspect.signature(oauth_request).bind(
+        TwitchLogin,
+        "https://id.twitch.tv/oauth2/device",
+        {},
+    )
