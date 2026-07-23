@@ -42,6 +42,7 @@ from .forms import (
     StaffAuthenticationForm,
 )
 from .models import (
+    AccountCredential,
     AccountChannelSelection,
     ActionLog,
     ChannelPreset,
@@ -71,6 +72,7 @@ from .services import (
     enqueue_all,
     enqueue_command,
     normalize_channels,
+    request_tv_authentication,
     save_preset,
     set_account_channel_selection,
     update_account,
@@ -416,12 +418,52 @@ def _serialize_action(item: ActionLog) -> dict[str, Any]:
 
 def _serialize_account(row: AccountTelemetry) -> dict[str, Any]:
     account = row.account
+    state = row.state
+    try:
+        credential = account.credential
+        auth_method = credential.auth_method
+    except ObjectDoesNotExist:
+        auth_method = AccountCredential.AuthMethod.TWITCH_TV
+    auth_status = (
+        state.authentication_status
+        if state is not None
+        else MinerInstanceState.AuthenticationStatus.UNLINKED
+    )
+    expired = bool(
+        state
+        and state.authentication_expires_at
+        and state.authentication_expires_at <= timezone.now()
+    )
+    if expired and auth_status == MinerInstanceState.AuthenticationStatus.PENDING:
+        auth_status = MinerInstanceState.AuthenticationStatus.REAUTH_REQUIRED
     return {
         "id": account.pk,
         "config_key": account.config_key,
         "username": account.display_username,
         "is_active": account.is_active,
         "has_credentials": account.has_credentials,
+        "authentication": {
+            "method": auth_method,
+            "status": auth_status,
+            "activation_url": (
+                state.authentication_uri
+                if state and auth_status == MinerInstanceState.AuthenticationStatus.PENDING
+                else ""
+            ),
+            "user_code": (
+                state.authentication_code
+                if state and auth_status == MinerInstanceState.AuthenticationStatus.PENDING
+                else ""
+            ),
+            "expires_at": (
+                _iso(state.authentication_expires_at)
+                if state and auth_status == MinerInstanceState.AuthenticationStatus.PENDING
+                else None
+            ),
+            "error": state.authentication_error if state else "",
+            "updated_at": _iso(state.authentication_updated_at) if state else None,
+            "can_reconnect": bool(account.is_active),
+        },
         "desired": row.desired,
         "observed": row.observed,
         "source": {
@@ -482,6 +524,8 @@ def _serialize_run(run: MinerRun) -> dict[str, Any]:
         "source_name": run.source_name,
         "channels": list(run.channels),
         "channel_revision": run.channel_revision,
+        "auth_method": run.auth_method,
+        "reset_session": run.reset_session,
         "pid": run.pid,
         "started_at": _iso(run.started_at),
         "ended_at": _iso(run.ended_at),
@@ -625,6 +669,11 @@ def accounts(request: HttpRequest):
         config_key=form.cleaned_data["config_key"],
         username=form.cleaned_data["username"],
         password=form.cleaned_data["password"],
+        auth_method=(
+            AccountCredential.AuthMethod.LEGACY_PASSWORD
+            if form.cleaned_data["password"]
+            else AccountCredential.AuthMethod.TWITCH_TV
+        ),
         mode=mode,
         channels=(form.cleaned_data["custom_channel_names"] if mode == "custom" else None),
         preset=form.cleaned_data.get("preset"),
@@ -734,6 +783,21 @@ def account_actions(request: HttpRequest, pk: int):
         reason="Requested from the web control room.",
     )
     return _success({"command": _serialize_command(command)}, status=202)
+
+
+@never_cache
+@api_endpoint("POST")
+def account_tv_authentication(request: HttpRequest, pk: int):
+    account = get_object_or_404(MinerAccount, pk=pk)
+    command = request_tv_authentication(account, actor=request.user)
+    account = get_object_or_404(_account_queryset(), pk=pk)
+    return _success(
+        {
+            "command": _serialize_command(command),
+            "account": _serialize_account(_as_telemetry(account)),
+        },
+        status=202,
+    )
 
 
 @api_endpoint("GET", "POST")

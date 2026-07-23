@@ -7,6 +7,7 @@ decrypted in this dedicated child and never appear in argv or launch records.
 from __future__ import annotations
 
 import ctypes
+import json
 import logging
 import os
 from pathlib import Path
@@ -18,6 +19,32 @@ from dataclasses import dataclass, field
 from django.views.decorators.debug import sensitive_variables
 
 
+CONTROL_EVENT_PREFIX = "@@TWITCH_FARM_EVENT@@"
+
+
+def emit_control_event(event: str, **payload: object) -> None:
+    """Emit a single machine-only event without ever serializing credentials."""
+
+    message = {"event": event, **payload}
+    print(CONTROL_EVENT_PREFIX + json.dumps(message, separators=(",", ":")), flush=True)
+
+
+def prepare_upstream_logging() -> None:
+    """Give the miner one INFO-only console pipeline in its dedicated child.
+
+    Django configures a root console handler before this module starts the
+    upstream miner. The library then adds its own queue-backed console handler,
+    which otherwise prints every INFO record twice and lets root-level DEBUG
+    records expose large HTTP/GQL payloads. This process runs one miner only, so
+    replacing the inherited handlers is isolated from the web and supervisor.
+    """
+
+    logging.disable(logging.DEBUG)
+    root_logger = logging.getLogger()
+    for handler in tuple(root_logger.handlers):
+        root_logger.removeHandler(handler)
+
+
 @dataclass(frozen=True, slots=True)
 class LaunchPayload:
     """The small, in-memory-only launch specification consumed by the miner."""
@@ -25,6 +52,7 @@ class LaunchPayload:
     username: str
     password: str = field(repr=False)
     channels: tuple[str, ...]
+    auth_method: str = "legacy_password"
 
 
 def configure_linux_parent_death_signal() -> None:
@@ -83,6 +111,7 @@ def load_launch_payload(run_id: int, account_id: int) -> LaunchPayload:
         username=run.account.display_username,
         password=password,
         channels=channels,
+        auth_method=run.auth_method,
     )
 
 
@@ -174,6 +203,8 @@ def prepare_runtime_cookie(username: str, account_id: int | None = None) -> Path
 def run_miner(payload: LaunchPayload) -> None:
     """Construct the upstream miner with the legacy behavior and start mining."""
 
+    prepare_upstream_logging()
+
     # Keep these imports inside the real execution path.  Management checks and
     # supervisor tests do not need to import the comparatively heavy miner stack.
     from colorama import Fore
@@ -181,42 +212,83 @@ def run_miner(payload: LaunchPayload) -> None:
     from TwitchChannelPointsMiner.classes.Chat import ChatPresence
     from TwitchChannelPointsMiner.classes.Settings import Priority
     from TwitchChannelPointsMiner.classes.entities.Streamer import StreamerSettings
+    from TwitchChannelPointsMiner.classes.TwitchLogin import TwitchLogin
     from TwitchChannelPointsMiner.logger import ColorPalette, LoggerSettings
 
-    twitch_miner = TwitchChannelPointsMiner(
-        username=payload.username,
-        password=payload.password,
-        claim_drops_startup=False,
-        priority=[Priority.DROPS, Priority.ORDER, Priority.STREAK],
-        enable_analytics=False,
-        disable_ssl_cert_verification=False,
-        disable_at_in_nickname=False,
-        logger_settings=LoggerSettings(
-            save=False,
-            console_level=logging.INFO,
-            console_username=True,
-            auto_clear=True,
-            time_zone="",
-            file_level=logging.WARNING,
-            emoji=True,
-            less=True,
-            colored=True,
-            color_palette=ColorPalette(
-                STREAMER_online="GREEN",
-                streamer_offline="red",
-                BET_wiN=Fore.MAGENTA,
+    original_oauth_request = TwitchLogin.send_oauth_request
+
+    def observed_oauth_request(login, url, json_data):
+        response = original_oauth_request(login, url, json_data)
+        if url == "https://id.twitch.tv/oauth2/device" and response.status_code == 200:
+            body = response.json()
+            allowed = {"user_code", "verification_uri", "expires_in"}
+            if isinstance(body, dict) and allowed.issubset(body):
+                emit_control_event(
+                    "device_code",
+                    user_code=str(body["user_code"]),
+                    verification_uri=str(body["verification_uri"]),
+                    expires_in=int(body["expires_in"]),
+                )
+        return response
+
+    TwitchLogin.send_oauth_request = observed_oauth_request
+    twitch_miner = None
+    authenticated = False
+    try:
+        twitch_miner = TwitchChannelPointsMiner(
+            username=payload.username,
+            password=payload.password or None,
+            claim_drops_startup=False,
+            priority=[Priority.DROPS, Priority.ORDER, Priority.STREAK],
+            enable_analytics=False,
+            disable_ssl_cert_verification=False,
+            disable_at_in_nickname=False,
+            logger_settings=LoggerSettings(
+                save=False,
+                console_level=logging.INFO,
+                console_username=True,
+                auto_clear=False,
+                time_zone="",
+                file_level=logging.WARNING,
+                emoji=True,
+                less=False,
+                colored=False,
+                color_palette=ColorPalette(
+                    STREAMER_online="GREEN",
+                    streamer_offline="red",
+                    BET_wiN=Fore.MAGENTA,
+                ),
             ),
-        ),
-        streamer_settings=StreamerSettings(
-            make_predictions=False,
-            follow_raid=False,
-            claim_drops=True,
-            claim_moments=True,
-            watch_streak=True,
-            chat=ChatPresence.ONLINE,
-        ),
-    )
-    twitch_miner.mine(list(payload.channels), followers=False)
+            streamer_settings=StreamerSettings(
+                make_predictions=False,
+                follow_raid=False,
+                claim_drops=True,
+                claim_moments=True,
+                watch_streak=True,
+                chat=ChatPresence.ONLINE,
+            ),
+        )
+        twitch_miner.twitch.login()
+        if not twitch_miner.twitch.twitch_login.check_login():
+            emit_control_event("authentication_failed", error="Twitch authentication was rejected.")
+            raise RuntimeError("Twitch authentication was rejected.")
+        emit_control_event("authenticated")
+        authenticated = True
+        twitch_miner.mine(list(payload.channels), followers=False)
+    except BaseException:
+        if not authenticated:
+            emit_control_event(
+                "authentication_failed",
+                error="Miner authentication or startup failed.",
+            )
+        if twitch_miner is not None:
+            try:
+                twitch_miner.queue_listener.stop()
+            except (AttributeError, RuntimeError):
+                pass
+        raise
+    finally:
+        TwitchLogin.send_oauth_request = original_oauth_request
 
 
 @sensitive_variables()

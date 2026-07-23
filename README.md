@@ -17,8 +17,12 @@ Accounts and application settings are managed through the web UI.
 - The web process never owns subprocesses. One `run_miner_worker` process holds
   the singleton lock, leases commands, owns all child processes, and records
   runs, incidents, restart attempts, and recovery.
-- Twitch passwords are encrypted at rest. Miner children receive account and run
-  IDs, never passwords or channels in process arguments.
+- New accounts use passwordless Twitch TV/device login. Existing password-backed
+  accounts remain compatible and can switch one-way to TV login. Miner children
+  receive account and run IDs, never passwords or channels in process arguments.
+- Upstream miner INFO output and lifecycle events are redacted into separate
+  per-account run archives. Completed parts are gzip-compressed and retained up
+  to 50 MiB per account.
 
 See [the feature and state map](docs/bot-feature-map.md) for full behavior.
 
@@ -29,6 +33,7 @@ staff UI -> Django web -> SQLite accounts/settings/commands -> singleton worker
                                                                |-- miner child A
                                                                `-- miner child B
 staff UI <- bounded log tail <- data/logs/twitch-farm.log <-----'
+         <- account history <- data/logs/accounts/<id>/runs/<id>/
 
 Settings -> legacy ZIP preview/confirm -> encrypted session seed -> worker
 runtime/cookies/ (worker-only writable sessions) -----------------^
@@ -73,6 +78,10 @@ TWITCH_FARM_LOG_WRITER=1 uv run python manage.py run_miner_worker
 
 Open <http://127.0.0.1:8000/>, sign in with the staff account, configure default
 channels under **Settings → General**, and add Twitch accounts from **Accounts**.
+Open the new account's **Auth** tab, choose **Connect Twitch**, and enter the
+shown code at <https://www.twitch.tv/activate>. The miner remains `starting`
+until the worker validates the session. Expired or rejected codes stop the
+account and require an explicit reconnect; the worker never loops device codes.
 
 For live UI development, run `npm run build -- --watch` in `frontend/` and
 Django in its normal terminal so API, authentication, and generated assets stay
@@ -142,6 +151,11 @@ preview. Import previews expire after 30 minutes and are single-use. Legacy
 cookie files are parsed as untrusted input; accepted cookie values are
 normalized into an encrypted one-time seed. The worker consumes that seed on
 first launch and writes the refreshable session beneath `runtime/cookies/`.
+Only the worker reads, replaces, or deletes those session files. The web process
+can display sanitized activation status but never receives cookies or OAuth
+tokens. Set `MINER_AUTHENTICATION_HANDSHAKE_SECONDS` only when deployment timing
+requires a stricter upper bound; Twitch's exact returned code expiry is also
+enforced.
 
 There is no command-line, startup, environment-variable, or Compose import
 path. Do not mount old configuration or cookie directories into any service.

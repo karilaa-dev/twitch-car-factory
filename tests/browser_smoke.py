@@ -61,6 +61,32 @@ def assert_touch_targets(page: Page, label: str) -> None:
         )
 
 
+def assert_log_run_cards_do_not_overlap(page: Page, label: str) -> None:
+    cards = page.locator("[data-log-run-id]").evaluate_all(
+        """
+        elements => elements.map(element => {
+          const rect = element.getBoundingClientRect();
+          return {id: element.dataset.logRunId, top: rect.top, bottom: rect.bottom};
+        })
+        """
+    )
+    for previous, current in zip(cards, cards[1:], strict=False):
+        assert previous["bottom"] <= current["top"] + 1, (
+            f"{label} run cards overlap: {previous!r}, {current!r}"
+        )
+
+
+def assert_tv_auth_targets(page: Page, label: str) -> None:
+    for target in (
+        page.get_by_role("button", name="Copy activation code"),
+        page.get_by_role("link", name="Open twitch.tv/activate", exact=True),
+    ):
+        box = target.bounding_box()
+        assert box is not None and box["height"] >= 43.5, (
+            f"{label} activation target is too small: {box!r}"
+        )
+
+
 def assert_route(page: Page, base_url: str, route: str, heading: str, label: str) -> None:
     page.goto(f"{base_url}{route}", wait_until="networkidle")
     assert page.get_by_role("heading", name=heading, exact=True).is_visible()
@@ -72,6 +98,9 @@ def main() -> None:
     parser.add_argument("--base-url", default="http://127.0.0.1:8765")
     parser.add_argument("--username", default="visualadmin")
     parser.add_argument("--password", default="visual-test-password")
+    parser.add_argument("--tv-account-id", type=int)
+    parser.add_argument("--tv-only", action="store_true")
+    parser.add_argument("--logs-filter-only", action="store_true")
     parser.add_argument(
         "--output", type=Path, default=Path("/private/tmp/twitch-farm-browser")
     )
@@ -109,6 +138,59 @@ def main() -> None:
         page.get_by_role("button", name="Sign in").click()
         page.wait_for_url(f"{args.base_url}/")
         page.get_by_role("heading", name="Runtime", exact=True).wait_for()
+        if args.logs_filter_only:
+            page.goto(f"{args.base_url}/logs", wait_until="networkidle")
+            page.get_by_role("heading", name="Logs", exact=True).wait_for()
+            page.get_by_role(
+                "button", name="Show Twitch library logs", exact=True
+            ).click()
+            page.get_by_text("Twitch library", exact=True).first.wait_for()
+            assert_no_horizontal_overflow(page, "Desktop log source filters")
+            page.screenshot(
+                path=args.output / "logs-filter-desktop.png", full_page=True
+            )
+            page.get_by_role("tab", name="History").click()
+            page.get_by_text("Run archive", exact=True).wait_for()
+            assert_log_run_cards_do_not_overlap(page, "Desktop log history")
+            page.screenshot(
+                path=args.output / "logs-history-desktop.png", full_page=True
+            )
+            for width in (390, 320):
+                page.set_viewport_size({"width": width, "height": 900})
+                assert_no_horizontal_overflow(page, f"Log source filters {width}px")
+                assert_log_run_cards_do_not_overlap(page, f"Log history {width}px")
+                page.screenshot(
+                    path=args.output / f"logs-history-{width}.png", full_page=True
+                )
+            assert not console_errors, console_errors
+            assert not page_errors, page_errors
+            browser.close()
+            return
+        if args.tv_only:
+            if args.tv_account_id is None:
+                raise AssertionError("--tv-only requires --tv-account-id")
+            page.goto(
+                f"{args.base_url}/accounts/{args.tv_account_id}?tab=auth",
+                wait_until="networkidle",
+            )
+            page.get_by_role("heading", name="tv_smoke", exact=True).wait_for()
+            page.get_by_role("button", name="Connect Twitch", exact=True).click()
+            page.get_by_text("FAKE-CODE", exact=True).wait_for(timeout=15_000)
+            assert page.get_by_role(
+                "link", name="Open twitch.tv/activate", exact=True
+            ).get_attribute("href") == "https://www.twitch.tv/activate"
+            page.screenshot(path=args.output / "tv-auth-desktop.png", full_page=True)
+            for width in (390, 320):
+                page.set_viewport_size({"width": width, "height": 900})
+                assert_no_horizontal_overflow(page, f"TV auth {width}px")
+                assert_tv_auth_targets(page, f"TV auth {width}px")
+                page.screenshot(
+                    path=args.output / f"tv-auth-{width}.png", full_page=True
+                )
+            assert not console_errors, console_errors
+            assert not page_errors, page_errors
+            browser.close()
+            return
         assert page.get_by_role("columnheader", name="Current state").count() == 1
         assert page.get_by_role("columnheader", name="Desired").count() == 0
         assert page.get_by_role("columnheader", name="Observed").count() == 0
@@ -141,6 +223,28 @@ def main() -> None:
         assert dialog.get_by_role("heading", name="Restart every configured account?").is_visible()
         dialog.get_by_role("button", name="Cancel").press("Enter")
         dialog.wait_for(state="hidden")
+
+        if args.tv_account_id is not None:
+            page.goto(
+                f"{args.base_url}/accounts/{args.tv_account_id}?tab=auth",
+                wait_until="networkidle",
+            )
+            page.get_by_role("heading", name="tv_smoke", exact=True).wait_for()
+            page.get_by_role("button", name="Connect Twitch", exact=True).click()
+            page.get_by_text("FAKE-CODE", exact=True).wait_for(timeout=15_000)
+            assert page.get_by_role(
+                "link", name="Open twitch.tv/activate", exact=True
+            ).get_attribute("href") == "https://www.twitch.tv/activate"
+            page.screenshot(path=args.output / "tv-auth-desktop.png", full_page=True)
+            for width in (390, 320):
+                page.set_viewport_size({"width": width, "height": 900})
+                assert_no_horizontal_overflow(page, f"TV auth {width}px")
+                assert_tv_auth_targets(page, f"TV auth {width}px")
+                page.screenshot(
+                    path=args.output / f"tv-auth-{width}.png",
+                    full_page=True,
+                )
+            page.set_viewport_size({"width": 1440, "height": 1000})
 
         # Every primary route renders from the single React entry point.
         assert_route(page, args.base_url, "/accounts", "Accounts", "Desktop accounts")

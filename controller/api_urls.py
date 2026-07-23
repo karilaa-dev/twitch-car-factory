@@ -18,6 +18,11 @@ urlpatterns = [
     path("accounts/<int:pk>/telemetry", api.account_telemetry, name="account_telemetry"),
     path("accounts/<int:pk>/channel-source", api.account_channel_source, name="account_channel_source"),
     path("accounts/<int:pk>/actions", api.account_actions, name="account_actions"),
+    path(
+        "accounts/<int:pk>/authentication/tv",
+        api.account_tv_authentication,
+        name="account_tv_authentication",
+    ),
     path("presets", api.presets, name="presets"),
     path("presets/<int:pk>", api.preset_detail, name="preset_detail"),
     path("presets/<int:pk>/assignments", api.preset_assignments, name="preset_assignments"),

@@ -64,12 +64,21 @@ class MinerAccount(models.Model):
 class AccountCredential(models.Model):
     """Encrypted launch credential for one account."""
 
+    class AuthMethod(models.TextChoices):
+        TWITCH_TV = "twitch_tv", "Twitch TV device login"
+        LEGACY_PASSWORD = "legacy_password", "Legacy password"
+
     account = models.OneToOneField(
         MinerAccount,
         on_delete=models.CASCADE,
         related_name="credential",
     )
-    password_ciphertext = models.TextField()
+    auth_method = models.CharField(
+        max_length=24,
+        choices=AuthMethod.choices,
+        default=AuthMethod.LEGACY_PASSWORD,
+    )
+    password_ciphertext = models.TextField(blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -248,6 +257,8 @@ class MinerRun(models.Model):
         SUPERVISOR_SHUTDOWN = "supervisor_shutdown", "Supervisor shutdown"
         UNEXPECTED_EXIT = "unexpected_exit", "Unexpected exit"
         START_FAILED = "start_failed", "Start failed"
+        AUTHENTICATION_FAILED = "authentication_failed", "Authentication failed"
+        AUTHENTICATION_RESET = "authentication_reset", "Authentication reset"
 
     IMMUTABLE_FIELDS = (
         "account_id",
@@ -256,6 +267,8 @@ class MinerRun(models.Model):
         "channels",
         "configuration_fingerprint",
         "channel_revision",
+        "auth_method",
+        "reset_session",
     )
 
     account = models.ForeignKey(MinerAccount, on_delete=models.PROTECT, related_name="runs")
@@ -264,6 +277,12 @@ class MinerRun(models.Model):
     channels = models.JSONField(validators=(validate_channel_snapshot,))
     configuration_fingerprint = models.CharField(max_length=64)
     channel_revision = models.PositiveBigIntegerField()
+    auth_method = models.CharField(
+        max_length=24,
+        choices=AccountCredential.AuthMethod.choices,
+        default=AccountCredential.AuthMethod.LEGACY_PASSWORD,
+    )
+    reset_session = models.BooleanField(default=False)
     pid = models.PositiveIntegerField(null=True, blank=True)
     worker_id = models.CharField(max_length=200, blank=True)
     startup_confirmed_at = models.DateTimeField(null=True, blank=True)
@@ -293,6 +312,12 @@ class MinerRun(models.Model):
 
 
 class MinerInstanceState(models.Model):
+    class AuthenticationStatus(models.TextChoices):
+        UNLINKED = "unlinked", "Unlinked"
+        PENDING = "pending", "Pending"
+        AUTHENTICATED = "authenticated", "Authenticated"
+        REAUTH_REQUIRED = "reauth_required", "Reauthentication required"
+
     class DesiredState(models.TextChoices):
         STOPPED = "stopped", "Stopped"
         RUNNING = "running", "Running"
@@ -337,6 +362,17 @@ class MinerInstanceState(models.Model):
     stable_since = models.DateTimeField(null=True, blank=True)
     last_heartbeat = models.DateTimeField(null=True, blank=True)
     last_error = models.TextField(blank=True)
+    authentication_status = models.CharField(
+        max_length=24,
+        choices=AuthenticationStatus.choices,
+        default=AuthenticationStatus.UNLINKED,
+        db_index=True,
+    )
+    authentication_uri = models.URLField(blank=True)
+    authentication_code = models.CharField(max_length=64, blank=True)
+    authentication_expires_at = models.DateTimeField(null=True, blank=True)
+    authentication_error = models.TextField(blank=True)
+    authentication_updated_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -352,6 +388,7 @@ class MinerCommand(models.Model):
         START = "start", "Start"
         STOP = "stop", "Stop"
         RESTART = "restart", "Restart"
+        AUTHENTICATE = "authenticate", "Authenticate"
 
     class Status(models.TextChoices):
         QUEUED = "queued", "Queued"

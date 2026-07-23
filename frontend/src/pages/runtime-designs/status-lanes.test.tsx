@@ -15,6 +15,16 @@ function account(
     username: `account_${id}`,
     is_active: true,
     has_credentials: true,
+    authentication: {
+      method: "legacy_password",
+      status: "authenticated",
+      activation_url: "",
+      user_code: "",
+      expires_at: null,
+      error: "",
+      updated_at: "2026-07-15T00:00:00Z",
+      can_reconnect: true,
+    },
     desired: "running",
     observed: "running",
     source: {

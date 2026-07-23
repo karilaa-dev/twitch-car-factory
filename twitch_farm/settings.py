@@ -197,6 +197,9 @@ TWITCH_FARM_LOG_FILE = Path(
     os.getenv("TWITCH_FARM_LOG_FILE", DATABASE_PATH.parent / "logs" / "twitch-farm.log")
 )
 TWITCH_FARM_LOG_WRITER = env_bool("TWITCH_FARM_LOG_WRITER", False)
+MINER_AUTHENTICATION_HANDSHAKE_SECONDS = float(
+    os.getenv("MINER_AUTHENTICATION_HANDSHAKE_SECONDS", "1900")
+)
 
 if TWITCH_FARM_LOG_WRITER:
     TWITCH_FARM_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)

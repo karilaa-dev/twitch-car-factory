@@ -202,6 +202,10 @@ def get_account_password(account: MinerAccount | int) -> str:
         credential = AccountCredential.objects.get(account_id=account_id)
     except AccountCredential.DoesNotExist as exc:
         raise ValidationError("This account has no stored Twitch password.") from exc
+    if credential.auth_method == AccountCredential.AuthMethod.TWITCH_TV:
+        return ""
+    if not credential.password_ciphertext:
+        raise ValidationError("This legacy account has no stored Twitch password.")
     return decrypt_text(credential.password_ciphertext)
 
 
@@ -230,7 +234,8 @@ def create_account(
     *,
     config_key: str,
     username: str,
-    password: str,
+    password: str = "",
+    auth_method: str | None = None,
     mode: str = AccountChannelSelection.Mode.DEFAULT,
     channels: str | Iterable[str] | None = None,
     preset: ChannelPreset | int | str | None = None,
@@ -238,7 +243,22 @@ def create_account(
     actor=None,
 ) -> MinerAccount:
     key, clean_username = _normalize_account_identity(config_key, username)
-    secret = _validate_password(password)
+    try:
+        auth_method = AccountCredential.AuthMethod(
+            auth_method
+            or (
+                AccountCredential.AuthMethod.LEGACY_PASSWORD
+                if password
+                else AccountCredential.AuthMethod.TWITCH_TV
+            )
+        )
+    except ValueError as exc:
+        raise ValidationError("Choose a supported Twitch authentication method.") from exc
+    secret = (
+        _validate_password(password)
+        if auth_method == AccountCredential.AuthMethod.LEGACY_PASSWORD
+        else ""
+    )
     if MinerAccount.objects.filter(config_key__iexact=key).exists():
         raise ValidationError("An account with this key already exists.")
     if MinerAccount.objects.filter(display_username__iexact=clean_username).exists():
@@ -251,13 +271,20 @@ def create_account(
     )
     AccountCredential.objects.create(
         account=account,
-        password_ciphertext=encrypt_text(secret),
+        auth_method=auth_method,
+        password_ciphertext=encrypt_text(secret) if secret else "",
     )
     AccountChannelSelection.objects.create(account=account)
     MinerInstanceState.objects.create(
         account=account,
         desired_state=MinerInstanceState.DesiredState.STOPPED,
         observed_state=MinerInstanceState.ObservedState.UNKNOWN,
+        authentication_status=(
+            MinerInstanceState.AuthenticationStatus.UNLINKED
+            if auth_method == AccountCredential.AuthMethod.TWITCH_TV
+            else MinerInstanceState.AuthenticationStatus.AUTHENTICATED
+        ),
+        authentication_updated_at=timezone.now(),
     )
     if mode != AccountChannelSelection.Mode.DEFAULT or channels is not None or preset is not None:
         set_account_channel_selection(
@@ -276,14 +303,18 @@ def create_account(
         account=account,
         action="account_created",
         message=f"Created account {account.config_key}.",
-        details={"username": account.display_username},
+        details={"username": account.display_username, "auth_method": auth_method},
     )
     if start_after_save:
         # Validate the complete launch source before durable running intent is set.
         resolve_channels(account)
         enqueue_command(
             account,
-            MinerCommand.Action.START,
+            (
+                MinerCommand.Action.AUTHENTICATE
+                if auth_method == AccountCredential.AuthMethod.TWITCH_TV
+                else MinerCommand.Action.START
+            ),
             actor=actor,
             reason="Start requested while creating the account.",
         )
@@ -314,10 +345,16 @@ def update_account(
         account.save(update_fields=("display_username", "updated_at"))
         AccountSessionSeed.objects.filter(account=account).delete()
     if credential_changed:
+        credential = AccountCredential.objects.get(account=account)
+        if credential.auth_method != AccountCredential.AuthMethod.LEGACY_PASSWORD:
+            raise ValidationError("TV-login accounts cannot store a Twitch password.")
         secret = _validate_password(password or "")
         AccountCredential.objects.update_or_create(
             account=account,
-            defaults={"password_ciphertext": encrypt_text(secret)},
+            defaults={
+                "auth_method": AccountCredential.AuthMethod.LEGACY_PASSWORD,
+                "password_ciphertext": encrypt_text(secret),
+            },
         )
     _refresh_account_fingerprint(account)
 
@@ -344,6 +381,51 @@ def update_account(
             reason="Account credentials changed.",
         )
     return account
+
+
+@transaction.atomic
+def request_tv_authentication(account: MinerAccount, *, actor=None) -> MinerCommand:
+    """Irreversibly switch/reconnect an account through worker-owned TV login."""
+
+    account = MinerAccount.objects.select_for_update().get(pk=account.pk)
+    if not account.is_active:
+        raise ValidationError("Archived accounts cannot be connected to Twitch.")
+    credential, _ = AccountCredential.objects.select_for_update().get_or_create(account=account)
+    credential.auth_method = AccountCredential.AuthMethod.TWITCH_TV
+    credential.password_ciphertext = ""
+    credential.save(update_fields=("auth_method", "password_ciphertext", "updated_at"))
+    state, _ = MinerInstanceState.objects.select_for_update().get_or_create(account=account)
+    state.authentication_status = MinerInstanceState.AuthenticationStatus.UNLINKED
+    state.authentication_uri = ""
+    state.authentication_code = ""
+    state.authentication_expires_at = None
+    state.authentication_error = ""
+    state.authentication_updated_at = timezone.now()
+    state.save(
+        update_fields=(
+            "authentication_status",
+            "authentication_uri",
+            "authentication_code",
+            "authentication_expires_at",
+            "authentication_error",
+            "authentication_updated_at",
+            "updated_at",
+        )
+    )
+    command = enqueue_command(
+        account,
+        MinerCommand.Action.AUTHENTICATE,
+        actor=actor,
+        reason="Twitch TV connection requested from the web control room.",
+    )
+    ActionLog.objects.create(
+        actor=actor,
+        account=account,
+        action="authentication_tv_requested",
+        message=f"Requested Twitch TV authentication for {account.config_key}.",
+        details={"command_id": command.pk},
+    )
+    return command
 
 
 @transaction.atomic
@@ -418,7 +500,7 @@ def enqueue_command(
         if not account.is_active:
             raise ValidationError("Archived accounts cannot be started or restarted.")
         if not AccountCredential.objects.filter(account=account).exists():
-            raise ValidationError("Add a Twitch password before starting this account.")
+            raise ValidationError("Configure Twitch authentication before starting this account.")
         resolve_channels(account)
     state, _ = MinerInstanceState.objects.select_for_update().get_or_create(account=account)
     active = MinerCommand.objects.select_for_update().filter(
@@ -438,12 +520,23 @@ def enqueue_command(
     state.save(update_fields=("desired_state", "updated_at"))
 
     if action == MinerCommand.Action.STOP:
-        pending.filter(action__in=(MinerCommand.Action.START, MinerCommand.Action.RESTART)).update(
+        pending.filter(action__in=(MinerCommand.Action.START, MinerCommand.Action.RESTART, MinerCommand.Action.AUTHENTICATE)).update(
             status=MinerCommand.Status.CANCELLED,
             completed_at=timezone.now(),
             error="Superseded by a stop command.",
         )
+    elif action == MinerCommand.Action.AUTHENTICATE:
+        pending.exclude(action=MinerCommand.Action.AUTHENTICATE).update(
+            status=MinerCommand.Status.CANCELLED,
+            completed_at=timezone.now(),
+            error="Superseded by a Twitch authentication command.",
+        )
     else:
+        stronger = active.filter(action=MinerCommand.Action.AUTHENTICATE).order_by(
+            "created_at", "id"
+        ).first()
+        if stronger is not None:
+            return stronger
         pending.filter(action=MinerCommand.Action.STOP).update(
             status=MinerCommand.Status.CANCELLED,
             completed_at=timezone.now(),
@@ -648,11 +741,14 @@ def delete_preset(preset: ChannelPreset, *, actor=None) -> None:
 def create_launch_snapshot(
     account: MinerAccount,
     worker_id: str = "",
+    *,
+    reset_session: bool = False,
 ) -> MinerRun:
     """Validate DB state and persist an immutable, secret-free launch spec."""
 
     account = MinerAccount.objects.select_for_update().get(pk=account.pk)
     resolution = resolve_channels(account)
+    credential = AccountCredential.objects.get(account=account)
     run = MinerRun(
         account=account,
         source_mode=resolution.mode,
@@ -660,6 +756,8 @@ def create_launch_snapshot(
         channels=list(resolution.channels),
         configuration_fingerprint=resolution.fingerprint,
         channel_revision=account.channel_revision,
+        auth_method=credential.auth_method,
+        reset_session=reset_session,
         worker_id=worker_id,
     )
     run.full_clean()

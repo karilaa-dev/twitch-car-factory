@@ -11,6 +11,9 @@ import {
   Archive,
   AlertTriangle,
   ArrowLeft,
+  CheckCircle2,
+  Clipboard,
+  ExternalLink,
   History,
   KeyRound,
   Play,
@@ -28,6 +31,7 @@ import { z } from "zod"
 
 import { ChannelEditor } from "@/components/channel-editor"
 import { ChannelList } from "@/components/channel-list"
+import { ConfirmAction } from "@/components/confirm-action"
 import { CurrentState } from "@/components/current-state"
 import {
   InteractiveCard,
@@ -280,7 +284,7 @@ const createSchema = z
       .string()
       .trim()
       .regex(/^[A-Za-z0-9_]{1,100}$/, "Enter a valid Twitch username."),
-    password: z.string().min(1, "Enter the Twitch password."),
+    password: z.string(),
     mode: z.enum(["default", "custom", "preset"]),
     preset_id: z.number().nullable(),
     channels: z.array(z.string()),
@@ -380,7 +384,7 @@ export function NewAccountPage() {
     <>
       <PageHeader
         title="Add account"
-        description="Create an encrypted credential and initial ordered channel source."
+        description="Create a passwordless Twitch TV account and choose its initial channel source."
         actions={
           <Button
             variant="outline"
@@ -395,8 +399,8 @@ export function NewAccountPage() {
         <CardHeader>
           <CardTitle>Account configuration</CardTitle>
           <CardDescription>
-            The internal key is permanent. Credentials are write-only and never
-            returned to this browser.
+            The internal key is permanent. Twitch authentication happens after
+            saving with a short-lived code at twitch.tv/activate.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -429,21 +433,15 @@ export function NewAccountPage() {
                   <FieldError errors={[form.formState.errors.username]} />
                 </Field>
               </div>
-              <Field data-invalid={Boolean(form.formState.errors.password)}>
-                <FieldLabel htmlFor="password">Twitch password</FieldLabel>
-                <Input
-                  id="password"
-                  type="password"
-                  autoComplete="new-password"
-                  aria-invalid={Boolean(form.formState.errors.password)}
-                  {...form.register("password")}
-                />
-                <FieldDescription>
-                  Encrypted before storage and omitted from API responses, logs,
-                  caches, and browser history.
-                </FieldDescription>
-                <FieldError errors={[form.formState.errors.password]} />
-              </Field>
+              <Alert>
+                <KeyRound />
+                <AlertTitle>Passwordless Twitch TV login</AlertTitle>
+                <AlertDescription>
+                  No Twitch password is stored. After creation, use the Auth tab
+                  to connect this account with Twitch&apos;s device activation
+                  page.
+                </AlertDescription>
+              </Alert>
               <Controller
                 name="mode"
                 control={form.control}
@@ -616,7 +614,7 @@ export function AccountWorkspacePage() {
     queryKey: ["account-telemetry", accountId],
     queryFn: () => api<AccountTelemetry>(`/accounts/${accountId}/telemetry`),
     enabled: Number.isInteger(accountId),
-    refetchInterval: 5_000,
+    refetchInterval: 2_000,
   })
   const action = useMutation({
     mutationFn: (value: "start" | "stop" | "restart") =>
@@ -657,6 +655,7 @@ export function AccountWorkspacePage() {
           <>
             <Button
               variant="outline"
+              nativeButton={false}
               className="min-h-11 sm:min-h-8"
               render={<Link to="/accounts" />}
             >
@@ -724,7 +723,7 @@ export function AccountWorkspacePage() {
           <AccountHistory account={account} />
         </TabsContent>
         <TabsContent value="auth">
-          <AccountAuthSettings account={account} />
+          <AccountAuthSettings account={account} live={live} />
         </TabsContent>
       </Tabs>
     </>
@@ -945,8 +944,15 @@ function AccountChannelSourceSettings({ account }: { account: AccountDetail }) {
   )
 }
 
-function AccountAuthSettings({ account }: { account: AccountDetail }) {
+function AccountAuthSettings({
+  account,
+  live,
+}: {
+  account: AccountDetail
+  live: AccountSummary
+}) {
   const queryClient = useQueryClient()
+  const authentication = live.authentication
   const identity = useForm<IdentityValues>({
     resolver: zodResolver(identitySchema),
     defaultValues: { username: account.username, password: "" },
@@ -972,13 +978,168 @@ function AccountAuthSettings({ account }: { account: AccountDetail }) {
     }
   }
   const disabled = !account.is_active
+  const connect = useMutation({
+    mutationFn: () =>
+      api(`/accounts/${account.id}/authentication/tv`, { method: "POST" }),
+    onSuccess: async () => {
+      toast.success("Twitch TV authentication started.")
+      await queryClient.invalidateQueries({ queryKey: ["account", account.id] })
+      await queryClient.invalidateQueries({
+        queryKey: ["account-telemetry", account.id],
+      })
+    },
+    onError: mutationError,
+  })
+  const [remaining, setRemaining] = React.useState(0)
+  React.useEffect(() => {
+    const update = () =>
+      setRemaining(
+        authentication.expires_at
+          ? Math.max(
+              0,
+              Math.ceil(
+                (new Date(authentication.expires_at).getTime() - Date.now()) /
+                  1_000
+              )
+            )
+          : 0
+      )
+    update()
+    if (!authentication.expires_at) return
+    const interval = window.setInterval(update, 1_000)
+    return () => window.clearInterval(interval)
+  }, [authentication.expires_at])
+  const minutes = Math.floor(remaining / 60)
+  const seconds = remaining % 60
+  const connectButton = (
+    <Button
+      type="button"
+      className="min-h-11"
+      disabled={disabled || connect.isPending}
+      onClick={live.desired === "running" ? undefined : () => connect.mutate()}
+    >
+      {connect.isPending ? <Spinner /> : <KeyRound />}
+      {authentication.status === "unlinked"
+        ? "Connect Twitch"
+        : "Reconnect Twitch"}
+    </Button>
+  )
+
+  if (authentication.method === "twitch_tv") {
+    return (
+      <Card className="max-w-3xl overflow-hidden">
+        <CardHeader className="border-b bg-muted/20">
+          <CardTitle>Twitch TV authentication</CardTitle>
+          <CardDescription>
+            Passwordless device login. Session files stay worker-owned and are
+            never returned to the browser.
+          </CardDescription>
+          <CardAction>
+            <span className="rounded-full border px-2.5 py-1 font-mono text-[11px] tracking-wider text-muted-foreground uppercase">
+              {authentication.status.replace("_", " ")}
+            </span>
+          </CardAction>
+        </CardHeader>
+        <CardContent className="grid gap-5 pt-5">
+          <div className="grid gap-1 text-sm sm:grid-cols-[9rem_1fr]">
+            <span className="text-muted-foreground">Account</span>
+            <span className="font-mono">{account.username}</span>
+            <span className="text-muted-foreground">Internal key</span>
+            <span className="font-mono">{account.config_key}</span>
+          </div>
+
+          {authentication.status === "pending" ? (
+            <div className="grid gap-4 rounded-xl border border-primary/35 bg-primary/5 p-4 sm:p-5">
+              <div>
+                <p className="text-xs font-medium tracking-[0.18em] text-primary uppercase">
+                  Activation code
+                </p>
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  <code className="text-3xl font-semibold tracking-[0.16em] select-all sm:text-4xl">
+                    {authentication.user_code}
+                  </code>
+                  <Button
+                    type="button"
+                    size="icon"
+                    variant="outline"
+                    aria-label="Copy activation code"
+                    onClick={async () => {
+                      await navigator.clipboard.writeText(
+                        authentication.user_code
+                      )
+                      toast.success("Activation code copied.")
+                    }}
+                  >
+                    <Clipboard />
+                  </Button>
+                </div>
+              </div>
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <span className="font-mono text-sm text-muted-foreground">
+                  Expires in {minutes}:{String(seconds).padStart(2, "0")}
+                </span>
+                <a
+                  className="inline-flex min-h-11 items-center justify-center gap-1.5 rounded-lg border bg-background px-3 text-sm font-medium transition-colors hover:bg-muted"
+                  href={
+                    authentication.activation_url ||
+                    "https://www.twitch.tv/activate"
+                  }
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  Open twitch.tv/activate <ExternalLink />
+                </a>
+              </div>
+            </div>
+          ) : null}
+
+          {authentication.status === "authenticated" ? (
+            <Alert>
+              <CheckCircle2 />
+              <AlertTitle>Twitch connected</AlertTitle>
+              <AlertDescription>
+                The worker validated the saved Twitch session. Starts and
+                restarts will reuse it without requesting another code.
+              </AlertDescription>
+            </Alert>
+          ) : null}
+
+          {authentication.status === "reauth_required" ? (
+            <Alert variant="destructive">
+              <AlertTriangle />
+              <AlertTitle>Reconnect required</AlertTitle>
+              <AlertDescription>
+                {authentication.error ||
+                  "The saved Twitch session could not be validated. Start a new device login."}
+              </AlertDescription>
+            </Alert>
+          ) : null}
+
+          {authentication.status !== "pending" ? (
+            live.desired === "running" ? (
+              <ConfirmAction
+                trigger={connectButton}
+                title="Stop and reconnect this miner?"
+                description="The worker will stop the active miner, remove its saved session, and wait for a new Twitch activation code."
+                confirmLabel="Stop and reconnect"
+                onConfirm={() => connect.mutate()}
+              />
+            ) : (
+              connectButton
+            )
+          ) : null}
+        </CardContent>
+      </Card>
+    )
+  }
+
   return (
     <Card className="max-w-3xl">
       <CardHeader>
         <CardTitle>Authentication settings</CardTitle>
         <CardDescription>
-          The account key remains immutable. Leave password blank to keep the
-          encrypted credential.
+          This legacy account keeps password replacement until it is switched to
+          passwordless Twitch TV login. Switching is one-way in this UI.
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -1032,6 +1193,25 @@ function AccountAuthSettings({ account }: { account: AccountDetail }) {
             >
               {identityPending ? <Spinner /> : <KeyRound />} Save authentication
             </Button>
+            <Separator />
+            <div className="grid gap-2 rounded-lg border p-4">
+              <FieldTitle>Switch to Twitch TV login</FieldTitle>
+              <FieldDescription>
+                This clears the encrypted password and saved session, stops the
+                miner if necessary, and requests a device activation code.
+              </FieldDescription>
+              <ConfirmAction
+                trigger={
+                  <Button type="button" variant="outline" disabled={disabled}>
+                    <KeyRound /> Switch to TV login
+                  </Button>
+                }
+                title="Switch permanently to Twitch TV login?"
+                description="The stored password will be erased. The UI will not offer a switch back to password authentication."
+                confirmLabel="Switch and connect"
+                onConfirm={() => connect.mutate()}
+              />
+            </div>
           </FieldGroup>
         </form>
       </CardContent>

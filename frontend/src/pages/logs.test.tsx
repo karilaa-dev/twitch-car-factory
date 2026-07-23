@@ -22,6 +22,16 @@ const accounts: AccountList = {
       username: "Primary Farmer",
       is_active: true,
       has_credentials: true,
+      authentication: {
+        method: "legacy_password",
+        status: "authenticated",
+        activation_url: "",
+        user_code: "",
+        expires_at: null,
+        error: "",
+        updated_at: "2026-07-15T10:00:00Z",
+        can_reconnect: true,
+      },
       desired: "running",
       observed: "running",
       source: { mode: "default", name: "farm defaults", channels: ["one"] },
@@ -36,6 +46,16 @@ const accounts: AccountList = {
       username: "Archived Farmer",
       is_active: false,
       has_credentials: false,
+      authentication: {
+        method: "twitch_tv",
+        status: "unlinked",
+        activation_url: "",
+        user_code: "",
+        expires_at: null,
+        error: "",
+        updated_at: null,
+        can_reconnect: false,
+      },
       desired: "stopped",
       observed: "stopped",
       source: { mode: "custom", name: "archived", channels: ["two"] },
@@ -51,7 +71,11 @@ const accounts: AccountList = {
   autostart_new_accounts: false,
 }
 
-function liveTail(lines: string[], cursor: string, accountId: number | null = null): LogTail {
+function liveTail(
+  lines: string[],
+  cursor: string,
+  accountId: number | null = null
+): LogTail {
   return {
     lines,
     line_count: lines.length,
@@ -147,7 +171,9 @@ describe("LogsPage", () => {
         return Promise.resolve(detail(["archived-account-line"], "live-older"))
       }
       if (path.startsWith("/logs?account_id=2")) {
-        return Promise.resolve(liveTail(["archived-account-line"], "account-cursor", 2))
+        return Promise.resolve(
+          liveTail(["archived-account-line"], "account-cursor", 2)
+        )
       }
       if (path.startsWith("/logs")) {
         combinedCalls += 1
@@ -165,18 +191,32 @@ describe("LogsPage", () => {
       await screen.findByText("first-live-line", {}, { timeout: 5_000 })
     ).toBeVisible()
     expect(
-      await screen.findByText(/first-live-line.*second-live-line/s, {}, { timeout: 5_000 })
+      await screen.findByText(
+        /first-live-line.*second-live-line/s,
+        {},
+        { timeout: 5_000 }
+      )
     ).toBeVisible()
-    expect(apiMock).toHaveBeenCalledWith(expect.stringContaining("cursor=cursor-one"))
+    expect(apiMock).toHaveBeenCalledWith(
+      expect.stringContaining("cursor=cursor-one")
+    )
 
     await user.click(screen.getByRole("combobox", { name: "Log account" }))
-    await user.click(await screen.findByRole("option", { name: /Archived Farmer/ }))
+    await user.click(
+      await screen.findByRole("option", { name: /Archived Farmer/ })
+    )
     expect(
       await screen.findByText("archived-account-line", {}, { timeout: 5_000 })
     ).toBeVisible()
-    expect(apiMock).toHaveBeenCalledWith(expect.stringContaining("account_id=2"))
-    await user.click(screen.getByRole("button", { name: "Load older lines from this run" }))
-    expect(await screen.findByText(/older-live-run-line.*archived-account-line/s)).toBeVisible()
+    expect(apiMock).toHaveBeenCalledWith(
+      expect.stringContaining("account_id=2")
+    )
+    await user.click(
+      screen.getByRole("button", { name: "Load older lines from this run" })
+    )
+    expect(
+      await screen.findByText(/older-live-run-line.*archived-account-line/s)
+    ).toBeVisible()
     expect(
       screen.queryByRole("button", { name: "Load older lines from this run" })
     ).not.toBeInTheDocument()
@@ -192,7 +232,10 @@ describe("LogsPage", () => {
         liveCalls += 1
         return Promise.resolve(
           liveTail(
-            Array.from({ length: 400 }, (_, index) => `batch-${batch}-line-${index}`),
+            Array.from(
+              { length: 400 },
+              (_, index) => `batch-${batch}-line-${index}`
+            ),
             `cursor-${batch}`
           )
         )
@@ -206,8 +249,14 @@ describe("LogsPage", () => {
       .getByLabelText("Live farmer log lines")
       .closest<HTMLElement>("[data-slot='scroll-area-viewport']")
     expect(viewport).not.toBeNull()
-    Object.defineProperty(viewport, "scrollHeight", { configurable: true, value: 1_000 })
-    Object.defineProperty(viewport, "clientHeight", { configurable: true, value: 200 })
+    Object.defineProperty(viewport, "scrollHeight", {
+      configurable: true,
+      value: 1_000,
+    })
+    Object.defineProperty(viewport, "clientHeight", {
+      configurable: true,
+      value: 200,
+    })
     if (!viewport) throw new Error("Log viewport did not render")
     await new Promise((resolve) => window.setTimeout(resolve, 0))
     viewport.scrollTop = 100
@@ -215,15 +264,24 @@ describe("LogsPage", () => {
     await new Promise((resolve) => window.setTimeout(resolve, 0))
 
     for (let batch = 1; batch <= 5; batch += 1) {
-      await user.click(screen.getByRole("button", { name: "Refresh live logs" }))
-      await screen.findByText(new RegExp(`batch-${batch}-line-399`), {}, { timeout: 5_000 })
+      await user.click(
+        screen.getByRole("button", { name: "Refresh live logs" })
+      )
+      await screen.findByText(
+        new RegExp(`batch-${batch}-line-399`),
+        {},
+        { timeout: 5_000 }
+      )
     }
 
-    const consoleText = screen.getByLabelText("Live farmer log lines").textContent ?? ""
+    const consoleText =
+      screen.getByLabelText("Live farmer log lines").textContent ?? ""
     expect(consoleText).not.toContain("batch-0-line-0")
     expect(consoleText.split("\n")).toHaveLength(2_000)
     expect(viewport.scrollTop).toBe(100)
-    await user.click(screen.getByRole("button", { name: "Jump to newest log line" }))
+    await user.click(
+      screen.getByRole("button", { name: "Jump to newest log line" })
+    )
     expect(viewport.scrollTop).toBe(1_000)
   }, 15_000)
 
@@ -243,32 +301,58 @@ describe("LogsPage", () => {
         accountCalls += 1
         return Promise.resolve(
           liveTail(
-            Array.from({ length: 400 }, (_, index) => `account-batch-${batch}-line-${index}`),
+            Array.from(
+              { length: 400 },
+              (_, index) => `account-batch-${batch}-line-${index}`
+            ),
             `account-cursor-${batch}`,
             2
           )
         )
       }
-      if (path.startsWith("/logs")) return Promise.resolve(liveTail([], "combined-cursor"))
+      if (path.startsWith("/logs"))
+        return Promise.resolve(liveTail([], "combined-cursor"))
       throw new Error(`Unexpected API path: ${path}`)
     })
 
     renderPage()
-    await user.click(await screen.findByRole("combobox", { name: "Log account" }))
-    await user.click(await screen.findByRole("option", { name: /Archived Farmer/ }))
+    await user.click(
+      await screen.findByRole("combobox", { name: "Log account" })
+    )
+    await user.click(
+      await screen.findByRole("option", { name: /Archived Farmer/ })
+    )
     await screen.findByText(/account-batch-0-line-399/, {}, { timeout: 5_000 })
     for (let batch = 1; batch <= 4; batch += 1) {
-      await user.click(screen.getByRole("button", { name: "Refresh live logs" }))
-      await screen.findByText(new RegExp(`account-batch-${batch}-line-399`), {}, { timeout: 5_000 })
+      await user.click(
+        screen.getByRole("button", { name: "Refresh live logs" })
+      )
+      await screen.findByText(
+        new RegExp(`account-batch-${batch}-line-399`),
+        {},
+        { timeout: 5_000 }
+      )
     }
-    expect(screen.getByLabelText("Live farmer log lines").textContent?.split("\n")).toHaveLength(2_000)
+    expect(
+      screen.getByLabelText("Live farmer log lines").textContent?.split("\n")
+    ).toHaveLength(2_000)
 
-    await user.click(screen.getByRole("button", { name: "Load older lines from this run" }))
-    expect(await screen.findByText(/two-factor-activation-code.*newest-archive-line/s)).toBeVisible()
+    await user.click(
+      screen.getByRole("button", { name: "Load older lines from this run" })
+    )
+    expect(
+      await screen.findByText(
+        /two-factor-activation-code.*newest-archive-line/s
+      )
+    ).toBeVisible()
 
-    await user.click(screen.getByRole("button", { name: "Jump to newest log line" }))
+    await user.click(
+      screen.getByRole("button", { name: "Jump to newest log line" })
+    )
     expect(await screen.findByText(/account-batch-4-line-399/)).toBeVisible()
-    expect(screen.queryByText("two-factor-activation-code")).not.toBeInTheDocument()
+    expect(
+      screen.queryByText("two-factor-activation-code")
+    ).not.toBeInTheDocument()
   }, 15_000)
 
   it("shows truncated run history, pages older lines, and exposes the gzip download", async () => {
@@ -278,9 +362,11 @@ describe("LogsPage", () => {
       if (path.startsWith("/logs/runs/55?before=older")) {
         return Promise.resolve(detail(["older-archived-line"], null))
       }
-      if (path === "/logs/runs/55") return Promise.resolve(detail(["newest-archived-line"], "older"))
+      if (path === "/logs/runs/55")
+        return Promise.resolve(detail(["newest-archived-line"], "older"))
       if (path.startsWith("/logs/runs")) return Promise.resolve(history)
-      if (path.startsWith("/logs")) return Promise.resolve(liveTail([], "cursor"))
+      if (path.startsWith("/logs"))
+        return Promise.resolve(liveTail([], "cursor"))
       throw new Error(`Unexpected API path: ${path}`)
     })
 
@@ -288,10 +374,91 @@ describe("LogsPage", () => {
     await user.click(await screen.findByRole("tab", { name: /History/ }))
     expect(await screen.findByText("earlier lines expired")).toBeVisible()
     expect(await screen.findByText("newest-archived-line")).toBeVisible()
+    expect(document.querySelector("[data-log-run-id='55']")).toHaveClass(
+      "h-auto",
+      "md:h-auto"
+    )
     const download = screen.getByRole("link", { name: /Download gzip/ })
     expect(download).toHaveAttribute("href", "/api/v1/logs/runs/55/download")
 
     await user.click(screen.getByRole("button", { name: "Load older lines" }))
-    await waitFor(() => expect(screen.getByText(/older-archived-line.*newest-archived-line/s)).toBeVisible())
+    await waitFor(() =>
+      expect(
+        screen.getByText(/older-archived-line.*newest-archived-line/s)
+      ).toBeVisible()
+    )
+  })
+
+  it("filters live and archived output between worker and Twitch library lines", async () => {
+    const user = userEvent.setup()
+    const combinedWorker =
+      "2026-07-22 10:00:00 INFO controller.miner_supervisor: worker-event"
+    const combinedLibrary =
+      "2026-07-22 10:00:01 INFO twitch_farm.miner_output: miner[primary] library-event"
+    const combinedLibraryDebug =
+      "2026-07-22 10:00:01 INFO twitch_farm.miner_output: miner[primary] 2026-07-22 10:00:01,123 DEBUG urllib3.connectionpool: protocol-noise"
+    const combinedLibraryDuplicate =
+      "2026-07-22 10:00:01 INFO twitch_farm.miner_output: miner[primary] 2026-07-22 10:00:01,124 INFO TwitchChannelPointsMiner.TwitchChannelPointsMiner: library-event"
+    const archivedWorker =
+      "2026-07-22T10:00:00.000Z INFO lifecycle account=primary run=55: startup_confirmed"
+    const archivedLibrary =
+      "2026-07-22T10:00:01.000Z INFO library account=primary run=55: Twitch miner ready"
+    const archivedLibraryDebug =
+      "2026-07-22T10:00:01.000Z INFO library account=primary run=55: 2026-07-22 10:00:01,125 DEBUG TwitchChannelPointsMiner.classes.Twitch: protocol-noise"
+
+    apiMock.mockImplementation((path: string) => {
+      if (path === "/accounts") return Promise.resolve(accounts)
+      if (path === "/logs/runs/55") {
+        return Promise.resolve(
+          detail(
+            [archivedWorker, archivedLibraryDebug, archivedLibrary],
+            null
+          )
+        )
+      }
+      if (path.startsWith("/logs/runs")) return Promise.resolve(history)
+      if (path.startsWith("/logs")) {
+        return Promise.resolve(
+          liveTail(
+            [
+              combinedWorker,
+              combinedLibraryDebug,
+              combinedLibraryDuplicate,
+              combinedLibrary,
+            ],
+            "source-cursor"
+          )
+        )
+      }
+      throw new Error(`Unexpected API path: ${path}`)
+    })
+
+    renderPage()
+    expect(
+      await screen.findByText(/worker-event.*library-event/s)
+    ).toBeVisible()
+
+    await user.click(
+      screen.getByRole("button", { name: "Show Twitch library logs" })
+    )
+    expect(screen.getByText(/library-event/)).toBeVisible()
+    expect(screen.queryByText(/protocol-noise/)).not.toBeInTheDocument()
+    expect(screen.getByText(/library-event/).textContent?.match(/library-event/g)).toHaveLength(1)
+    expect(screen.queryByText(/worker-event/)).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole("button", { name: "Show Worker logs" }))
+    expect(screen.getByText(/worker-event/)).toBeVisible()
+    expect(screen.queryByText(/library-event/)).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole("tab", { name: /History/ }))
+    expect(await screen.findByText(/startup_confirmed/)).toBeVisible()
+    expect(screen.queryByText(/Twitch miner ready/)).not.toBeInTheDocument()
+
+    await user.click(
+      screen.getByRole("button", { name: "Show Twitch library logs" })
+    )
+    expect(screen.getByText(/Twitch miner ready/)).toBeVisible()
+    expect(screen.queryByText(/protocol-noise/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/startup_confirmed/)).not.toBeInTheDocument()
   })
 })

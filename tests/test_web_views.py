@@ -298,7 +298,8 @@ class ApiContractTests(TestCase):
         self.login()
         listing = self.assert_envelope(self.client.get(self.api("accounts")))
         self.assertEqual(listing["active_count"], 1)
-        self.assertNotIn("password", json.dumps(listing))
+        self.assertNotIn("password_ciphertext", json.dumps(listing))
+        self.assertNotIn(self.credential_ciphertext(), json.dumps(listing))
 
         created_response = self.json_request(
             "post",
@@ -331,6 +332,37 @@ class ApiContractTests(TestCase):
             self.client.get(self.api("account_telemetry", account.pk))
         )
         self.assertEqual(telemetry["account"]["id"], account.pk)
+
+    def test_passwordless_tv_account_and_reconnect_api_are_redacted(self):
+        self.login()
+        response = self.json_request(
+            "post",
+            self.api("accounts"),
+            {
+                "config_key": "tv-account",
+                "username": "tv_viewer",
+                "mode": "default",
+                "channels": [],
+                "start_after_save": False,
+            },
+        )
+        created = self.assert_envelope(response, 201)
+        account = MinerAccount.objects.get(pk=created["id"])
+        self.assertEqual(created["authentication"]["method"], "twitch_tv")
+        self.assertEqual(created["authentication"]["status"], "unlinked")
+        self.assertEqual(account.credential.password_ciphertext, "")
+
+        reconnect = self.client.post(
+            self.api("account_tv_authentication", account.pk),
+            data="{}",
+            content_type="application/json",
+        )
+        data = self.assert_envelope(reconnect, 202)
+        self.assertEqual(data["command"]["action"], "authenticate")
+        serialized = reconnect.content.decode()
+        self.assertNotIn("ciphertext", serialized)
+        self.assertNotIn("access_token", serialized)
+        self.assertNotIn("device_code", serialized)
 
     def test_account_validation_envelope_and_sensitive_failure_redaction(self):
         self.login()

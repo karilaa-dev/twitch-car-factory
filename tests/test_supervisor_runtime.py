@@ -181,6 +181,7 @@ def runtime_options(**overrides) -> SupervisorOptions:
         "command_lease_seconds": 5,
         "worker_lease_seconds": 20,
         "worker_heartbeat_seconds": 0,
+        "require_authentication_events": False,
         "fake_miner": False,
         "lock_path": None,
     }
@@ -198,6 +199,86 @@ def make_supervisor(clock: FakeClock, factory: ProcessFactory, **option_override
         worker_id="test-worker",
         use_file_lock=False,
     )
+
+
+def configure_tv_account() -> MinerAccount:
+    account = configure_farm()
+    credential = account.credential
+    credential.auth_method = AccountCredential.AuthMethod.TWITCH_TV
+    credential.password_ciphertext = ""
+    credential.save(update_fields=("auth_method", "password_ciphertext", "updated_at"))
+    return account
+
+
+@pytest.mark.django_db
+def test_tv_authentication_stays_starting_until_validated_event(tmp_path, settings):
+    settings.TWITCH_FARM_RUNTIME_DIR = tmp_path / "runtime"
+    account = configure_tv_account()
+    command = enqueue_command(account, MinerCommand.Action.AUTHENTICATE)
+    clock = FakeClock()
+    supervisor = make_supervisor(clock, ProcessFactory())
+    leased = supervisor._lease_next_command()
+    assert leased is not None and leased.pk == command.pk
+    assert supervisor.execute_command(leased) is True
+    managed = supervisor.processes[account.pk]
+
+    supervisor.check_health()
+    account.runtime_state.refresh_from_db()
+    assert account.runtime_state.observed_state == MinerInstanceState.ObservedState.STARTING
+    assert managed.confirmed is False
+
+    managed.auth_events.put(
+        {
+            "event": "device_code",
+            "user_code": "ABCD-1234",
+            "verification_uri": "https://www.twitch.tv/activate",
+            "expires_in": 1800,
+        }
+    )
+    supervisor.check_health()
+    account.runtime_state.refresh_from_db()
+    assert account.runtime_state.authentication_status == MinerInstanceState.AuthenticationStatus.PENDING
+    assert account.runtime_state.authentication_code == "ABCD-1234"
+    assert managed.confirmed is False
+
+    managed.auth_events.put({"event": "authenticated"})
+    supervisor.check_health()
+    account.runtime_state.refresh_from_db()
+    command.refresh_from_db()
+    run = MinerRun.objects.get(pk=managed.run_id)
+    assert managed.confirmed is True
+    assert run.reset_session is True
+    assert run.auth_method == AccountCredential.AuthMethod.TWITCH_TV
+    assert account.runtime_state.authentication_status == MinerInstanceState.AuthenticationStatus.AUTHENTICATED
+    assert account.runtime_state.authentication_code == ""
+    assert command.status == MinerCommand.Status.SUCCEEDED
+
+
+@pytest.mark.django_db
+def test_tv_authentication_failure_stops_without_recovery(tmp_path, settings):
+    settings.TWITCH_FARM_RUNTIME_DIR = tmp_path / "runtime"
+    account = configure_tv_account()
+    command = enqueue_command(account, MinerCommand.Action.AUTHENTICATE)
+    clock = FakeClock()
+    supervisor = make_supervisor(clock, ProcessFactory())
+    leased = supervisor._lease_next_command()
+    assert leased is not None
+    supervisor.execute_command(leased)
+    managed = supervisor.processes[account.pk]
+    managed.auth_events.put({"event": "authentication_failed", "error": "Code expired."})
+
+    supervisor.check_health()
+
+    account.runtime_state.refresh_from_db()
+    command.refresh_from_db()
+    run = MinerRun.objects.get(pk=managed.run_id)
+    assert account.runtime_state.desired_state == MinerInstanceState.DesiredState.STOPPED
+    assert account.runtime_state.authentication_status == MinerInstanceState.AuthenticationStatus.REAUTH_REQUIRED
+    assert account.runtime_state.authentication_code == ""
+    assert run.stop_reason == MinerRun.StopReason.AUTHENTICATION_FAILED
+    assert command.status == MinerCommand.Status.FAILED
+    assert account.pk not in supervisor.processes
+    assert not RestartAttempt.objects.filter(incident__account=account).exists()
 
 
 @pytest.mark.django_db
@@ -1614,6 +1695,35 @@ def test_runner_configures_linux_parent_death_signal_after_exec(monkeypatch):
     assert prctl_calls == [(1, signal.SIGKILL)]
     assert kill_calls == [(5252, signal.SIGKILL)]
     assert "TWITCH_FARM_SUPERVISOR_PID" not in os.environ
+
+
+def test_runner_replaces_inherited_handlers_and_disables_debug(monkeypatch):
+    removed = []
+    disabled = []
+    inherited_handlers = [object(), object()]
+
+    class FakeRootLogger:
+        handlers = inherited_handlers
+
+        @staticmethod
+        def removeHandler(handler):
+            removed.append(handler)
+
+    class FakeLogging:
+        DEBUG = 10
+
+        @staticmethod
+        def getLogger():
+            return FakeRootLogger()
+
+        disable = staticmethod(disabled.append)
+
+    monkeypatch.setattr(miner_runner, "logging", FakeLogging)
+
+    miner_runner.prepare_upstream_logging()
+
+    assert disabled == [FakeLogging.DEBUG]
+    assert removed == inherited_handlers
 
 
 @pytest.mark.django_db

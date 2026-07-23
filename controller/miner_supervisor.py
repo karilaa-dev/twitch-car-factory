@@ -9,18 +9,21 @@ and keeps retrying without turning a broken miner into a tight restart loop.
 from __future__ import annotations
 
 import fcntl
+import json
 import logging
 import os
+import queue
 import re
 import subprocess
 import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, IO, Protocol
+from urllib.parse import urlparse
 
 from django.conf import settings
 from django.db import IntegrityError, transaction
@@ -28,6 +31,8 @@ from django.db.models import F, Max, Q
 from django.utils import timezone
 
 from controller.models import (
+    AccountCredential,
+    AccountSessionSeed,
     MinerAccount,
     MinerCommand,
     MinerIncident,
@@ -38,10 +43,18 @@ from controller.models import (
 )
 from controller import services
 from controller.runtime_logs import AccountRunLogWriter, recover_account_log_archives
+from controller.miner_runner import CONTROL_EVENT_PREFIX
 
 
 logger = logging.getLogger(__name__)
 miner_output_logger = logging.getLogger("twitch_farm.miner_output")
+
+_UPSTREAM_DEBUG_LINE = re.compile(
+    r"^(?:"
+    r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[,.]\d+)?\s+(?:TRACE|DEBUG)\s+\S+:"
+    r"|\d{2}/\d{2}(?:/\d{2})?\s+\d{2}:\d{2}:\d{2}\s+-\s+(?:TRACE|DEBUG)\s+-"
+    r")"
+)
 
 
 class ProcessLike(Protocol):
@@ -103,6 +116,7 @@ class SupervisorOptions:
     health_poll_seconds: float = 5.0
     fingerprint_poll_seconds: float = 30.0
     startup_grace_seconds: float = 15.0
+    authentication_handshake_seconds: float = 1900.0
     stop_timeout_seconds: float = 10.0
     rapid_restart_backoff: tuple[float, ...] = (5.0, 15.0, 30.0, 60.0, 120.0)
     degraded_retry_seconds: float = 300.0
@@ -110,6 +124,7 @@ class SupervisorOptions:
     command_lease_seconds: float = 45.0
     worker_lease_seconds: float = 20.0
     worker_heartbeat_seconds: float = 5.0
+    require_authentication_events: bool = True
     fake_miner: bool = False
     lock_path: Path | None = None
 
@@ -140,6 +155,11 @@ class SupervisorOptions:
             startup_grace_seconds=_number_setting(
                 "MINER_STARTUP_GRACE_SECONDS", "MINER_STARTUP_GRACE_SECONDS", 15
             ),
+            authentication_handshake_seconds=_number_setting(
+                "MINER_AUTHENTICATION_HANDSHAKE_SECONDS",
+                "MINER_AUTHENTICATION_HANDSHAKE_SECONDS",
+                1900,
+            ),
             stop_timeout_seconds=_number_setting(
                 "MINER_STOP_TIMEOUT_SECONDS", "MINER_STOP_TIMEOUT_SECONDS", 10
             ),
@@ -159,6 +179,7 @@ class SupervisorOptions:
             worker_heartbeat_seconds=_number_setting(
                 "MINER_WORKER_HEARTBEAT_SECONDS", "MINER_WORKER_HEARTBEAT_SECONDS", 5
             ),
+            require_authentication_events=True,
             fake_miner=str(fake_raw).strip().lower() in {"1", "true", "yes", "on"},
             lock_path=Path(lock_value),
         )
@@ -181,6 +202,12 @@ class ManagedProcess:
     output_thread: threading.Thread | None = None
     log_writer: AccountRunLogWriter | None = None
     crash_logged: bool = False
+    auth_required: bool = False
+    authenticated: bool = False
+    authentication_deadline: float | None = None
+    auth_events: queue.SimpleQueue[dict[str, object]] = dataclass_field(
+        default_factory=queue.SimpleQueue
+    )
 
 
 _SENSITIVE_VALUE = re.compile(
@@ -216,10 +243,52 @@ def safe_error(value: object, *, limit: int = 2000) -> str:
     return text[:limit]
 
 
+def _parse_control_event(line: str) -> dict[str, object] | None:
+    if not line.startswith(CONTROL_EVENT_PREFIX):
+        return None
+    payload = line[len(CONTROL_EVENT_PREFIX) :]
+    if len(payload) > 2048:
+        raise ValueError("Control event exceeded the size limit.")
+    try:
+        event = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Control event was not valid JSON.") from exc
+    if not isinstance(event, dict) or not isinstance(event.get("event"), str):
+        raise ValueError("Control event has an invalid shape.")
+    forbidden = {"token", "device_code", "access_token", "refresh_token", "password"}
+    if forbidden.intersection(str(key).casefold() for key in event):
+        raise ValueError("Control event contained a forbidden secret field.")
+    kind = event["event"]
+    if kind == "device_code":
+        if set(event) != {"event", "user_code", "verification_uri", "expires_in"}:
+            raise ValueError("Device-code event has unexpected fields.")
+        code = event["user_code"]
+        uri = event["verification_uri"]
+        expires_in = event["expires_in"]
+        parsed = urlparse(uri if isinstance(uri, str) else "")
+        if not isinstance(code, str) or not re.fullmatch(r"[A-Z0-9-]{4,32}", code):
+            raise ValueError("Device-code event has an invalid user code.")
+        if parsed.scheme != "https" or parsed.hostname != "www.twitch.tv" or parsed.path != "/activate":
+            raise ValueError("Device-code event has an invalid activation URL.")
+        if not isinstance(expires_in, int) or isinstance(expires_in, bool) or not 1 <= expires_in <= 3600:
+            raise ValueError("Device-code event has an invalid expiry.")
+    elif kind == "authenticated":
+        if set(event) != {"event"}:
+            raise ValueError("Authenticated event has unexpected fields.")
+    elif kind == "authentication_failed":
+        if set(event) != {"event", "error"} or not isinstance(event.get("error"), str):
+            raise ValueError("Authentication-failure event has an invalid shape.")
+        event["error"] = safe_error(event["error"], limit=500)
+    else:
+        raise ValueError("Control event type is unsupported.")
+    return event
+
+
 def _drain_miner_output(
     stream: IO[str],
     account_key: str,
     log_writer: AccountRunLogWriter | None = None,
+    auth_events: queue.SimpleQueue[dict[str, object]] | None = None,
 ) -> None:
     """Forward one child's output through the worker's console/file handlers."""
 
@@ -228,9 +297,25 @@ def _drain_miner_output(
             unstyled_line = _ANSI_ESCAPE.sub("", raw_line.rstrip("\r\n"))
             line = safe_error(unstyled_line, limit=8000)
             if line:
+                if line.startswith(CONTROL_EVENT_PREFIX):
+                    try:
+                        event = _parse_control_event(line)
+                    except ValueError as exc:
+                        logger.warning("Rejected miner control event for %s: %s", account_key, exc)
+                        if log_writer is not None:
+                            log_writer.lifecycle("control_event_rejected", error=safe_error(exc))
+                    else:
+                        if event is not None and auth_events is not None:
+                            auth_events.put(event)
+                    continue
+                # The pinned miner sets the root logger to DEBUG internally.
+                # Keep protocol payloads out of both combined and account logs
+                # even if its handler configuration regresses in a later fork.
+                if _UPSTREAM_DEBUG_LINE.match(line):
+                    continue
                 miner_output_logger.info("miner[%s] %s", account_key, line)
                 if log_writer is not None:
-                    log_writer.write(line)
+                    log_writer.write(line, kind="library")
     except (OSError, ValueError):
         logger.exception("Miner output stream failed for %s", account_key)
     finally:
@@ -452,6 +537,13 @@ class MinerSupervisor:
             state.last_heartbeat = None
             state.stable_since = None
             state.next_retry_at = None
+            if state.authentication_status == MinerInstanceState.AuthenticationStatus.PENDING:
+                state.authentication_status = MinerInstanceState.AuthenticationStatus.UNLINKED
+                state.authentication_uri = ""
+                state.authentication_code = ""
+                state.authentication_expires_at = None
+                state.authentication_error = ""
+                state.authentication_updated_at = now
             state.observed_state = (
                 MinerInstanceState.ObservedState.UNKNOWN
                 if state.desired_state == MinerInstanceState.DesiredState.RUNNING
@@ -465,6 +557,12 @@ class MinerSupervisor:
                     "last_heartbeat",
                     "stable_since",
                     "next_retry_at",
+                    "authentication_status",
+                    "authentication_uri",
+                    "authentication_code",
+                    "authentication_expires_at",
+                    "authentication_error",
+                    "authentication_updated_at",
                     "observed_state",
                     "updated_at",
                 )
@@ -680,6 +778,11 @@ class MinerSupervisor:
                     reset_failures=True,
                     command_id=command.pk,
                 )
+            elif command.action == MinerCommand.Action.AUTHENTICATE:
+                managed = self.authenticate_account(
+                    command.account,
+                    command_id=command.pk,
+                )
             else:
                 raise ValueError(f"Unsupported miner command action: {command.action}")
 
@@ -693,6 +796,76 @@ class MinerSupervisor:
                 self._recover_incident_for_healthy_fallback(command.account_id)
             logger.exception("Miner command %s failed", command.pk)
             return False
+
+    def _remove_runtime_session(self, account: MinerAccount) -> None:
+        """Remove worker-owned session material without following symbolic links."""
+
+        runtime_dir = Path(
+            getattr(settings, "TWITCH_FARM_RUNTIME_DIR", settings.BASE_DIR / "runtime")
+        )
+        filename = f"{account.display_username}.pkl"
+        if Path(filename).name != filename:
+            raise ValueError("Twitch username cannot identify a safe cookie file.")
+        cookie_dir = runtime_dir / "cookies"
+        cookie = cookie_dir / filename
+        if cookie_dir.is_symlink() or cookie.is_symlink():
+            raise ValueError("Runtime cookie storage cannot use symbolic links.")
+        if cookie.exists():
+            cookie.unlink()
+        AccountSessionSeed.objects.filter(account=account).delete()
+
+    def authenticate_account(
+        self,
+        account: MinerAccount,
+        *,
+        command_id: int,
+    ) -> ManagedProcess:
+        """Stop the miner, clear its session, and launch one explicit TV handshake."""
+
+        run = services.create_launch_snapshot(
+            account,
+            worker_id=self.worker_id,
+            reset_session=True,
+        )
+        try:
+            self.stop_account(
+                account,
+                reason=MinerRun.StopReason.AUTHENTICATION_RESET,
+                preserve_desired=True,
+                final_observed=MinerInstanceState.ObservedState.STARTING,
+                except_command_id=command_id,
+            )
+            self._remove_runtime_session(account)
+            state, _ = MinerInstanceState.objects.get_or_create(account=account)
+            state.authentication_status = MinerInstanceState.AuthenticationStatus.UNLINKED
+            state.authentication_uri = ""
+            state.authentication_code = ""
+            state.authentication_expires_at = None
+            state.authentication_error = ""
+            state.authentication_updated_at = self.now()
+            state.save(
+                update_fields=(
+                    "authentication_status",
+                    "authentication_uri",
+                    "authentication_code",
+                    "authentication_expires_at",
+                    "authentication_error",
+                    "authentication_updated_at",
+                    "updated_at",
+                )
+            )
+            return self._spawn_snapshot_if_desired_running(run, command_id=command_id)
+        except Exception as exc:
+            owned = self.processes.get(account.pk)
+            if owned is None or owned.run_id != run.pk:
+                self._finalize_or_remember(
+                    run_id=run.pk,
+                    account_id=run.account_id,
+                    returncode=None,
+                    reason=MinerRun.StopReason.AUTHENTICATION_FAILED,
+                    error=exc,
+                )
+            raise
 
     def process_pending_commands(self, *, limit: int = 100) -> int:
         processed = 0
@@ -960,6 +1133,8 @@ class MinerSupervisor:
                     source_mode=run.source_mode,
                     source_name=run.source_name,
                     channels=run.channels,
+                    auth_method=run.auth_method,
+                    reset_session=run.reset_session,
                 )
                 if restart_attempt_id is not None:
                     log_writer.lifecycle(
@@ -1050,6 +1225,18 @@ class MinerSupervisor:
             command_id=command_id,
             restart_attempt_id=restart_attempt_id,
             log_writer=log_writer,
+            auth_required=(
+                self.options.require_authentication_events
+                or run.auth_method == AccountCredential.AuthMethod.TWITCH_TV
+            ),
+            authentication_deadline=(
+                self.monotonic() + self.options.authentication_handshake_seconds
+                if (
+                    self.options.require_authentication_events
+                    or run.auth_method == AccountCredential.AuthMethod.TWITCH_TV
+                )
+                else None
+            ),
         )
         # Register ownership immediately after Popen. If any following database
         # write fails, cleanup can still signal this exact child and a failed
@@ -1059,7 +1246,7 @@ class MinerSupervisor:
         if output_stream is not None:
             managed.output_thread = threading.Thread(
                 target=_drain_miner_output,
-                args=(output_stream, run.account.config_key, log_writer),
+                args=(output_stream, run.account.config_key, log_writer, managed.auth_events),
                 name=f"miner-log-{run.account_id}",
                 daemon=True,
             )
@@ -1552,6 +1739,13 @@ class MinerSupervisor:
         state.last_heartbeat = self.now()
         state.stable_since = None
         state.last_error = ""
+        if state.authentication_status == MinerInstanceState.AuthenticationStatus.PENDING:
+            state.authentication_status = MinerInstanceState.AuthenticationStatus.UNLINKED
+            state.authentication_uri = ""
+            state.authentication_code = ""
+            state.authentication_expires_at = None
+            state.authentication_error = ""
+            state.authentication_updated_at = self.now()
         state.observed_state = final_observed or (
             MinerInstanceState.ObservedState.UNKNOWN
             if preserve_desired
@@ -1565,6 +1759,12 @@ class MinerSupervisor:
                 "last_heartbeat",
                 "stable_since",
                 "last_error",
+                "authentication_status",
+                "authentication_uri",
+                "authentication_code",
+                "authentication_expires_at",
+                "authentication_error",
+                "authentication_updated_at",
                 "observed_state",
                 "updated_at",
             )
@@ -1964,6 +2164,12 @@ class MinerSupervisor:
             state.next_retry_at = None
             state.last_error = ""
             state.last_heartbeat = now
+            state.authentication_status = MinerInstanceState.AuthenticationStatus.AUTHENTICATED
+            state.authentication_uri = ""
+            state.authentication_code = ""
+            state.authentication_expires_at = None
+            state.authentication_error = ""
+            state.authentication_updated_at = now
             state.save(
                 update_fields=(
                     "observed_state",
@@ -1971,6 +2177,12 @@ class MinerSupervisor:
                     "next_retry_at",
                     "last_error",
                     "last_heartbeat",
+                    "authentication_status",
+                    "authentication_uri",
+                    "authentication_code",
+                    "authentication_expires_at",
+                    "authentication_error",
+                    "authentication_updated_at",
                     "updated_at",
                 )
             )
@@ -2027,6 +2239,107 @@ class MinerSupervisor:
         managed.confirmed = True
         managed.command_id = None
         managed.restart_attempt_id = None
+
+    def _consume_authentication_events(self, managed: ManagedProcess) -> str | None:
+        """Persist validated child events; return a terminal safe error when rejected."""
+
+        terminal_error = None
+        while True:
+            try:
+                event = managed.auth_events.get_nowait()
+            except queue.Empty:
+                break
+            kind = event["event"]
+            now = self.now()
+            state = MinerInstanceState.objects.get(account_id=managed.account_id)
+            if kind == "device_code":
+                expires_in = int(event["expires_in"])
+                state.authentication_status = MinerInstanceState.AuthenticationStatus.PENDING
+                state.authentication_uri = str(event["verification_uri"])
+                state.authentication_code = str(event["user_code"])
+                state.authentication_expires_at = now + timedelta(seconds=expires_in)
+                state.authentication_error = ""
+                state.authentication_updated_at = now
+                state.save(
+                    update_fields=(
+                        "authentication_status",
+                        "authentication_uri",
+                        "authentication_code",
+                        "authentication_expires_at",
+                        "authentication_error",
+                        "authentication_updated_at",
+                        "updated_at",
+                    )
+                )
+                managed.authentication_deadline = min(
+                    managed.authentication_deadline or float("inf"),
+                    self.monotonic() + expires_in,
+                )
+                self._write_managed_lifecycle(
+                    managed,
+                    "device_code",
+                    activation_url=state.authentication_uri,
+                    user_code=state.authentication_code,
+                    expires_at=state.authentication_expires_at.isoformat(),
+                )
+            elif kind == "authenticated":
+                managed.authenticated = True
+                state.authentication_status = MinerInstanceState.AuthenticationStatus.AUTHENTICATED
+                state.authentication_uri = ""
+                state.authentication_code = ""
+                state.authentication_expires_at = None
+                state.authentication_error = ""
+                state.authentication_updated_at = now
+                state.save(
+                    update_fields=(
+                        "authentication_status",
+                        "authentication_uri",
+                        "authentication_code",
+                        "authentication_expires_at",
+                        "authentication_error",
+                        "authentication_updated_at",
+                        "updated_at",
+                    )
+                )
+                self._write_managed_lifecycle(managed, "authenticated")
+            elif kind == "authentication_failed":
+                terminal_error = safe_error(event.get("error") or "Twitch authentication failed.")
+                break
+        return terminal_error
+
+    def _fail_authentication(self, managed: ManagedProcess, error: object) -> None:
+        safe = safe_error(error)
+        command_id = managed.command_id
+        self._write_managed_lifecycle(managed, "authentication_failed", error=safe)
+        state = MinerInstanceState.objects.get(account_id=managed.account_id)
+        state.desired_state = MinerInstanceState.DesiredState.STOPPED
+        state.authentication_status = MinerInstanceState.AuthenticationStatus.REAUTH_REQUIRED
+        state.authentication_uri = ""
+        state.authentication_code = ""
+        state.authentication_expires_at = None
+        state.authentication_error = safe
+        state.authentication_updated_at = self.now()
+        state.save(
+            update_fields=(
+                "desired_state",
+                "authentication_status",
+                "authentication_uri",
+                "authentication_code",
+                "authentication_expires_at",
+                "authentication_error",
+                "authentication_updated_at",
+                "updated_at",
+            )
+        )
+        managed.pending_stop_reason = MinerRun.StopReason.AUTHENTICATION_FAILED
+        self.stop_account(
+            state.account,
+            reason=MinerRun.StopReason.AUTHENTICATION_FAILED,
+            preserve_desired=False,
+            except_command_id=command_id,
+        )
+        if command_id:
+            self._finish_command(command_id, MinerCommand.Status.FAILED, safe)
 
     def _close_incident_for_intentional_stop(
         self,
@@ -2382,6 +2695,10 @@ class MinerSupervisor:
                 self._reconcile_required_cleanup(managed)
                 continue
             state = MinerInstanceState.objects.get(account_id=account_id)
+            authentication_error = self._consume_authentication_events(managed)
+            if authentication_error:
+                self._fail_authentication(managed, authentication_error)
+                continue
             if managed.pending_stop_reason:
                 # The child was already stopped intentionally, but the durable
                 # run-ending write failed. Retry that exact planned reason;
@@ -2409,10 +2726,28 @@ class MinerSupervisor:
                 continue
             returncode = managed.process.poll()
             if returncode is not None:
+                if managed.auth_required and not managed.authenticated:
+                    self._fail_authentication(
+                        managed,
+                        "The miner exited before Twitch authentication completed.",
+                    )
+                    continue
                 self._handle_unexpected_exit(managed, returncode)
                 continue
             if (
+                managed.auth_required
+                and not managed.authenticated
+                and managed.authentication_deadline is not None
+                and self.monotonic() >= managed.authentication_deadline
+            ):
+                self._fail_authentication(
+                    managed,
+                    "Twitch activation expired or the authentication handshake timed out.",
+                )
+                continue
+            if (
                 not managed.confirmed
+                and (not managed.auth_required or managed.authenticated)
                 and self.monotonic() - managed.spawned_monotonic
                 >= self.options.startup_grace_seconds
             ):

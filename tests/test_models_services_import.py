@@ -28,6 +28,7 @@ from controller.services import (
     get_account_password,
     normalize_channels,
     resolve_channels,
+    request_tv_authentication,
     save_preset,
     set_account_channel_selection,
     update_account,
@@ -123,6 +124,42 @@ def test_create_account_encrypts_credentials_and_sets_durable_start_intent():
     )
     assert password not in persisted_values
     assert "password" not in {field.name for field in MinerAccount._meta.get_fields()}
+
+
+@pytest.mark.django_db
+def test_passwordless_account_defaults_to_tv_login_and_authenticate_intent(farm_configuration):
+    account = create_account(
+        config_key="tv",
+        username="TvViewer",
+        start_after_save=True,
+    )
+
+    credential = AccountCredential.objects.get(account=account)
+    state = MinerInstanceState.objects.get(account=account)
+    command = MinerCommand.objects.get(account=account)
+    assert credential.auth_method == AccountCredential.AuthMethod.TWITCH_TV
+    assert credential.password_ciphertext == ""
+    assert state.authentication_status == MinerInstanceState.AuthenticationStatus.UNLINKED
+    assert command.action == MinerCommand.Action.AUTHENTICATE
+
+
+@pytest.mark.django_db
+def test_tv_switch_erases_password_and_supersedes_ordinary_commands(db_account):
+    account = db_account
+    enqueue_command(account, MinerCommand.Action.START)
+
+    command = request_tv_authentication(account)
+
+    account.credential.refresh_from_db()
+    assert account.credential.auth_method == AccountCredential.AuthMethod.TWITCH_TV
+    assert account.credential.password_ciphertext == ""
+    assert command.action == MinerCommand.Action.AUTHENTICATE
+    assert not MinerCommand.objects.filter(
+        account=account,
+        action=MinerCommand.Action.START,
+        status=MinerCommand.Status.QUEUED,
+    ).exists()
+    assert enqueue_command(account, MinerCommand.Action.RESTART).pk == command.pk
 
 
 @pytest.mark.django_db

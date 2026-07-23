@@ -4,12 +4,14 @@ import gzip
 import io
 import logging
 import os
+import queue
 import stat
 from unittest.mock import patch
 
 import pytest
 from django.test import override_settings
 
+from controller.miner_runner import CONTROL_EVENT_PREFIX
 from controller.miner_supervisor import _drain_miner_output
 from controller import runtime_logs
 from controller.runtime_logs import (
@@ -51,6 +53,62 @@ def test_miner_output_is_prefixed_redacted_and_emitted_once(caplog):
         'miner[primary] {"password": [redacted]}',
         "miner[primary] access_token=[redacted]",
     ]
+
+
+def test_miner_output_drops_debug_protocol_payloads_from_all_logs(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger="twitch_farm.miner_output")
+    path = tmp_path / "logs" / "farm.log"
+    with override_settings(TWITCH_FARM_LOG_FILE=path):
+        writer = AccountRunLogWriter(account_id=7, run_id=92, account_key="primary")
+        _drain_miner_output(
+            io.StringIO(
+                "2026-07-22 23:44:00,743 DEBUG TwitchChannelPointsMiner.classes.Twitch: Data: secret payload\n"
+                "22/07/26 23:44:00 - DEBUG - [send]: websocket payload\n"
+                "22/07/26 23:44:01 - INFO - [run]: [primary] Loading data\n"
+            ),
+            "primary",
+            writer,
+        )
+        writer.finalize("done")
+        page = read_run_log_page(account_id=7, run_id=92)
+
+    rendered = "\n".join(page["lines"])
+    assert "secret payload" not in rendered
+    assert "websocket payload" not in rendered
+    assert "Loading data" in rendered
+    assert [record.getMessage() for record in caplog.records] == [
+        "miner[primary] 22/07/26 23:44:01 - INFO - [run]: [primary] Loading data"
+    ]
+
+
+def test_control_events_are_validated_and_never_written_as_library_output(tmp_path, caplog):
+    path = tmp_path / "logs" / "farm.log"
+    events = queue.SimpleQueue()
+    with override_settings(TWITCH_FARM_LOG_FILE=path):
+        writer = AccountRunLogWriter(account_id=7, run_id=91, account_key="primary")
+        _drain_miner_output(
+            io.StringIO(
+                CONTROL_EVENT_PREFIX
+                + '{"event":"device_code","user_code":"ABCD-1234","verification_uri":"https://www.twitch.tv/activate","expires_in":1800}\n'
+                + CONTROL_EVENT_PREFIX
+                + '{"event":"authenticated","access_token":"must-not-pass"}\n'
+                + "\u001b[32mupstream info\u001b[0m\n"
+            ),
+            "primary",
+            writer,
+            events,
+        )
+        writer.finalize("done")
+        page = read_run_log_page(account_id=7, run_id=91)
+
+    event = events.get_nowait()
+    assert event["event"] == "device_code"
+    assert events.empty()
+    rendered = "\n".join(page["lines"])
+    assert "upstream info" in rendered
+    assert "INFO library account=primary run=91: upstream info" in rendered
+    assert "must-not-pass" not in rendered
+    assert "control_event_rejected" in rendered
 
 
 def test_runtime_log_tail_reads_rotation_in_order_and_bounds_output(tmp_path):

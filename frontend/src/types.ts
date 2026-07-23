@@ -68,6 +68,16 @@ export interface AccountSummary {
   username: string
   is_active: boolean
   has_credentials: boolean
+  authentication: {
+    method: "twitch_tv" | "legacy_password"
+    status: "unlinked" | "pending" | "authenticated" | "reauth_required"
+    activation_url: string
+    user_code: string
+    expires_at: string | null
+    error: string
+    updated_at: string | null
+    can_reconnect: boolean
+  }
   desired: "running" | "stopped"
   observed: RuntimeStatus
   source: ChannelSource
@@ -99,7 +109,7 @@ export interface Command {
   id: number
   account_id: number
   account_key: string
-  action: "start" | "stop" | "restart"
+  action: "start" | "stop" | "restart" | "authenticate"
   status: RuntimeStatus
   reason: string
   attempts: number
@@ -177,6 +187,8 @@ export interface AccountDetail extends AccountSummary {
     source_name: string
     channels: string[]
     channel_revision: number
+    auth_method: "twitch_tv" | "legacy_password"
+    reset_session: boolean
     pid: number | null
     started_at: string
     ended_at: string | null

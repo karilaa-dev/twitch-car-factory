@@ -43,6 +43,7 @@ import {
 } from "@/components/ui/select"
 import { Spinner } from "@/components/ui/spinner"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { api, formatTime, mutationError } from "@/lib/api"
 import type {
   AccountList,
@@ -55,6 +56,66 @@ import type {
 const LIVE_BUFFER_LINES = 2_000
 const COMBINED_SOURCE = "combined"
 const ALL_ACCOUNTS = "all"
+type LogKind = "all" | "worker" | "library"
+
+const LOG_KIND_LABELS: Record<LogKind, string> = {
+  all: "All output",
+  worker: "Worker",
+  library: "Twitch library",
+}
+
+function classifyLogLine(line: string): Exclude<LogKind, "all"> {
+  if (
+    /\s(?:TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL)\s+twitch_farm\.miner_output:/.test(
+      line
+    ) ||
+    /\s(?:TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL)\s+library\s+account=/.test(
+      line
+    )
+  ) {
+    return "library"
+  }
+  return "worker"
+}
+
+function libraryPayload(line: string) {
+  const archived = line.match(
+    /\s(?:TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL)\s+library\s+account=\S+\s+run=\S+:\s*(.*)$/
+  )
+  if (archived) return archived[1]
+
+  const combined = line.match(
+    /\s(?:TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL)\s+twitch_farm\.miner_output:\s+miner\[[^\]]+\]\s*(.*)$/
+  )
+  return combined?.[1] ?? line
+}
+
+function isReadableLibraryLine(line: string) {
+  const payload = libraryPayload(line)
+
+  // Older runs may contain the inherited Python root-handler copy as well as
+  // the miner's compact console copy. Hide that duplicate and all DEBUG/TRACE
+  // payloads while retaining compact INFO/WARNING/ERROR records and tracebacks.
+  if (
+    /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[,.]\d+)?\s+(?:TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL)\s+\S+:/.test(
+      payload
+    )
+  ) {
+    return false
+  }
+  return !/^\d{2}\/\d{2}(?:\/\d{2})?\s+\d{2}:\d{2}:\d{2}\s+-\s+(?:TRACE|DEBUG)\s+-/.test(
+    payload
+  )
+}
+
+function filterLogLines(lines: string[], kind: LogKind) {
+  if (kind === "all") return lines
+  return lines.filter(
+    (line) =>
+      classifyLogLine(line) === kind &&
+      (kind !== "library" || isReadableLibraryLine(line))
+  )
+}
 
 function accountSource(accountId: number) {
   return `account:${accountId}`
@@ -66,10 +127,14 @@ function sourceAccountId(source: string): number | null {
   return Number.isInteger(value) && value > 0 ? value : null
 }
 
-function withQuery(path: string, values: Record<string, string | number | null | undefined>) {
+function withQuery(
+  path: string,
+  values: Record<string, string | number | null | undefined>
+) {
   const query = new URLSearchParams()
   for (const [key, value] of Object.entries(values)) {
-    if (value !== null && value !== undefined && value !== "") query.set(key, String(value))
+    if (value !== null && value !== undefined && value !== "")
+      query.set(key, String(value))
   }
   const encoded = query.toString()
   return encoded ? `${path}?${encoded}` : path
@@ -83,9 +148,13 @@ function formatBytes(bytes: number) {
 
 function formatDuration(startedAt: string, endedAt: string | null) {
   if (!endedAt) return "Still running"
-  const seconds = Math.max(0, (new Date(endedAt).getTime() - new Date(startedAt).getTime()) / 1000)
+  const seconds = Math.max(
+    0,
+    (new Date(endedAt).getTime() - new Date(startedAt).getTime()) / 1000
+  )
   if (seconds < 60) return `${Math.round(seconds)}s`
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`
+  if (seconds < 3600)
+    return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`
   const hours = Math.floor(seconds / 3600)
   const minutes = Math.floor((seconds % 3600) / 60)
   return `${hours}h ${minutes}m`
@@ -120,6 +189,7 @@ export function LogsPage() {
     refetchInterval: 10_000,
   })
   const [liveSource, setLiveSource] = React.useState(COMBINED_SOURCE)
+  const [logKind, setLogKind] = React.useState<LogKind>("all")
 
   if (accounts.isLoading) return <PageSkeleton />
   if (!accounts.data)
@@ -128,7 +198,8 @@ export function LogsPage() {
         <AlertTriangle />
         <AlertTitle>Logs unavailable</AlertTitle>
         <AlertDescription>
-          Account sources could not be loaded. Refresh before inspecting farmer output.
+          Account sources could not be loaded. Refresh before inspecting farmer
+          output.
         </AlertDescription>
       </Alert>
     )
@@ -140,27 +211,63 @@ export function LogsPage() {
         description="Live farmer telemetry and compressed, per-account run archives."
       />
       <Tabs defaultValue="live">
-        <TabsList variant="line">
-          <TabsTrigger value="live">
-            <Radio /> Live
-          </TabsTrigger>
-          <TabsTrigger value="history">
-            <History /> History
-          </TabsTrigger>
-        </TabsList>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <TabsList variant="line">
+            <TabsTrigger value="live">
+              <Radio /> Live
+            </TabsTrigger>
+            <TabsTrigger value="history">
+              <History /> History
+            </TabsTrigger>
+          </TabsList>
+          <LogKindFilter value={logKind} onValueChange={setLogKind} />
+        </div>
         <TabsContent value="live">
           <LiveLogs
             key={liveSource}
             accounts={accounts.data}
             source={liveSource}
             onSourceChange={setLiveSource}
+            logKind={logKind}
           />
         </TabsContent>
         <TabsContent value="history">
-          <LogHistory accounts={accounts.data} />
+          <LogHistory accounts={accounts.data} logKind={logKind} />
         </TabsContent>
       </Tabs>
     </>
+  )
+}
+
+function LogKindFilter({
+  value,
+  onValueChange,
+}: {
+  value: LogKind
+  onValueChange: (value: LogKind) => void
+}) {
+  return (
+    <ToggleGroup
+      aria-label="Log source type"
+      value={[value]}
+      onValueChange={(values) => {
+        const next = values[0] as LogKind | undefined
+        if (next) onValueChange(next)
+      }}
+      variant="outline"
+      className="grid w-full grid-cols-3 sm:w-auto"
+    >
+      {(Object.keys(LOG_KIND_LABELS) as LogKind[]).map((kind) => (
+        <ToggleGroupItem
+          key={kind}
+          value={kind}
+          aria-label={`Show ${LOG_KIND_LABELS[kind]} logs`}
+          className="min-h-11 px-2 text-xs sm:min-h-8 sm:px-3"
+        >
+          {LOG_KIND_LABELS[kind]}
+        </ToggleGroupItem>
+      ))}
+    </ToggleGroup>
   )
 }
 
@@ -180,10 +287,17 @@ function SourceSelect({
   const items = Object.fromEntries([
     ...(includeCombined ? [[COMBINED_SOURCE, "All farm activity"]] : []),
     ...(includeAll ? [[ALL_ACCOUNTS, "All accounts"]] : []),
-    ...accounts.accounts.map((account) => [accountSource(account.id), account.username]),
+    ...accounts.accounts.map((account) => [
+      accountSource(account.id),
+      account.username,
+    ]),
   ])
   return (
-    <Select items={items} value={value} onValueChange={(next) => next && onValueChange(next)}>
+    <Select
+      items={items}
+      value={value}
+      onValueChange={(next) => next && onValueChange(next)}
+    >
       <SelectTrigger aria-label="Log account" className="w-full sm:w-64">
         <SelectValue />
       </SelectTrigger>
@@ -192,11 +306,15 @@ function SourceSelect({
           {includeCombined ? (
             <SelectItem value={COMBINED_SOURCE}>All farm activity</SelectItem>
           ) : null}
-          {includeAll ? <SelectItem value={ALL_ACCOUNTS}>All accounts</SelectItem> : null}
+          {includeAll ? (
+            <SelectItem value={ALL_ACCOUNTS}>All accounts</SelectItem>
+          ) : null}
           {accounts.accounts.map((account) => (
             <SelectItem key={account.id} value={accountSource(account.id)}>
               <span>{account.username}</span>
-              {!account.is_active ? <span className="text-muted-foreground">archived</span> : null}
+              {!account.is_active ? (
+                <span className="text-muted-foreground">archived</span>
+              ) : null}
             </SelectItem>
           ))}
         </SelectGroup>
@@ -209,10 +327,12 @@ function LiveLogs({
   accounts,
   source,
   onSourceChange,
+  logKind,
 }: {
   accounts: AccountList
   source: string
   onSourceChange: (value: string) => void
+  logKind: LogKind
 }) {
   const accountId = sourceAccountId(source)
   const rootRef = React.useRef<HTMLDivElement>(null)
@@ -227,7 +347,11 @@ function LiveLogs({
     before: string | null
   } | null>(null)
   const [loadingOlder, setLoadingOlder] = React.useState(false)
-  const hasLines = lines.length > 0
+  const visibleLines = React.useMemo(
+    () => filterLogLines(lines, logKind),
+    [lines, logKind]
+  )
+  const hasLines = visibleLines.length > 0
   const live = useQuery({
     queryKey: ["logs", "live", source],
     queryFn: () =>
@@ -241,7 +365,10 @@ function LiveLogs({
   })
 
   const viewport = React.useCallback(
-    () => rootRef.current?.querySelector<HTMLElement>("[data-slot='scroll-area-viewport']") ?? null,
+    () =>
+      rootRef.current?.querySelector<HTMLElement>(
+        "[data-slot='scroll-area-viewport']"
+      ) ?? null,
     []
   )
   const scrollToBottom = React.useCallback(() => {
@@ -256,7 +383,8 @@ function LiveLogs({
     const element = viewport()
     if (!element) return
     const onScroll = () => {
-      pinnedRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 24
+      pinnedRef.current =
+        element.scrollHeight - element.scrollTop - element.clientHeight < 24
     }
     element.addEventListener("scroll", onScroll, { passive: true })
     return () => element.removeEventListener("scroll", onScroll)
@@ -284,12 +412,14 @@ function LiveLogs({
 
   React.useLayoutEffect(() => {
     if (pinnedRef.current) scrollToBottom()
-  }, [lines, scrollToBottom])
+  }, [visibleLines, scrollToBottom])
 
   const loadOlder = async () => {
     const runId = live.data?.run_id
     const currentOlderState =
-      !olderStateInvalidatedRef.current && olderState?.runId === runId ? olderState : null
+      !olderStateInvalidatedRef.current && olderState?.runId === runId
+        ? olderState
+        : null
     const continuingOlderView = currentOlderState !== null
     const olderBefore = currentOlderState?.before
     if (!runId || olderBefore === null) return
@@ -310,7 +440,10 @@ function LiveLogs({
       viewingOlderRef.current = true
       setLines((current) => {
         if (!continuingOlderView) return loadedLines.slice(-LIVE_BUFFER_LINES)
-        return mergeWithOverlap(loadedLines, current).slice(0, LIVE_BUFFER_LINES)
+        return mergeWithOverlap(loadedLines, current).slice(
+          0,
+          LIVE_BUFFER_LINES
+        )
       })
       olderStateInvalidatedRef.current = false
       setOlderState({ runId, before: page.before })
@@ -351,7 +484,9 @@ function LiveLogs({
             Live stream
           </CardTitle>
           <CardDescription>
-            {sourceLabel} · two-second incremental tail · {lines.length.toLocaleString()} buffered lines
+            {sourceLabel} · {LOG_KIND_LABELS[logKind]} · two-second incremental
+            tail · {visibleLines.length.toLocaleString()} shown /{" "}
+            {lines.length.toLocaleString()} buffered
           </CardDescription>
         </div>
         <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto sm:flex-nowrap">
@@ -361,7 +496,9 @@ function LiveLogs({
             onValueChange={onSourceChange}
             includeCombined
           />
-          {live.data ? <StatusBadge status={live.data.supervisor.status} /> : null}
+          {live.data ? (
+            <StatusBadge status={live.data.supervisor.status} />
+          ) : null}
           <Button
             variant="ghost"
             size="icon-sm"
@@ -386,7 +523,8 @@ function LiveLogs({
             <AlertTriangle />
             <AlertTitle>Live stream interrupted</AlertTitle>
             <AlertDescription>
-              The current tail could not be refreshed. Archived files remain untouched.
+              The current tail could not be refreshed. Archived files remain
+              untouched.
             </AlertDescription>
           </Alert>
         ) : null}
@@ -395,7 +533,8 @@ function LiveLogs({
             <RefreshCw />
             <AlertTitle>Tail position refreshed</AlertTitle>
             <AlertDescription>
-              Rotation replaced the live cursor, so the console resumed from the newest retained lines.
+              Rotation replaced the live cursor, so the console resumed from the
+              newest retained lines.
             </AlertDescription>
           </Alert>
         ) : null}
@@ -406,7 +545,7 @@ function LiveLogs({
                 className="min-w-max p-3 font-mono text-xs leading-relaxed"
                 aria-label="Live farmer log lines"
               >
-                {lines.join("\n")}
+                {visibleLines.join("\n")}
               </pre>
             </ScrollArea>
           </div>
@@ -416,21 +555,38 @@ function LiveLogs({
               <EmptyMedia variant="icon">
                 <FileText />
               </EmptyMedia>
-              <EmptyTitle>{accountId ? "No active farmer log" : "No live log lines"}</EmptyTitle>
+              <EmptyTitle>
+                {lines.length
+                  ? `No ${LOG_KIND_LABELS[logKind].toLowerCase()} lines in this buffer`
+                  : accountId
+                    ? "No active farmer log"
+                    : "No live log lines"}
+              </EmptyTitle>
               <EmptyDescription>
-                {accountId
-                  ? "This account is stopped or its current run has not emitted output yet."
-                  : "The worker-owned combined log is empty or unavailable."}
+                {lines.length
+                  ? "Choose another output type or wait for matching activity. Cursor polling continues in the background."
+                  : accountId
+                    ? "This account is stopped or its current run has not emitted output yet."
+                    : "The worker-owned combined log is empty or unavailable."}
               </EmptyDescription>
             </EmptyHeader>
           </Empty>
         )}
         {accountId &&
         live.data?.run_id &&
-        (olderState?.runId !== live.data.run_id || olderState.before !== null) ? (
+        (olderState?.runId !== live.data.run_id ||
+          olderState.before !== null) ? (
           <div className="flex justify-start">
-            <Button variant="outline" onClick={loadOlder} disabled={loadingOlder}>
-              {loadingOlder ? <Spinner data-icon="inline-start" /> : <Archive data-icon="inline-start" />}
+            <Button
+              variant="outline"
+              onClick={loadOlder}
+              disabled={loadingOlder}
+            >
+              {loadingOlder ? (
+                <Spinner data-icon="inline-start" />
+              ) : (
+                <Archive data-icon="inline-start" />
+              )}
               Load older lines from this run
             </Button>
           </div>
@@ -440,7 +596,13 @@ function LiveLogs({
   )
 }
 
-function LogHistory({ accounts }: { accounts: AccountList }) {
+function LogHistory({
+  accounts,
+  logKind,
+}: {
+  accounts: AccountList
+  logKind: LogKind
+}) {
   const [filter, setFilter] = React.useState(ALL_ACCOUNTS)
   const [selectedRunId, setSelectedRunId] = React.useState<number | null>(null)
   const accountId = sourceAccountId(filter)
@@ -472,7 +634,8 @@ function LogHistory({ accounts }: { accounts: AccountList }) {
         <CardHeader>
           <CardTitle>Run archive</CardTitle>
           <CardDescription>
-            Completed farmer runs, newest first. Each account retains up to 50 MiB compressed.
+            Completed farmer runs, newest first. Each account retains up to 50
+            MiB compressed.
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col gap-3">
@@ -486,7 +649,9 @@ function LogHistory({ accounts }: { accounts: AccountList }) {
             <Alert variant="destructive">
               <AlertTriangle />
               <AlertTitle>History unavailable</AlertTitle>
-              <AlertDescription>The retained run index could not be loaded.</AlertDescription>
+              <AlertDescription>
+                The retained run index could not be loaded.
+              </AlertDescription>
             </Alert>
           ) : null}
           {history.isLoading ? (
@@ -526,14 +691,15 @@ function LogHistory({ accounts }: { accounts: AccountList }) {
                 </EmptyMedia>
                 <EmptyTitle>No archived runs</EmptyTitle>
                 <EmptyDescription>
-                  Per-account history begins after the updated worker starts a farmer.
+                  Per-account history begins after the updated worker starts a
+                  farmer.
                 </EmptyDescription>
               </EmptyHeader>
             </Empty>
           )}
         </CardContent>
       </Card>
-      <RunArchiveViewer runId={effectiveSelectedRunId} />
+      <RunArchiveViewer runId={effectiveSelectedRunId} logKind={logKind} />
     </div>
   )
 }
@@ -550,28 +716,36 @@ function RunArchiveButton({
   return (
     <Button
       variant={selected ? "secondary" : "ghost"}
-      className="h-auto w-full justify-start px-3 py-3 text-left whitespace-normal"
+      className="h-auto w-full justify-start px-3 py-3 text-left whitespace-normal md:h-auto"
       onClick={onSelect}
+      data-log-run-id={run.run_id}
     >
       <span className="flex min-w-0 flex-1 flex-col gap-1.5">
         <span className="flex items-start justify-between gap-3">
-          <span className="min-w-0 truncate font-medium">{run.account.username}</span>
-          <span className="shrink-0 font-mono text-xs text-muted-foreground">#{run.run_id}</span>
+          <span className="min-w-0 truncate font-medium">
+            {run.account.username}
+          </span>
+          <span className="shrink-0 font-mono text-xs text-muted-foreground">
+            #{run.run_id}
+          </span>
         </span>
-        <span className="font-mono text-xs text-muted-foreground">{run.account.config_key}</span>
+        <span className="font-mono text-xs text-muted-foreground">
+          {run.account.config_key}
+        </span>
         <span className="text-xs text-muted-foreground">
           {formatTime(run.started_at)}–{formatTime(run.ended_at)} ·{" "}
           {formatDuration(run.started_at, run.ended_at)}
         </span>
-        <span className="text-xs text-muted-foreground">
-          {runOutcome(run)}
-        </span>
+        <span className="text-xs text-muted-foreground">{runOutcome(run)}</span>
         <span className="flex flex-wrap gap-1.5">
           <Badge variant="outline">{formatBytes(run.compressed_bytes)}</Badge>
           <Badge variant="outline">
-            {run.compressed_parts} {run.compressed_parts === 1 ? "part" : "parts"}
+            {run.compressed_parts}{" "}
+            {run.compressed_parts === 1 ? "part" : "parts"}
           </Badge>
-          {run.truncated ? <Badge variant="destructive">earlier lines expired</Badge> : null}
+          {run.truncated ? (
+            <Badge variant="destructive">earlier lines expired</Badge>
+          ) : null}
           {run.archive_state === "compression_pending" ? (
             <Badge variant="secondary">compression pending</Badge>
           ) : null}
@@ -581,20 +755,35 @@ function RunArchiveButton({
   )
 }
 
-function RunArchiveViewer({ runId }: { runId: number | null }) {
+function RunArchiveViewer({
+  runId,
+  logKind,
+}: {
+  runId: number | null
+  logKind: LogKind
+}) {
   const detail = useInfiniteQuery({
     queryKey: ["logs", "run", runId],
     queryFn: ({ pageParam }) =>
-      api<LogRunDetail>(withQuery(`/logs/runs/${runId}`, { before: pageParam })),
+      api<LogRunDetail>(
+        withQuery(`/logs/runs/${runId}`, { before: pageParam })
+      ),
     initialPageParam: null as string | null,
     getNextPageParam: (page) => page.before ?? undefined,
     enabled: runId !== null,
   })
-  const pages = React.useMemo(() => detail.data?.pages ?? [], [detail.data?.pages])
+  const pages = React.useMemo(
+    () => detail.data?.pages ?? [],
+    [detail.data?.pages]
+  )
   const run = pages[0]?.run
   const lines = React.useMemo(
     () => [...pages].reverse().flatMap((page) => page.lines),
     [pages]
+  )
+  const visibleLines = React.useMemo(
+    () => filterLogLines(lines, logKind),
+    [lines, logKind]
   )
 
   if (runId === null)
@@ -607,7 +796,9 @@ function RunArchiveViewer({ runId }: { runId: number | null }) {
                 <FileText />
               </EmptyMedia>
               <EmptyTitle>Select a run</EmptyTitle>
-              <EmptyDescription>Choose an archived run to inspect its retained lines.</EmptyDescription>
+              <EmptyDescription>
+                Choose an archived run to inspect its retained lines.
+              </EmptyDescription>
             </EmptyHeader>
           </Empty>
         </CardContent>
@@ -620,7 +811,9 @@ function RunArchiveViewer({ runId }: { runId: number | null }) {
       <Alert variant="destructive">
         <AlertTriangle />
         <AlertTitle>Run log unavailable</AlertTitle>
-        <AlertDescription>The selected archive could not be opened.</AlertDescription>
+        <AlertDescription>
+          The selected archive could not be opened.
+        </AlertDescription>
       </Alert>
     )
 
@@ -632,12 +825,15 @@ function RunArchiveViewer({ runId }: { runId: number | null }) {
             {run.account.username} · run #{run.run_id}
           </CardTitle>
           <CardDescription>
-            {formatTime(run.started_at)}–{formatTime(run.ended_at)} · {runOutcome(run)} ·{" "}
-            {formatBytes(run.compressed_bytes)}
+            {formatTime(run.started_at)}–{formatTime(run.ended_at)} ·{" "}
+            {runOutcome(run)} · {formatBytes(run.compressed_bytes)} ·{" "}
+            {LOG_KIND_LABELS[logKind]}
           </CardDescription>
         </div>
         <div className="flex flex-wrap items-center gap-2 sm:shrink-0">
-          {run.truncated ? <Badge variant="destructive">partial retention</Badge> : null}
+          {run.truncated ? (
+            <Badge variant="destructive">partial retention</Badge>
+          ) : null}
           {run.downloadable ? (
             <Button
               variant="outline"
@@ -662,7 +858,8 @@ function RunArchiveViewer({ runId }: { runId: number | null }) {
             <Archive />
             <AlertTitle>Earlier lines expired</AlertTitle>
             <AlertDescription>
-              This run crossed the account retention boundary. The viewer and download contain the retained suffix.
+              This run crossed the account retention boundary. The viewer and
+              download contain the retained suffix.
             </AlertDescription>
           </Alert>
         ) : null}
@@ -682,13 +879,13 @@ function RunArchiveViewer({ runId }: { runId: number | null }) {
             </Button>
           </div>
         ) : null}
-        {lines.length ? (
+        {visibleLines.length ? (
           <ScrollArea className="h-[min(64dvh,44rem)] rounded-lg border bg-muted/30">
             <pre
               className="min-w-max p-3 font-mono text-xs leading-relaxed"
               aria-label="Archived farmer log lines"
             >
-              {lines.join("\n")}
+              {visibleLines.join("\n")}
             </pre>
           </ScrollArea>
         ) : (
@@ -697,8 +894,16 @@ function RunArchiveViewer({ runId }: { runId: number | null }) {
               <EmptyMedia variant="icon">
                 <FileText />
               </EmptyMedia>
-              <EmptyTitle>Archive contains no lines</EmptyTitle>
-              <EmptyDescription>The run record exists, but no readable log lines remain.</EmptyDescription>
+              <EmptyTitle>
+                {lines.length
+                  ? `No ${LOG_KIND_LABELS[logKind].toLowerCase()} lines in this archive`
+                  : "Archive contains no lines"}
+              </EmptyTitle>
+              <EmptyDescription>
+                {lines.length
+                  ? "Choose another output type to inspect the retained run."
+                  : "The run record exists, but no readable log lines remain."}
+              </EmptyDescription>
             </EmptyHeader>
             <EmptyContent>
               <Badge variant="outline">run #{run.run_id}</Badge>
