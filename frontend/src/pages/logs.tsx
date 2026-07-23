@@ -78,16 +78,23 @@ function classifyLogLine(line: string): Exclude<LogKind, "all"> {
   return "worker"
 }
 
-function libraryPayload(line: string) {
+function parseLibraryLine(line: string) {
   const archived = line.match(
-    /\s(?:TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL)\s+library\s+account=\S+\s+run=\S+:\s*(.*)$/
+    /\s(?:TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL)\s+library\s+account=(\S+)\s+run=\S+:\s*(.*)$/
   )
-  if (archived) return archived[1]
+  if (archived)
+    return { account: archived[1], payload: archived[2], combined: false }
 
   const combined = line.match(
-    /\s(?:TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL)\s+twitch_farm\.miner_output:\s+miner\[[^\]]+\]\s*(.*)$/
+    /\s(?:TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL)\s+twitch_farm\.miner_output:\s+miner\[([^\]]+)\]\s*(.*)$/
   )
-  return combined?.[1] ?? line
+  if (combined)
+    return { account: combined[1], payload: combined[2], combined: true }
+  return null
+}
+
+function libraryPayload(line: string) {
+  return parseLibraryLine(line)?.payload ?? line
 }
 
 function isReadableLibraryLine(line: string) {
@@ -109,12 +116,24 @@ function isReadableLibraryLine(line: string) {
 }
 
 function filterLogLines(lines: string[], kind: LogKind) {
-  if (kind === "all") return lines
-  return lines.filter(
+  const readable = lines.filter(
     (line) =>
-      classifyLogLine(line) === kind &&
-      (kind !== "library" || isReadableLibraryLine(line))
+      classifyLogLine(line) !== "library" || isReadableLibraryLine(line)
   )
+  if (kind === "all") return readable
+  return readable.filter((line) => classifyLogLine(line) === kind)
+}
+
+function formatLogLine(line: string) {
+  const parsed = parseLibraryLine(line)
+  if (!parsed) return line
+  return parsed.combined
+    ? `${parsed.account} · ${parsed.payload}`
+    : parsed.payload
+}
+
+function visibleLogLines(lines: string[], kind: LogKind) {
+  return filterLogLines(lines, kind).map(formatLogLine)
 }
 
 function accountSource(accountId: number) {
@@ -158,6 +177,33 @@ function formatDuration(startedAt: string, endedAt: string | null) {
   const hours = Math.floor(seconds / 3600)
   const minutes = Math.floor((seconds % 3600) / 60)
   return `${hours}h ${minutes}m`
+}
+
+const compactDateTimeFormatter = new Intl.DateTimeFormat(undefined, {
+  month: "short",
+  day: "numeric",
+  hour: "numeric",
+  minute: "2-digit",
+})
+
+const compactTimeFormatter = new Intl.DateTimeFormat(undefined, {
+  hour: "numeric",
+  minute: "2-digit",
+})
+
+function formatRunWindow(startedAt: string, endedAt: string | null) {
+  const started = new Date(startedAt)
+  if (!endedAt) return `${compactDateTimeFormatter.format(started)}–now`
+
+  const ended = new Date(endedAt)
+  const sameDay =
+    started.getFullYear() === ended.getFullYear() &&
+    started.getMonth() === ended.getMonth() &&
+    started.getDate() === ended.getDate()
+
+  return sameDay
+    ? `${compactDateTimeFormatter.format(started)}–${compactTimeFormatter.format(ended)}`
+    : `${compactDateTimeFormatter.format(started)}–${compactDateTimeFormatter.format(ended)}`
 }
 
 function runOutcome(run: LogRunSummary) {
@@ -348,7 +394,7 @@ function LiveLogs({
   } | null>(null)
   const [loadingOlder, setLoadingOlder] = React.useState(false)
   const visibleLines = React.useMemo(
-    () => filterLogLines(lines, logKind),
+    () => visibleLogLines(lines, logKind),
     [lines, logKind]
   )
   const hasLines = visibleLines.length > 0
@@ -397,7 +443,7 @@ function LiveLogs({
     const newest = (
       replace
         ? live.data.lines
-        : [...newestLinesRef.current, ...live.data.lines]
+        : mergeWithOverlap(newestLinesRef.current, live.data.lines)
     ).slice(-LIVE_BUFFER_LINES)
     newestLinesRef.current = newest
     if (replace) {
@@ -716,38 +762,60 @@ function RunArchiveButton({
   return (
     <Button
       variant={selected ? "secondary" : "ghost"}
-      className="h-auto w-full justify-start px-3 py-3 text-left whitespace-normal md:h-auto"
+      className={`h-auto min-h-0 w-full justify-start overflow-hidden rounded-md px-2.5 py-1.5 text-left whitespace-normal md:h-auto ${
+        selected ? "border-l-primary border-l-2" : "border-l-2"
+      }`}
       onClick={onSelect}
       data-log-run-id={run.run_id}
     >
-      <span className="flex min-w-0 flex-1 flex-col gap-1.5">
-        <span className="flex items-start justify-between gap-3">
-          <span className="min-w-0 truncate font-medium">
+      <span className="grid min-w-0 flex-1 grid-cols-[minmax(0,1fr)_auto] gap-x-2 gap-y-0.5">
+        <span className="flex min-w-0 items-baseline gap-1.5 overflow-hidden leading-4">
+          <span className="max-w-[50%] shrink-0 truncate text-sm font-medium">
             {run.account.username}
           </span>
-          <span className="shrink-0 font-mono text-xs text-muted-foreground">
-            #{run.run_id}
+          <span aria-hidden="true" className="text-muted-foreground">
+            ·
+          </span>
+          <span
+            className="min-w-0 truncate text-[11px] text-muted-foreground"
+            title={runOutcome(run)}
+          >
+            {runOutcome(run)}
           </span>
         </span>
-        <span className="font-mono text-xs text-muted-foreground">
-          {run.account.config_key}
+        <span className="shrink-0 font-mono text-[11px] leading-4 text-muted-foreground">
+          #{run.run_id}
         </span>
-        <span className="text-xs text-muted-foreground">
-          {formatTime(run.started_at)}–{formatTime(run.ended_at)} ·{" "}
-          {formatDuration(run.started_at, run.ended_at)}
-        </span>
-        <span className="text-xs text-muted-foreground">{runOutcome(run)}</span>
-        <span className="flex flex-wrap gap-1.5">
-          <Badge variant="outline">{formatBytes(run.compressed_bytes)}</Badge>
-          <Badge variant="outline">
-            {run.compressed_parts}{" "}
-            {run.compressed_parts === 1 ? "part" : "parts"}
-          </Badge>
+        <span className="col-span-2 flex min-w-0 items-center gap-1 overflow-hidden text-[11px] leading-4 text-muted-foreground">
+          <span
+            className="min-w-0 truncate"
+            title={`${formatTime(run.started_at)}–${formatTime(run.ended_at)}`}
+          >
+            {formatRunWindow(run.started_at, run.ended_at)}
+          </span>
+          <span aria-hidden="true">·</span>
+          <span className="shrink-0">
+            {formatDuration(run.started_at, run.ended_at)}
+          </span>
+          <span aria-hidden="true">·</span>
+          <span className="shrink-0">{formatBytes(run.compressed_bytes)}</span>
+          <span aria-hidden="true">·</span>
+          <span className="shrink-0">{run.compressed_parts}p</span>
           {run.truncated ? (
-            <Badge variant="destructive">earlier lines expired</Badge>
+            <Badge
+              variant="destructive"
+              className="h-3.5 shrink-0 px-1 text-[9px]"
+            >
+              truncated
+            </Badge>
           ) : null}
           {run.archive_state === "compression_pending" ? (
-            <Badge variant="secondary">compression pending</Badge>
+            <Badge
+              variant="secondary"
+              className="h-3.5 shrink-0 px-1 text-[9px]"
+            >
+              pending
+            </Badge>
           ) : null}
         </span>
       </span>
@@ -782,7 +850,7 @@ function RunArchiveViewer({
     [pages]
   )
   const visibleLines = React.useMemo(
-    () => filterLogLines(lines, logKind),
+    () => visibleLogLines(lines, logKind),
     [lines, logKind]
   )
 

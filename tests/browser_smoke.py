@@ -76,6 +76,21 @@ def assert_log_run_cards_do_not_overlap(page: Page, label: str) -> None:
         )
 
 
+def assert_log_run_cards_are_compact(page: Page, label: str) -> None:
+    cards = page.locator("[data-log-run-id]").evaluate_all(
+        """
+        elements => elements.map(element => ({
+          id: element.dataset.logRunId,
+          height: element.getBoundingClientRect().height,
+        }))
+        """
+    )
+    for card in cards:
+        assert 43.5 <= card["height"] <= 56, (
+            f"{label} run card {card['id']} is {card['height']}px tall"
+        )
+
+
 def assert_no_browser_errors(
     console_errors: list[str], page_errors: list[str]
 ) -> None:
@@ -184,12 +199,19 @@ def main() -> None:
             ).click()
             page.get_by_text("Twitch library", exact=True).first.wait_for()
             assert_no_horizontal_overflow(page, "Desktop log source filters")
+            live_console = page.get_by_label("Live farmer log lines")
+            if live_console.count():
+                assert "twitch_farm.miner_output" not in live_console.inner_text()
             page.screenshot(
                 path=args.output / "logs-filter-desktop.png", full_page=True
             )
             page.get_by_role("tab", name="History").click()
             page.get_by_text("Run archive", exact=True).wait_for()
             assert_log_run_cards_do_not_overlap(page, "Desktop log history")
+            assert_log_run_cards_are_compact(page, "Desktop log history")
+            archived_console = page.get_by_label("Archived farmer log lines")
+            if archived_console.count():
+                assert " INFO library account=" not in archived_console.inner_text()
             page.screenshot(
                 path=args.output / "logs-history-desktop.png", full_page=True
             )
@@ -197,6 +219,7 @@ def main() -> None:
                 page.set_viewport_size({"width": width, "height": 900})
                 assert_no_horizontal_overflow(page, f"Log source filters {width}px")
                 assert_log_run_cards_do_not_overlap(page, f"Log history {width}px")
+                assert_log_run_cards_are_compact(page, f"Log history {width}px")
                 page.screenshot(
                     path=args.output / f"logs-history-{width}.png", full_page=True
                 )

@@ -222,6 +222,32 @@ describe("LogsPage", () => {
     ).not.toBeInTheDocument()
   }, 15_000)
 
+  it("does not append a repeated cursorless snapshot from the query cache", async () => {
+    const user = userEvent.setup()
+    let liveCalls = 0
+    apiMock.mockImplementation((path: string) => {
+      if (path === "/accounts") return Promise.resolve(accounts)
+      if (path.startsWith("/logs")) {
+        liveCalls += 1
+        return Promise.resolve(
+          liveTail(["one-cached-line"], `cached-cursor-${liveCalls}`)
+        )
+      }
+      throw new Error(`Unexpected API path: ${path}`)
+    })
+
+    renderPage()
+    expect(await screen.findByText("one-cached-line")).toBeVisible()
+    await user.click(screen.getByRole("button", { name: "Refresh live logs" }))
+    await waitFor(() => expect(liveCalls).toBeGreaterThanOrEqual(2))
+
+    expect(
+      screen
+        .getByLabelText("Live farmer log lines")
+        .textContent?.match(/one-cached-line/g)
+    ).toHaveLength(1)
+  })
+
   it("keeps a 2,000-line live buffer and does not auto-follow after scrolling away", async () => {
     const user = userEvent.setup()
     let liveCalls = 0
@@ -372,12 +398,19 @@ describe("LogsPage", () => {
 
     renderPage()
     await user.click(await screen.findByRole("tab", { name: /History/ }))
-    expect(await screen.findByText("earlier lines expired")).toBeVisible()
+    expect(await screen.findByText("truncated")).toBeVisible()
     expect(await screen.findByText("newest-archived-line")).toBeVisible()
     expect(document.querySelector("[data-log-run-id='55']")).toHaveClass(
       "h-auto",
-      "md:h-auto"
+      "min-h-0",
+      "py-1.5"
     )
+    expect(document.querySelector("[data-log-run-id='55']")).not.toHaveClass(
+      "py-2"
+    )
+    expect(screen.getByText("unexpected exit · exit 1")).toBeVisible()
+    expect(screen.getByText("4.0 KiB")).toBeVisible()
+    expect(screen.getByText("2p")).toBeVisible()
     const download = screen.getByRole("link", { name: /Download gzip/ })
     expect(download).toHaveAttribute("href", "/api/v1/logs/runs/55/download")
 
@@ -394,7 +427,7 @@ describe("LogsPage", () => {
     const combinedWorker =
       "2026-07-22 10:00:00 INFO controller.miner_supervisor: worker-event"
     const combinedLibrary =
-      "2026-07-22 10:00:01 INFO twitch_farm.miner_output: miner[primary] library-event"
+      "2026-07-22 10:00:01 INFO twitch_farm.miner_output: miner[primary] 22/07/26 10:00:01 - INFO - [run]: [Primary Farmer] library-event"
     const combinedLibraryDebug =
       "2026-07-22 10:00:01 INFO twitch_farm.miner_output: miner[primary] 2026-07-22 10:00:01,123 DEBUG urllib3.connectionpool: protocol-noise"
     const combinedLibraryDuplicate =
@@ -402,7 +435,7 @@ describe("LogsPage", () => {
     const archivedWorker =
       "2026-07-22T10:00:00.000Z INFO lifecycle account=primary run=55: startup_confirmed"
     const archivedLibrary =
-      "2026-07-22T10:00:01.000Z INFO library account=primary run=55: Twitch miner ready"
+      "2026-07-22T10:00:01.000Z INFO library account=primary run=55: 22/07/26 10:00:01 - INFO - [run]: [Primary Farmer] Twitch miner ready"
     const archivedLibraryDebug =
       "2026-07-22T10:00:01.000Z INFO library account=primary run=55: 2026-07-22 10:00:01,125 DEBUG TwitchChannelPointsMiner.classes.Twitch: protocol-noise"
 
@@ -442,6 +475,12 @@ describe("LogsPage", () => {
       screen.getByRole("button", { name: "Show Twitch library logs" })
     )
     expect(screen.getByText(/library-event/)).toBeVisible()
+    expect(screen.getByText(/library-event/)).toHaveTextContent(
+      "primary · 22/07/26 10:00:01 - INFO - [run]: [Primary Farmer] library-event"
+    )
+    expect(screen.getByText(/library-event/)).not.toHaveTextContent(
+      "twitch_farm.miner_output"
+    )
     expect(screen.queryByText(/protocol-noise/)).not.toBeInTheDocument()
     expect(screen.getByText(/library-event/).textContent?.match(/library-event/g)).toHaveLength(1)
     expect(screen.queryByText(/worker-event/)).not.toBeInTheDocument()
@@ -458,6 +497,12 @@ describe("LogsPage", () => {
       screen.getByRole("button", { name: "Show Twitch library logs" })
     )
     expect(screen.getByText(/Twitch miner ready/)).toBeVisible()
+    expect(screen.getByText(/Twitch miner ready/)).toHaveTextContent(
+      "22/07/26 10:00:01 - INFO - [run]: [Primary Farmer] Twitch miner ready"
+    )
+    expect(screen.getByText(/Twitch miner ready/)).not.toHaveTextContent(
+      "INFO library account=primary"
+    )
     expect(screen.queryByText(/protocol-noise/)).not.toBeInTheDocument()
     expect(screen.queryByText(/startup_confirmed/)).not.toBeInTheDocument()
   })
