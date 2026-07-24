@@ -31,6 +31,24 @@ def emit_control_event(event: str, **payload: object) -> None:
     print(CONTROL_EVENT_PREFIX + json.dumps(message, separators=(",", ":")), flush=True)
 
 
+@dataclass(frozen=True, slots=True)
+class WatchingStreamerSnapshot:
+    username: str
+    is_online: bool
+    online_at: float
+
+
+def _snapshot_streamers(streamers: object) -> tuple[WatchingStreamerSnapshot, ...]:
+    return tuple(
+        WatchingStreamerSnapshot(
+            username=getattr(streamer, "username", ""),
+            is_online=getattr(streamer, "is_online", False) is True,
+            online_at=getattr(streamer, "online_at", 0),
+        )
+        for streamer in tuple(streamers)
+    )
+
+
 def selected_ordered_channels(
     streamers: object,
     *,
@@ -60,7 +78,8 @@ def _observe_watching_channels(streamers: object, stopped: threading.Event) -> N
     refreshed_at = 0.0
     while not stopped.is_set():
         now = time.monotonic()
-        selected = tuple(selected_ordered_channels(streamers))
+        snapshot = _snapshot_streamers(streamers)
+        selected = tuple(selected_ordered_channels(snapshot))
         if selected != previous or now - refreshed_at >= 60:
             emit_control_event("watching_channels", channels=list(selected))
             previous = selected

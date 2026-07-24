@@ -318,6 +318,13 @@ class ApiContractTests(TestCase):
         self.assertEqual(by_name["Watched"]["watching_channels"], ["Alpha", "Beta"])
         self.assertEqual(by_name["Unrelated"]["watching_channels"], [])
 
+        self.account.selection.preset = unrelated_preset
+        self.account.selection.save(update_fields=("preset", "updated_at"))
+        reassigned = self.assert_envelope(self.client.get(self.api("presets")))["presets"]
+        by_name = {preset["name"]: preset for preset in reassigned}
+        self.assertEqual(by_name["Watched"]["watching_channels"], [])
+        self.assertEqual(by_name["Unrelated"]["watching_channels"], [])
+
         self.state.watching_updated_at = timezone.now() - timedelta(minutes=6)
         self.state.save(update_fields=("watching_updated_at", "updated_at"))
         runtime = self.assert_envelope(self.client.get(self.api("runtime")))

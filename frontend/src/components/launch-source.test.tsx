@@ -46,7 +46,13 @@ describe("LaunchSource", () => {
       name: "primary",
       channels: ["rocketleague"],
     }
-    render(<LaunchSource current={current} planned={planned} />)
+    render(
+      <LaunchSource
+        current={current}
+        planned={planned}
+        watchingChannels={["MONSTERCAT", "rocketleague"]}
+      />
+    )
 
     const diff = screen.getByLabelText("Launch source diff")
     expect(within(diff).getAllByText("Current").length).toBeGreaterThan(0)
@@ -65,10 +71,16 @@ describe("LaunchSource", () => {
       "data-variant",
       "destructive"
     )
+    expect(
+      within(diff).getByLabelText("monstercat (currently watched)")
+    ).toHaveAttribute("data-variant", "success")
     expect(within(diff).getByText("rocketleague")).toHaveAttribute(
       "data-variant",
       "success"
     )
+    expect(
+      within(diff).queryByLabelText("rocketleague (currently watched)")
+    ).not.toBeInTheDocument()
     expect(within(diff).getByText("Source reference")).toBeVisible()
     expect(within(diff).getByText("Source preset")).toHaveClass(
       "text-muted-foreground"

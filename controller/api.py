@@ -579,6 +579,12 @@ def _preset_summary(preset: ChannelPreset) -> dict[str, Any]:
             state = assignment.account.runtime_state
         except MinerInstanceState.DoesNotExist:
             continue
+        if (
+            state.current_run is None
+            or state.current_run.source_mode != AccountChannelSelection.Mode.PRESET
+            or state.current_run.source_name != preset.name
+        ):
+            continue
         watched.update(channel.casefold() for channel in _fresh_watching_channels(state))
     return {
         "id": preset.pk,

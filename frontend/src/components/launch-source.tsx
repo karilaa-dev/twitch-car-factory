@@ -149,9 +149,11 @@ function SourceSummary({
 function SourceDiff({
   current,
   planned,
+  watchingChannels,
 }: {
   current: ChannelSource
   planned: ChannelSource
+  watchingChannels: string[]
 }) {
   const currentReference = sourceReference(current)
   const plannedReference = sourceReference(planned)
@@ -167,6 +169,11 @@ function SourceDiff({
     current.channels,
     planned.channels
   )
+  const watched = new Set(
+    watchingChannels.map((channel) => channel.trim().toLowerCase())
+  )
+  const isWatching = (channel: string) =>
+    watched.has(channel.trim().toLowerCase())
 
   return (
     <div className="rounded-lg border p-3" aria-label="Launch source diff">
@@ -254,8 +261,15 @@ function SourceDiff({
               <ChannelList
                 channels={current.channels}
                 ariaLabel="Current farming channels"
-                getVariant={(_channel, index) =>
-                  currentIndexes.has(index) ? "outline" : "destructive"
+                getVariant={(channel, index) =>
+                  isWatching(channel)
+                    ? "success"
+                    : currentIndexes.has(index)
+                      ? "outline"
+                      : "destructive"
+                }
+                getChannelAriaLabel={(channel) =>
+                  `${channel} (${isWatching(channel) ? "currently watched" : "not currently watched"})`
                 }
               />
             </DiffValue>
@@ -306,7 +320,11 @@ export function LaunchSource({
       {matches ? (
         <SourceSummary source={current} watchingChannels={watchingChannels} />
       ) : (
-        <SourceDiff current={current} planned={planned} />
+        <SourceDiff
+          current={current}
+          planned={planned}
+          watchingChannels={watchingChannels}
+        />
       )}
     </section>
   )
