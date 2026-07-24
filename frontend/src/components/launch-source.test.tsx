@@ -12,7 +12,13 @@ const current: ChannelSource = {
 
 describe("LaunchSource", () => {
   it("merges identical current and planned sources", () => {
-    render(<LaunchSource current={current} planned={{ ...current }} />)
+    render(
+      <LaunchSource
+        current={current}
+        planned={{ ...current }}
+        watchingChannels={["TWITCHGAMING"]}
+      />
+    )
 
     expect(screen.getByText("Launch source", { exact: true })).toBeVisible()
     expect(
@@ -26,6 +32,12 @@ describe("LaunchSource", () => {
       "data-variant",
       "secondary"
     )
+    expect(
+      screen.getByLabelText("twitchgaming (currently watched)")
+    ).toHaveAttribute("data-variant", "success")
+    expect(
+      screen.getByLabelText("monstercat (not currently watched)")
+    ).toHaveAttribute("data-variant", "outline")
   })
 
   it("highlights changed source fields without tinting the comparison card", () => {

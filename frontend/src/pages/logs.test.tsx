@@ -35,6 +35,8 @@ const accounts: AccountList = {
       desired: "running",
       observed: "running",
       source: { mode: "default", name: "farm defaults", channels: ["one"] },
+      watching_channels: ["one"],
+      watching_updated_at: "2026-07-15T10:00:00Z",
       pid: 42,
       last_heartbeat: "2026-07-15T10:00:00Z",
       open_incident: null,
@@ -59,6 +61,8 @@ const accounts: AccountList = {
       desired: "stopped",
       observed: "stopped",
       source: { mode: "custom", name: "archived", channels: ["two"] },
+      watching_channels: [],
+      watching_updated_at: null,
       pid: null,
       last_heartbeat: null,
       open_incident: null,
@@ -443,10 +447,7 @@ describe("LogsPage", () => {
       if (path === "/accounts") return Promise.resolve(accounts)
       if (path === "/logs/runs/55") {
         return Promise.resolve(
-          detail(
-            [archivedWorker, archivedLibraryDebug, archivedLibrary],
-            null
-          )
+          detail([archivedWorker, archivedLibraryDebug, archivedLibrary], null)
         )
       }
       if (path.startsWith("/logs/runs")) return Promise.resolve(history)
@@ -482,7 +483,9 @@ describe("LogsPage", () => {
       "twitch_farm.miner_output"
     )
     expect(screen.queryByText(/protocol-noise/)).not.toBeInTheDocument()
-    expect(screen.getByText(/library-event/).textContent?.match(/library-event/g)).toHaveLength(1)
+    expect(
+      screen.getByText(/library-event/).textContent?.match(/library-event/g)
+    ).toHaveLength(1)
     expect(screen.queryByText(/worker-event/)).not.toBeInTheDocument()
 
     await user.click(screen.getByRole("button", { name: "Show Worker logs" }))

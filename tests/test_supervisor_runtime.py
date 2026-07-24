@@ -227,7 +227,7 @@ def test_tv_authentication_stays_starting_until_validated_event(tmp_path, settin
     assert account.runtime_state.observed_state == MinerInstanceState.ObservedState.STARTING
     assert managed.confirmed is False
 
-    managed.auth_events.put(
+    managed.control_events.put(
         {
             "event": "device_code",
             "user_code": "ABCD-1234",
@@ -241,7 +241,7 @@ def test_tv_authentication_stays_starting_until_validated_event(tmp_path, settin
     assert account.runtime_state.authentication_code == "ABCD-1234"
     assert managed.confirmed is False
 
-    managed.auth_events.put({"event": "authenticated"})
+    managed.control_events.put({"event": "authenticated"})
     supervisor.check_health()
     account.runtime_state.refresh_from_db()
     command.refresh_from_db()
@@ -255,6 +255,51 @@ def test_tv_authentication_stays_starting_until_validated_event(tmp_path, settin
 
 
 @pytest.mark.django_db
+def test_watching_channel_events_are_canonical_and_clear_on_stop(tmp_path, settings):
+    settings.TWITCH_FARM_RUNTIME_DIR = tmp_path / "runtime"
+    account = configure_farm(channels=("Alpha", "Beta", "Gamma"))
+    state = account.runtime_state
+    state.desired_state = MinerInstanceState.DesiredState.RUNNING
+    state.save(update_fields=("desired_state", "updated_at"))
+    clock = FakeClock()
+    supervisor = make_supervisor(clock, ProcessFactory())
+    supervisor.start_account(account)
+    managed = supervisor.processes[account.pk]
+
+    managed.put_control_event(
+        {"event": "watching_channels", "channels": ["gamma", "ALPHA"]}
+    )
+    supervisor.check_health()
+
+    state = MinerInstanceState.objects.get(account=account)
+    assert state.watching_channels == ["Alpha", "Gamma"]
+    assert state.watching_updated_at == clock.now()
+
+    managed.put_control_event({"event": "watching_channels", "channels": []})
+    supervisor.check_health()
+    state.refresh_from_db()
+    assert state.watching_channels == []
+    assert state.watching_updated_at == clock.now()
+
+    managed.put_control_event({"event": "watching_channels", "channels": ["Beta"]})
+    supervisor.check_health()
+    supervisor.stop_account(account)
+    state.refresh_from_db()
+    assert state.watching_channels == []
+    assert state.watching_updated_at is None
+
+    state.desired_state = MinerInstanceState.DesiredState.RUNNING
+    state.save(update_fields=("desired_state", "updated_at"))
+    supervisor.start_account(account)
+    replacement = supervisor.processes[account.pk]
+    managed.put_control_event({"event": "watching_channels", "channels": ["Alpha"]})
+    supervisor._consume_control_events(managed)
+    state.refresh_from_db()
+    assert state.current_run_id == replacement.run_id
+    assert state.watching_channels == []
+
+
+@pytest.mark.django_db
 def test_tv_authentication_failure_stops_without_recovery(tmp_path, settings):
     settings.TWITCH_FARM_RUNTIME_DIR = tmp_path / "runtime"
     account = configure_tv_account()
@@ -265,7 +310,7 @@ def test_tv_authentication_failure_stops_without_recovery(tmp_path, settings):
     assert leased is not None
     supervisor.execute_command(leased)
     managed = supervisor.processes[account.pk]
-    managed.auth_events.put({"event": "authentication_failed", "error": "Code expired."})
+    managed.control_events.put({"event": "authentication_failed", "error": "Code expired."})
 
     supervisor.check_health()
 

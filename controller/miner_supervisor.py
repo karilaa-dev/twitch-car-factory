@@ -26,6 +26,7 @@ from typing import Callable, IO, Protocol
 from urllib.parse import urlparse
 
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.db.models import F, Max, Q
 from django.utils import timezone
@@ -205,9 +206,24 @@ class ManagedProcess:
     auth_required: bool = False
     authenticated: bool = False
     authentication_deadline: float | None = None
-    auth_events: queue.SimpleQueue[dict[str, object]] = dataclass_field(
+    control_events: queue.SimpleQueue[dict[str, object]] = dataclass_field(
         default_factory=queue.SimpleQueue
     )
+    latest_watching_event: dict[str, object] | None = None
+    control_event_lock: threading.Lock = dataclass_field(default_factory=threading.Lock)
+
+    def put_control_event(self, event: dict[str, object]) -> None:
+        if event.get("event") == "watching_channels":
+            with self.control_event_lock:
+                self.latest_watching_event = event
+            return
+        self.control_events.put(event)
+
+    def pop_watching_event(self) -> dict[str, object] | None:
+        with self.control_event_lock:
+            event = self.latest_watching_event
+            self.latest_watching_event = None
+            return event
 
 
 _SENSITIVE_VALUE = re.compile(
@@ -241,6 +257,11 @@ def safe_error(value: object, *, limit: int = 2000) -> str:
     text = _AUTHORIZATION_VALUE.sub(r"\g<label>[redacted]", text)
     text = _SENSITIVE_VALUE.sub(r"\g<label>[redacted]", text)
     return text[:limit]
+
+
+def _clear_watching_state(state: MinerInstanceState) -> None:
+    state.watching_channels = []
+    state.watching_updated_at = None
 
 
 def _parse_control_event(line: str) -> dict[str, object] | None:
@@ -279,6 +300,19 @@ def _parse_control_event(line: str) -> dict[str, object] | None:
         if set(event) != {"event", "error"} or not isinstance(event.get("error"), str):
             raise ValueError("Authentication-failure event has an invalid shape.")
         event["error"] = safe_error(event["error"], limit=500)
+    elif kind == "watching_channels":
+        if set(event) != {"event", "channels"} or not isinstance(event.get("channels"), list):
+            raise ValueError("Watching-channels event has an invalid shape.")
+        channels = event["channels"]
+        if len(channels) > 2:
+            raise ValueError("Watching-channels event exceeded the channel limit.")
+        try:
+            normalized = services.normalize_channels(channels, require_nonempty=False)
+        except ValidationError as exc:
+            raise ValueError("Watching-channels event has invalid channel names.") from exc
+        if len(normalized) != len(channels):
+            raise ValueError("Watching-channels event has duplicate or empty channel names.")
+        event["channels"] = normalized
     else:
         raise ValueError("Control event type is unsupported.")
     return event
@@ -288,7 +322,7 @@ def _drain_miner_output(
     stream: IO[str],
     account_key: str,
     log_writer: AccountRunLogWriter | None = None,
-    auth_events: queue.SimpleQueue[dict[str, object]] | None = None,
+    event_handler: Callable[[dict[str, object]], None] | None = None,
 ) -> None:
     """Forward one child's output through the worker's console/file handlers."""
 
@@ -305,8 +339,8 @@ def _drain_miner_output(
                         if log_writer is not None:
                             log_writer.lifecycle("control_event_rejected", error=safe_error(exc))
                     else:
-                        if event is not None and auth_events is not None:
-                            auth_events.put(event)
+                        if event is not None and event_handler is not None:
+                            event_handler(event)
                     continue
                 # The pinned miner sets the root logger to DEBUG internally.
                 # Keep protocol payloads out of both combined and account logs
@@ -1246,7 +1280,7 @@ class MinerSupervisor:
         if output_stream is not None:
             managed.output_thread = threading.Thread(
                 target=_drain_miner_output,
-                args=(output_stream, run.account.config_key, log_writer, managed.auth_events),
+                args=(output_stream, run.account.config_key, log_writer, managed.put_control_event),
                 name=f"miner-log-{run.account_id}",
                 daemon=True,
             )
@@ -1269,6 +1303,7 @@ class MinerSupervisor:
             state.last_error = ""
             state.next_retry_at = None
             state.stable_since = None
+            _clear_watching_state(state)
             state.save(
                 update_fields=(
                     "current_run",
@@ -1279,6 +1314,8 @@ class MinerSupervisor:
                     "last_error",
                     "next_retry_at",
                     "stable_since",
+                    "watching_channels",
+                    "watching_updated_at",
                     "updated_at",
                 )
             )
@@ -2240,13 +2277,56 @@ class MinerSupervisor:
         managed.command_id = None
         managed.restart_attempt_id = None
 
-    def _consume_authentication_events(self, managed: ManagedProcess) -> str | None:
-        """Persist validated child events; return a terminal safe error when rejected."""
+    def _persist_watching_event(
+        self,
+        managed: ManagedProcess,
+        event: dict[str, object],
+    ) -> None:
+        state = MinerInstanceState.objects.get(account_id=managed.account_id)
+        if (
+            self.processes.get(managed.account_id) is not managed
+            or state.current_run_id != managed.run_id
+            or state.worker_id != self.worker_id
+        ):
+            return
+        run = state.current_run
+        if run is None:
+            return
+        by_name = {
+            channel.casefold(): channel
+            for channel in run.channels
+            if isinstance(channel, str)
+        }
+        requested = [str(channel).casefold() for channel in event["channels"]]
+        if any(channel not in by_name for channel in requested):
+            self._write_managed_lifecycle(
+                managed,
+                "watching_channels_rejected",
+                error="Reported channel is not in the launch snapshot.",
+            )
+            return
+        selected = [
+            channel
+            for channel in run.channels
+            if isinstance(channel, str) and channel.casefold() in requested
+        ]
+        state.watching_channels = selected
+        state.watching_updated_at = self.now()
+        state.save(
+            update_fields=(
+                "watching_channels",
+                "watching_updated_at",
+                "updated_at",
+            )
+        )
+
+    def _consume_control_events(self, managed: ManagedProcess) -> str | None:
+        """Persist validated child events; return a terminal authentication error."""
 
         terminal_error = None
         while True:
             try:
-                event = managed.auth_events.get_nowait()
+                event = managed.control_events.get_nowait()
             except queue.Empty:
                 break
             kind = event["event"]
@@ -2305,6 +2385,10 @@ class MinerSupervisor:
             elif kind == "authentication_failed":
                 terminal_error = safe_error(event.get("error") or "Twitch authentication failed.")
                 break
+        if terminal_error is None:
+            watching_event = managed.pop_watching_event()
+            if watching_event is not None:
+                self._persist_watching_event(managed, watching_event)
         return terminal_error
 
     def _fail_authentication(self, managed: ManagedProcess, error: object) -> None:
@@ -2695,7 +2779,7 @@ class MinerSupervisor:
                 self._reconcile_required_cleanup(managed)
                 continue
             state = MinerInstanceState.objects.get(account_id=account_id)
-            authentication_error = self._consume_authentication_events(managed)
+            authentication_error = self._consume_control_events(managed)
             if authentication_error:
                 self._fail_authentication(managed, authentication_error)
                 continue
@@ -2952,6 +3036,8 @@ class MinerSupervisor:
             observed_state=MinerInstanceState.ObservedState.UNKNOWN,
             next_retry_at=None,
             stable_since=None,
+            watching_channels=[],
+            watching_updated_at=None,
             last_heartbeat=now,
             last_error="",
             updated_at=now,

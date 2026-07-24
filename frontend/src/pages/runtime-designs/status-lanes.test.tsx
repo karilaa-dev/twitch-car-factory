@@ -32,6 +32,8 @@ function account(
       name: "Farm defaults",
       channels: ["channel_one"],
     },
+    watching_channels: [],
+    watching_updated_at: null,
     pid: id,
     last_heartbeat: "2026-07-15T12:00:00Z",
     open_incident: null,
@@ -88,6 +90,36 @@ describe("MobileStatusLanes", () => {
     expect(
       screen.queryByRole("heading", { name: "Stopped or idle" })
     ).not.toBeInTheDocument()
+  })
+
+  it("highlights each account's watched channels case-insensitively", () => {
+    render(
+      <MemoryRouter>
+        <MobileStatusLanes
+          data={snapshot([
+            account(1, {
+              source: {
+                mode: "default",
+                name: "Farm defaults",
+                channels: ["Channel_One", "channel_two"],
+              },
+              watching_channels: ["channel_one"],
+            }),
+          ])}
+          globalPending={false}
+          accountPending={false}
+          onGlobalAction={vi.fn()}
+          onAccountAction={vi.fn()}
+        />
+      </MemoryRouter>
+    )
+
+    expect(
+      screen.getByLabelText("Channel_One (currently watched)")
+    ).toHaveAttribute("data-variant", "success")
+    expect(
+      screen.getByLabelText("channel_two (not currently watched)")
+    ).toHaveAttribute("data-variant", "outline")
   })
 
   it("keeps each populated lane visible", () => {

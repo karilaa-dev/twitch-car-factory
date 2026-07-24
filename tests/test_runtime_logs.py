@@ -12,7 +12,7 @@ import pytest
 from django.test import override_settings
 
 from controller.miner_runner import CONTROL_EVENT_PREFIX
-from controller.miner_supervisor import _drain_miner_output
+from controller.miner_supervisor import _drain_miner_output, _parse_control_event
 from controller import runtime_logs
 from controller.runtime_logs import (
     MAX_LOG_BYTES,
@@ -96,7 +96,7 @@ def test_control_events_are_validated_and_never_written_as_library_output(tmp_pa
             ),
             "primary",
             writer,
-            events,
+            events.put,
         )
         writer.finalize("done")
         page = read_run_log_page(account_id=7, run_id=91)
@@ -109,6 +109,34 @@ def test_control_events_are_validated_and_never_written_as_library_output(tmp_pa
     assert "INFO library account=primary run=91: upstream info" in rendered
     assert "must-not-pass" not in rendered
     assert "control_event_rejected" in rendered
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"event":"watching_channels","channels":["one","two","three"]}',
+        '{"event":"watching_channels","channels":["one","ONE"]}',
+        '{"event":"watching_channels","channels":[1]}',
+        '{"event":"watching_channels","channels":[],"extra":true}',
+    ],
+)
+def test_watching_channel_control_events_reject_invalid_payloads(payload):
+    with pytest.raises(ValueError):
+        _parse_control_event(CONTROL_EVENT_PREFIX + payload)
+
+
+def test_watching_channel_control_event_accepts_empty_and_ordered_channels():
+    event = _parse_control_event(
+        CONTROL_EVENT_PREFIX
+        + '{"event":"watching_channels","channels":["First","second"]}'
+    )
+    assert event == {
+        "event": "watching_channels",
+        "channels": ["First", "second"],
+    }
+    assert _parse_control_event(
+        CONTROL_EVENT_PREFIX + '{"event":"watching_channels","channels":[]}'
+    ) == {"event": "watching_channels", "channels": []}
 
 
 def test_runtime_log_tail_reads_rotation_in_order_and_bounds_output(tmp_path):

@@ -98,6 +98,7 @@ class Command(BaseCommand):
 
         self.stdout.write(json.dumps(record, sort_keys=True))
 
+        authenticated = False
         if run.auth_method == AccountCredential.AuthMethod.TWITCH_TV:
             tv_mode = os.environ.get("TWITCH_FARM_FAKE_TV_AUTH_MODE", "success")
             if run.reset_session:
@@ -116,8 +117,13 @@ class Command(BaseCommand):
                 raise SystemExit(19)
             if tv_mode != "pending":
                 emit_control_event("authenticated")
+                authenticated = True
         else:
             emit_control_event("authenticated")
+            authenticated = True
+
+        if authenticated:
+            emit_control_event("watching_channels", channels=channels[:2])
 
         exit_code = options["exit_code"]
         if mode == "exit-immediately":

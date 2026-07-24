@@ -30,7 +30,7 @@ import { toast } from "sonner"
 import { z } from "zod"
 
 import { ChannelEditor } from "@/components/channel-editor"
-import { ChannelList } from "@/components/channel-list"
+import { ChannelList, WatchedChannelList } from "@/components/channel-list"
 import { ConfirmAction } from "@/components/confirm-action"
 import { CurrentState } from "@/components/current-state"
 import {
@@ -138,7 +138,11 @@ export function AccountsPage() {
         cell: ({ row }) => (
           <div className="grid max-w-72 gap-1">
             <span>{row.original.source.label}</span>
-            <ChannelList channels={row.original.source.channels} limit={3} />
+            <WatchedChannelList
+              channels={row.original.source.channels}
+              watchingChannels={row.original.watching_channels}
+              limit={3}
+            />
           </div>
         ),
       }),
@@ -246,7 +250,10 @@ export function AccountsPage() {
                         <p className="mb-1 text-xs text-muted-foreground">
                           Channel source · {account.source.label}
                         </p>
-                        <ChannelList channels={account.source.channels} />
+                        <WatchedChannelList
+                          channels={account.source.channels}
+                          watchingChannels={account.watching_channels}
+                        />
                       </div>
                     </CardContent>
                   </InteractiveCard>
@@ -766,7 +773,11 @@ function AccountRuntime({
             </div>
           </dl>
           <Separator />
-          <LaunchSource current={live.source} planned={plannedSource} />
+          <LaunchSource
+            current={live.source}
+            planned={plannedSource}
+            watchingChannels={live.watching_channels}
+          />
         </CardContent>
       </Card>
       <AccountChannelSourceSettings

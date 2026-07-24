@@ -5,8 +5,11 @@ from colorama import Fore
 from TwitchChannelPointsMiner import TwitchChannelPointsMiner
 from TwitchChannelPointsMiner.classes.Chat import ChatPresence
 from TwitchChannelPointsMiner.classes.Settings import Priority
-from TwitchChannelPointsMiner.classes.entities.Streamer import StreamerSettings
+from TwitchChannelPointsMiner.classes.entities.Streamer import Streamer, StreamerSettings
+from TwitchChannelPointsMiner.classes.Twitch import Twitch
 from TwitchChannelPointsMiner.classes.TwitchLogin import TwitchLogin
+
+from controller.miner_runner import selected_ordered_channels
 from TwitchChannelPointsMiner.logger import ColorPalette, LoggerSettings
 
 
@@ -42,7 +45,7 @@ def test_upstream_miner_supports_runner_configuration():
         username="dependency-contract",
         password=None,
         claim_drops_startup=False,
-        priority=[Priority.DROPS, Priority.ORDER, Priority.STREAK],
+        priority=[Priority.ORDER],
         enable_analytics=False,
         disable_ssl_cert_verification=False,
         disable_at_in_nickname=False,
@@ -56,3 +59,38 @@ def test_upstream_miner_supports_runner_configuration():
         "https://id.twitch.tv/oauth2/device",
         {},
     )
+    inspect.signature(Twitch.send_minute_watched_events).bind(
+        Twitch,
+        [],
+        [Priority.ORDER],
+        3,
+    )
+
+
+def test_order_priority_contract_and_telemetry_selection():
+    source = inspect.getsource(Twitch.send_minute_watched_events)
+    assert "max_watch_amount = 2" in source
+    assert "streamers_index[:remaining_watch_amount()]" in source
+
+    first = Streamer("first")
+    second = Streamer("second")
+    third = Streamer("third")
+    fourth = Streamer("fourth")
+    first.is_online = True
+    first.online_at = 980
+    second.is_online = False
+    third.is_online = True
+    third.online_at = 0
+    fourth.is_online = True
+    fourth.online_at = 900
+
+    assert selected_ordered_channels(
+        [first, second, third, fourth],
+        now=1000,
+    ) == ["third", "fourth"]
+
+    first.online_at = 900
+    assert selected_ordered_channels(
+        [first, second, third, fourth],
+        now=1000,
+    ) == ["first", "third"]

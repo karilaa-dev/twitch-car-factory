@@ -1,4 +1,4 @@
-import { ChannelList } from "@/components/channel-list"
+import { ChannelList, WatchedChannelList } from "@/components/channel-list"
 import { Badge } from "@/components/ui/badge"
 import { Separator } from "@/components/ui/separator"
 import { cn } from "@/lib/utils"
@@ -33,7 +33,11 @@ function unchangedChannelIndexes(current: string[], planned: string[]) {
     Array<number>(planned.length + 1).fill(0)
   )
 
-  for (let currentIndex = current.length - 1; currentIndex >= 0; currentIndex--) {
+  for (
+    let currentIndex = current.length - 1;
+    currentIndex >= 0;
+    currentIndex--
+  ) {
     for (
       let plannedIndex = planned.length - 1;
       plannedIndex >= 0;
@@ -99,7 +103,13 @@ function DiffValue({
   )
 }
 
-function SourceSummary({ source }: { source: ChannelSource }) {
+function SourceSummary({
+  source,
+  watchingChannels,
+}: {
+  source: ChannelSource
+  watchingChannels: string[]
+}) {
   const reference = sourceReference(source)
 
   return (
@@ -127,7 +137,10 @@ function SourceSummary({ source }: { source: ChannelSource }) {
       </dl>
       <div className="flex flex-col gap-1">
         <p className="text-xs text-muted-foreground">Farming channels</p>
-        <ChannelList channels={source.channels} />
+        <WatchedChannelList
+          channels={source.channels}
+          watchingChannels={watchingChannels}
+        />
       </div>
     </div>
   )
@@ -267,9 +280,11 @@ function SourceDiff({
 export function LaunchSource({
   current,
   planned,
+  watchingChannels = [],
 }: {
   current: ChannelSource
   planned: ChannelSource
+  watchingChannels?: string[]
 }) {
   const matches = launchSourcesMatch(current, planned)
 
@@ -289,7 +304,7 @@ export function LaunchSource({
         </p>
       </div>
       {matches ? (
-        <SourceSummary source={current} />
+        <SourceSummary source={current} watchingChannels={watchingChannels} />
       ) : (
         <SourceDiff current={current} planned={planned} />
       )}

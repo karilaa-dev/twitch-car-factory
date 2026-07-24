@@ -10,7 +10,7 @@ import {
   Wifi,
 } from "lucide-react"
 
-import { ChannelList } from "@/components/channel-list"
+import { WatchedChannelList } from "@/components/channel-list"
 import { ConfirmAction } from "@/components/confirm-action"
 import { CurrentState } from "@/components/current-state"
 import { InteractiveCard } from "@/components/interactive-card"
@@ -285,8 +285,9 @@ export function MobileStatusLanes({
                                 {account.source.mode}
                               </Badge>
                             </div>
-                            <ChannelList
+                            <WatchedChannelList
                               channels={account.source.channels}
+                              watchingChannels={account.watching_channels}
                               limit={3}
                             />
                           </div>

@@ -4,8 +4,8 @@ import userEvent from "@testing-library/user-event"
 import { MemoryRouter, Route, Routes } from "react-router-dom"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
-import { AccountWorkspacePage } from "@/pages/accounts"
-import type { AccountDetail, AccountTelemetry } from "@/types"
+import { AccountsPage, AccountWorkspacePage } from "@/pages/accounts"
+import type { AccountDetail, AccountList, AccountTelemetry } from "@/types"
 
 const apiMock = vi.fn()
 vi.mock("@/lib/api", async (importOriginal) => {
@@ -34,6 +34,8 @@ const account: AccountDetail = {
   desired: "running",
   observed: "starting",
   source: { mode: "default", name: "farm defaults", channels: ["one"] },
+  watching_channels: ["one"],
+  watching_updated_at: new Date().toISOString(),
   planned_source: { mode: "default", name: "Farm defaults", channels: ["one"] },
   pid: 42,
   last_heartbeat: new Date().toISOString(),
@@ -66,6 +68,40 @@ function renderAuth() {
     </QueryClientProvider>
   )
 }
+
+describe("AccountsPage", () => {
+  beforeEach(() => {
+    apiMock.mockReset()
+    apiMock.mockResolvedValue({
+      accounts: [account],
+      active_count: 1,
+      presets: [],
+      farm_default_channels: ["one"],
+      autostart_new_accounts: false,
+    } satisfies AccountList)
+  })
+
+  it("highlights watched channels in live account summaries", async () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <AccountsPage />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+
+    const watchedBadges = await screen.findAllByLabelText(
+      "one (currently watched)"
+    )
+    expect(watchedBadges.length).toBeGreaterThan(0)
+    for (const badge of watchedBadges) {
+      expect(badge).toHaveAttribute("data-variant", "success")
+    }
+  })
+})
 
 describe("Account Twitch TV authentication", () => {
   beforeEach(() => {

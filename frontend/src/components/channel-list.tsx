@@ -2,15 +2,7 @@ import { Badge } from "@/components/ui/badge"
 import { cn } from "@/lib/utils"
 import type * as React from "react"
 
-export function ChannelList({
-  channels,
-  empty = "No channels",
-  limit,
-  className,
-  variant = "outline",
-  getVariant,
-  ariaLabel = "Farming channels",
-}: {
+type ChannelListProps = {
   channels: string[]
   empty?: string
   limit?: number
@@ -20,8 +12,20 @@ export function ChannelList({
     channel: string,
     index: number
   ) => React.ComponentProps<typeof Badge>["variant"]
+  getChannelAriaLabel?: (channel: string, index: number) => string
   ariaLabel?: string
-}) {
+}
+
+export function ChannelList({
+  channels,
+  empty = "No channels",
+  limit,
+  className,
+  variant = "outline",
+  getVariant,
+  getChannelAriaLabel,
+  ariaLabel = "Farming channels",
+}: ChannelListProps) {
   if (!channels.length) {
     return (
       <span className="font-mono text-sm text-muted-foreground">{empty}</span>
@@ -41,6 +45,7 @@ export function ChannelList({
           <Badge
             variant={getVariant?.(channel, index) ?? variant}
             className="max-w-full font-mono font-normal tracking-tight"
+            aria-label={getChannelAriaLabel?.(channel, index)}
           >
             {channel}
           </Badge>
@@ -52,5 +57,31 @@ export function ChannelList({
         </li>
       ) : null}
     </ul>
+  )
+}
+
+function normalizeChannel(channel: string) {
+  return channel.trim().toLowerCase()
+}
+
+export function WatchedChannelList({
+  watchingChannels,
+  ariaLabel = "Farming channels; currently watched channels are identified",
+  ...props
+}: Omit<ChannelListProps, "variant" | "getVariant" | "getChannelAriaLabel"> & {
+  watchingChannels: string[]
+}) {
+  const watched = new Set(watchingChannels.map(normalizeChannel))
+  const isWatching = (channel: string) => watched.has(normalizeChannel(channel))
+
+  return (
+    <ChannelList
+      {...props}
+      ariaLabel={ariaLabel}
+      getVariant={(channel) => (isWatching(channel) ? "success" : "outline")}
+      getChannelAriaLabel={(channel) =>
+        `${channel} (${isWatching(channel) ? "currently watched" : "not currently watched"})`
+      }
+    />
   )
 }

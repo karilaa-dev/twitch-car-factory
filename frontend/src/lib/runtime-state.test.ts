@@ -27,6 +27,8 @@ function account(
     desired,
     observed,
     source: { mode: "default", name: "default", channels: [] },
+    watching_channels: [],
+    watching_updated_at: null,
     pid: null,
     last_heartbeat: null,
     open_incident: null,

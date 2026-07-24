@@ -1,6 +1,6 @@
 import { AlertTriangle, Play, RefreshCw, Square } from "lucide-react"
 
-import { ChannelList } from "@/components/channel-list"
+import { WatchedChannelList } from "@/components/channel-list"
 import { ConfirmAction } from "@/components/confirm-action"
 import { CurrentState } from "@/components/current-state"
 import { InteractiveTableRow } from "@/components/interactive-card"
@@ -229,7 +229,11 @@ export function DesktopOperationsGrid({
                     <p className="max-w-64 truncate font-medium">
                       {account.source.label || account.source.name}
                     </p>
-                    <ChannelList channels={account.source.channels} limit={3} />
+                    <WatchedChannelList
+                      channels={account.source.channels}
+                      watchingChannels={account.watching_channels}
+                      limit={3}
+                    />
                   </TableCell>
                   <TableCell>
                     <p>{formatTime(account.last_heartbeat)}</p>

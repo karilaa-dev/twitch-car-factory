@@ -361,6 +361,8 @@ class MinerInstanceState(models.Model):
     next_retry_at = models.DateTimeField(null=True, blank=True)
     stable_since = models.DateTimeField(null=True, blank=True)
     last_heartbeat = models.DateTimeField(null=True, blank=True)
+    watching_channels = models.JSONField(default=list, blank=True)
+    watching_updated_at = models.DateTimeField(null=True, blank=True)
     last_error = models.TextField(blank=True)
     authentication_status = models.CharField(
         max_length=24,
@@ -378,6 +380,21 @@ class MinerInstanceState(models.Model):
 
     class Meta:
         ordering = ("account__config_key",)
+
+    def save(self, *args: Any, **kwargs: Any) -> None:
+        if (
+            self.current_run_id is None
+            or self.observed_state
+            not in (self.ObservedState.STARTING, self.ObservedState.RUNNING)
+        ):
+            self.watching_channels = []
+            self.watching_updated_at = None
+            update_fields = kwargs.get("update_fields")
+            if update_fields is not None:
+                kwargs["update_fields"] = tuple(
+                    dict.fromkeys((*update_fields, "watching_channels", "watching_updated_at"))
+                )
+        super().save(*args, **kwargs)
 
     def __str__(self) -> str:
         return f"{self.account.config_key}: {self.desired_state}/{self.observed_state}"
