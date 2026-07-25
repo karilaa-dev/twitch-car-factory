@@ -1,4 +1,11 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
@@ -17,6 +24,7 @@ describe("ChannelEditor", () => {
 
   afterEach(() => {
     vi.useRealTimers()
+    vi.restoreAllMocks()
   })
 
   it("removes a channel only after confirmation within five seconds", () => {
@@ -132,5 +140,108 @@ describe("ChannelEditor", () => {
     )
     expect(screen.getByDisplayValue("canonical")).toHaveAttribute("readonly")
     expect(onChange).toHaveBeenLastCalledWith(["canonical"])
+  })
+
+  it("explains priority and numbers rows as an ordered list", () => {
+    render(
+      <ChannelEditor
+        id="channels"
+        description="Custom channel guidance."
+        value={["alpha", "beta"]}
+        onChange={vi.fn()}
+      />
+    )
+
+    const channels = screen.getByRole("list", {
+      name: "Channels ordered by priority",
+    })
+    expect(channels).toBeVisible()
+    expect(within(channels).getAllByRole("listitem")).toHaveLength(2)
+    expect(screen.getByText("1")).toBeVisible()
+    expect(screen.getByText("2")).toBeVisible()
+    expect(
+      screen.getByRole("button", {
+        name: "Reorder alpha, priority 1 of 2",
+      })
+    ).toBeVisible()
+    expect(
+      screen.getByRole("button", {
+        name: "Reorder beta, priority 2 of 2",
+      })
+    ).toBeVisible()
+    const guidance = screen.getByRole("list", {
+      name: "Channel list guidance",
+    })
+    expect(guidance).toBeVisible()
+    expect(guidance.children).toHaveLength(4)
+    expect(guidance.firstElementChild).toHaveTextContent(
+      "Priority follows list position; 1 is highest."
+    )
+    expect(guidance).toHaveTextContent("Custom channel guidance.")
+  })
+
+  it("renumbers priorities after adding and removing rows", async () => {
+    const user = userEvent.setup()
+    render(
+      <ChannelEditor
+        id="channels"
+        value={["alpha", "beta"]}
+        onChange={vi.fn()}
+      />
+    )
+
+    await user.click(screen.getByRole("button", { name: "Add channel" }))
+    expect(
+      screen.getByRole("button", { name: "Reorder channel, priority 3 of 3" })
+    ).toBeVisible()
+
+    await user.click(screen.getByRole("button", { name: "Remove alpha" }))
+    await user.click(
+      screen.getByRole("button", { name: "Confirm remove alpha" })
+    )
+
+    const channels = screen.getByRole("list", {
+      name: "Channels ordered by priority",
+    })
+    expect(within(channels).getAllByRole("listitem")).toHaveLength(2)
+    expect(
+      screen.getByRole("button", { name: "Reorder beta, priority 1 of 2" })
+    ).toBeVisible()
+    expect(
+      screen.getByRole("button", { name: "Reorder channel, priority 2 of 2" })
+    ).toBeVisible()
+  })
+
+  it("reorders channel priority with the keyboard", async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+      function (this: HTMLElement) {
+        const channel = this.querySelector("input")?.getAttribute("value")
+        const top = channel === "alpha" ? 0 : channel === "beta" ? 48 : 96
+        return DOMRect.fromRect({ x: 0, y: top, width: 320, height: 40 })
+      }
+    )
+    render(
+      <ChannelEditor
+        id="channels"
+        value={["alpha", "beta", "gamma"]}
+        onChange={onChange}
+      />
+    )
+
+    const alphaHandle = screen.getByRole("button", {
+      name: "Reorder alpha, priority 1 of 3",
+    })
+    alphaHandle.focus()
+    await user.keyboard("[Space][ArrowDown][Space]")
+
+    expect(onChange).toHaveBeenLastCalledWith(["beta", "alpha", "gamma"])
+    expect(
+      screen.getByRole("button", { name: "Reorder beta, priority 1 of 3" })
+    ).toBeVisible()
+    expect(
+      screen.getByRole("button", { name: "Reorder alpha, priority 2 of 3" })
+    ).toBeVisible()
   })
 })

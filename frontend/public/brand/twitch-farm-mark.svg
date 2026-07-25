@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Twitch Farm logo mark</title>
+  <desc id="desc">A white factory silhouette inside a rounded purple square.</desc>
+  <rect x="32" y="32" width="448" height="448" rx="104" fill="#772CE8"/>
+  <path fill="#FFFFFF" d="M120 396V238l96-64v64l96-64v64h80v158H120Z"/>
+  <rect x="168" y="294" width="48" height="58" rx="12" fill="#772CE8"/>
+  <rect x="260" y="294" width="48" height="58" rx="12" fill="#772CE8"/>
+  <rect x="352" y="294" width="40" height="102" rx="12" fill="#772CE8"/>
+</svg>

@@ -77,7 +77,6 @@ import {
 } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
 import { Spinner } from "@/components/ui/spinner"
-import { Switch } from "@/components/ui/switch"
 import {
   Table,
   TableBody,
@@ -295,7 +294,6 @@ const createSchema = z
     mode: z.enum(["default", "custom", "preset"]),
     preset_id: z.number().nullable(),
     channels: z.array(z.string()),
-    start_after_save: z.boolean(),
   })
   .superRefine((value, context) => {
     if (value.mode === "preset" && !value.preset_id)
@@ -329,13 +327,8 @@ export function NewAccountPage() {
       mode: "default",
       preset_id: null,
       channels: [],
-      start_after_save: false,
     },
   })
-  React.useEffect(() => {
-    if (accounts.data)
-      form.setValue("start_after_save", accounts.data.autostart_new_accounts)
-  }, [accounts.data, form])
   const submit = async (values: CreateValues) => {
     setPending(true)
     try {
@@ -355,7 +348,6 @@ export function NewAccountPage() {
           "mode",
           "preset_id",
           "channels",
-          "start_after_save",
         ],
         aliases: {
           custom_channels: "channels",
@@ -562,26 +554,6 @@ export function NewAccountPage() {
                   </AlertDescription>
                 </Alert>
               ) : null}
-              <Controller
-                name="start_after_save"
-                control={form.control}
-                render={({ field }) => (
-                  <Field orientation="horizontal">
-                    <FieldLabel htmlFor="start-after-save">
-                      <FieldTitle>Start after saving</FieldTitle>
-                      <FieldDescription>
-                        Validate the complete launch source before recording
-                        running intent.
-                      </FieldDescription>
-                    </FieldLabel>
-                    <Switch
-                      id="start-after-save"
-                      checked={field.value}
-                      onCheckedChange={field.onChange}
-                    />
-                  </Field>
-                )}
-              />
               <FieldError errors={[form.formState.errors.root]} />
               <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
                 <Button

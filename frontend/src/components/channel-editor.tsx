@@ -27,12 +27,7 @@ import {
 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
-import {
-  Field,
-  FieldDescription,
-  FieldError,
-  FieldLabel,
-} from "@/components/ui/field"
+import { Field, FieldError, FieldLabel } from "@/components/ui/field"
 import {
   InputGroup,
   InputGroupAddon,
@@ -73,6 +68,8 @@ function normalizedChannels(items: ChannelItem[]) {
 function SortableChannel({
   item,
   inputId,
+  position,
+  count,
   disabled,
   onChange,
   onRemove,
@@ -80,6 +77,8 @@ function SortableChannel({
 }: {
   item: ChannelItem
   inputId: string
+  position: number
+  count: number
   disabled?: boolean
   onChange: (value: string) => void
   onRemove: () => void
@@ -115,16 +114,22 @@ function SortableChannel({
     ) : null
 
   return (
-    <div
+    <li
       ref={setNodeRef}
       style={{ transform: CSS.Transform.toString(transform), transition }}
       className={isDragging ? "relative z-10 opacity-80" : undefined}
     >
       <InputGroup>
         <InputGroupAddon>
+          <span
+            className="w-5 text-center font-mono text-xs text-muted-foreground tabular-nums"
+            aria-hidden="true"
+          >
+            {position}
+          </span>
           <InputGroupButton
             size="icon-sm"
-            aria-label={`Reorder ${item.name || "channel"}`}
+            aria-label={`Reorder ${item.name || "channel"}, priority ${position} of ${count}`}
             disabled={disabled}
             {...attributes}
             {...listeners}
@@ -173,7 +178,7 @@ function SortableChannel({
           </InputGroupButton>
         </InputGroupAddon>
       </InputGroup>
-    </div>
+    </li>
   )
 }
 
@@ -289,12 +294,17 @@ export function ChannelEditor({
         onDragEnd={dragEnd}
       >
         <SortableContext items={items} strategy={verticalListSortingStrategy}>
-          <div className="grid gap-2.5">
+          <ol
+            aria-label="Channels ordered by priority"
+            className="grid gap-2.5"
+          >
             {items.map((item, index) => (
               <SortableChannel
                 key={item.id}
                 item={item}
                 inputId={index === 0 ? id : `${id}-${index + 1}`}
+                position={index + 1}
+                count={items.length}
                 disabled={disabled}
                 onChange={(name) =>
                   update(item.id, { name, status: "idle", isDraft: true })
@@ -309,7 +319,7 @@ export function ChannelEditor({
                 onValidate={() => void validate(item.id)}
               />
             ))}
-          </div>
+          </ol>
         </SortableContext>
       </DndContext>
       <Button
@@ -329,10 +339,18 @@ export function ChannelEditor({
       >
         <Plus /> Add channel
       </Button>
-      <FieldDescription>
-        {description} Added channels are read-only; remove and re-add one to
-        change its name.
-      </FieldDescription>
+      <ul
+        aria-label="Channel list guidance"
+        className="ml-5 list-disc space-y-1 text-sm leading-normal font-normal text-muted-foreground"
+      >
+        <li>Priority follows list position; 1 is highest.</li>
+        <li>Drag channels to reorder them.</li>
+        <li>{description}</li>
+        <li>
+          Added channels are read-only; remove and re-add one to change its
+          name.
+        </li>
+      </ul>
       <FieldError>{error}</FieldError>
     </Field>
   )

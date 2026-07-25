@@ -166,9 +166,9 @@ function AppShell({ session }: { session: SessionData }) {
                 <ChevronDown className="hidden sm:block" />
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
-                <DropdownMenuLabel>Operator</DropdownMenuLabel>
-                <DropdownMenuSeparator />
                 <DropdownMenuGroup>
+                  <DropdownMenuLabel>Operator</DropdownMenuLabel>
+                  <DropdownMenuSeparator />
                   <DropdownMenuItem onClick={() => logout.mutate()}>
                     <LogOut /> Log out
                   </DropdownMenuItem>

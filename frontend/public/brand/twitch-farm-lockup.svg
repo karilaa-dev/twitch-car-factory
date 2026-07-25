@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" role="img" aria-labelledby="title desc">
+  <title id="title">Twitch Farm Control Room</title>
+  <desc id="desc">The Twitch Farm factory mark with a horizontal wordmark.</desc>
+  <g transform="translate(40 40) scale(.46875)">
+    <rect x="0" y="0" width="512" height="512" rx="112" fill="#772CE8"/>
+    <path fill="#FFFFFF" d="M88 388V220l104-68v68l104-68v68h88v168H88Z"/>
+    <rect x="140" y="278" width="52" height="62" rx="12" fill="#772CE8"/>
+    <rect x="240" y="278" width="52" height="62" rx="12" fill="#772CE8"/>
+    <rect x="340" y="278" width="44" height="110" rx="12" fill="#772CE8"/>
+  </g>
+  <text x="336" y="150" fill="#18181B" font-family="Geist, Inter, Arial, sans-serif" font-size="92" font-weight="760" letter-spacing="-3">Twitch Farm</text>
+  <text x="340" y="211" fill="#772CE8" font-family="Geist, Inter, Arial, sans-serif" font-size="32" font-weight="650" letter-spacing="8">CONTROL ROOM</text>
+</svg>

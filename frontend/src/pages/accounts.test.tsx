@@ -4,7 +4,11 @@ import userEvent from "@testing-library/user-event"
 import { MemoryRouter, Route, Routes } from "react-router-dom"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
-import { AccountsPage, AccountWorkspacePage } from "@/pages/accounts"
+import {
+  AccountsPage,
+  AccountWorkspacePage,
+  NewAccountPage,
+} from "@/pages/accounts"
 import type { AccountDetail, AccountList, AccountTelemetry } from "@/types"
 
 const apiMock = vi.fn()
@@ -109,6 +113,66 @@ describe("AccountsPage", () => {
     for (const badge of watchedBadges) {
       expect(badge).toHaveAttribute("data-variant", "success")
     }
+  })
+})
+
+describe("NewAccountPage", () => {
+  it("creates accounts stopped so Twitch login can be completed first", async () => {
+    const user = userEvent.setup()
+    apiMock.mockReset()
+    apiMock.mockImplementation(
+      (path: string, options?: { method?: string; json?: unknown }) => {
+        if (path === "/accounts" && options?.method === "POST")
+          return Promise.resolve(account)
+        if (path === "/accounts")
+          return Promise.resolve({
+            accounts: [],
+            active_count: 0,
+            presets: [],
+            farm_default_channels: ["one"],
+            autostart_new_accounts: true,
+          } satisfies AccountList)
+        throw new Error(`Unexpected API path: ${path}`)
+      }
+    )
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/accounts/new"]}>
+          <Routes>
+            <Route path="/accounts/new" element={<NewAccountPage />} />
+            <Route path="/accounts/:id" element={<div>Account created</div>} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+
+    expect(await screen.findByText("Account configuration")).toBeVisible()
+    expect(screen.queryByText("Start after saving")).not.toBeInTheDocument()
+
+    await user.type(screen.getByLabelText("Account key"), "secondary")
+    await user.type(
+      screen.getByLabelText("Twitch username"),
+      "secondary_viewer"
+    )
+    await user.click(screen.getByRole("button", { name: "Create account" }))
+
+    await waitFor(() =>
+      expect(apiMock).toHaveBeenCalledWith(
+        "/accounts",
+        expect.objectContaining({ method: "POST" })
+      )
+    )
+    const createCall = apiMock.mock.calls.find(
+      ([, options]) =>
+        (options as { method?: string } | undefined)?.method === "POST"
+    )
+    expect(
+      (createCall?.[1] as { json?: Record<string, unknown> } | undefined)?.json
+    ).not.toHaveProperty("start_after_save")
+    expect(await screen.findByText("Account created")).toBeVisible()
   })
 })
 
