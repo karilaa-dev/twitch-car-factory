@@ -9,7 +9,11 @@ from TwitchChannelPointsMiner.classes.entities.Streamer import Streamer, Streame
 from TwitchChannelPointsMiner.classes.Twitch import Twitch
 from TwitchChannelPointsMiner.classes.TwitchLogin import TwitchLogin
 
-from controller.miner_runner import _snapshot_streamers, selected_ordered_channels
+from controller.miner_runner import (
+    _snapshot_streamers,
+    online_ordered_channels,
+    selected_ordered_channels,
+)
 from TwitchChannelPointsMiner.logger import ColorPalette, LoggerSettings
 
 
@@ -88,6 +92,9 @@ def test_order_priority_contract_and_telemetry_selection():
         [first, second, third, fourth],
         now=1000,
     ) == ["third", "fourth"]
+    assert online_ordered_channels(
+        [first, second, third, fourth]
+    ) == ["first", "third", "fourth"]
 
     first.online_at = 900
     assert selected_ordered_channels(
@@ -99,3 +106,4 @@ def test_order_priority_contract_and_telemetry_selection():
     first.is_online = False
     third.is_online = False
     assert selected_ordered_channels(snapshot, now=1000) == ["first", "third"]
+    assert online_ordered_channels(snapshot) == ["first", "third", "fourth"]

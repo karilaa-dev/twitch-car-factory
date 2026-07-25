@@ -245,11 +245,11 @@ def _iso(value: datetime | None) -> str | None:
 WATCHING_CHANNELS_FRESH_FOR = timedelta(minutes=5)
 
 
-def _fresh_watching_channels(
+def _fresh_channel_status(
     state: MinerInstanceState | None,
     *,
     now: datetime | None = None,
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     if (
         state is None
         or state.current_run is None
@@ -261,17 +261,38 @@ def _fresh_watching_channels(
         or state.watching_updated_at is None
         or state.watching_updated_at < (now or timezone.now()) - WATCHING_CHANNELS_FRESH_FOR
     ):
-        return []
-    requested = {
+        return [], []
+    requested_online = {
         channel.casefold()
-        for channel in state.watching_channels
+        for channel in state.online_channels
         if isinstance(channel, str)
     }
-    return [
+    online = [
         channel
         for channel in state.current_run.channels
-        if isinstance(channel, str) and channel.casefold() in requested
+        if isinstance(channel, str) and channel.casefold() in requested_online
+    ]
+    online_names = {channel.casefold() for channel in online}
+    requested_watching = {
+        channel.casefold()
+        for channel in state.watching_channels
+        if isinstance(channel, str) and channel.casefold() in online_names
+    }
+    watching = [
+        channel
+        for channel in state.current_run.channels
+        if isinstance(channel, str) and channel.casefold() in requested_watching
     ][:2]
+    return watching, online
+
+
+def _fresh_watching_channels(
+    state: MinerInstanceState | None,
+    *,
+    now: datetime | None = None,
+) -> list[str]:
+    watching, _online = _fresh_channel_status(state, now=now)
+    return watching
 
 
 @dataclass(frozen=True, slots=True)
@@ -468,6 +489,7 @@ def _serialize_account(row: AccountTelemetry) -> dict[str, Any]:
     )
     if expired and auth_status == MinerInstanceState.AuthenticationStatus.PENDING:
         auth_status = MinerInstanceState.AuthenticationStatus.REAUTH_REQUIRED
+    watching_channels, online_channels = _fresh_channel_status(state)
     return {
         "id": account.pk,
         "config_key": account.config_key,
@@ -504,7 +526,8 @@ def _serialize_account(row: AccountTelemetry) -> dict[str, Any]:
             "label": row.source_label,
             "channels": list(row.channels),
         },
-        "watching_channels": _fresh_watching_channels(state),
+        "watching_channels": watching_channels,
+        "online_channels": online_channels,
         "watching_updated_at": _iso(state.watching_updated_at) if state else None,
         "pid": row.pid,
         "last_heartbeat": _iso(row.last_heartbeat),

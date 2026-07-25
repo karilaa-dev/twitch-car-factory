@@ -118,6 +118,9 @@ def test_control_events_are_validated_and_never_written_as_library_output(tmp_pa
         '{"event":"watching_channels","channels":["one","ONE"]}',
         '{"event":"watching_channels","channels":[1]}',
         '{"event":"watching_channels","channels":[],"extra":true}',
+        '{"event":"watching_channels","channels":["one"],"online_channels":[]}',
+        '{"event":"watching_channels","channels":[],"online_channels":["one","ONE"]}',
+        '{"event":"watching_channels","channels":[],"online_channels":"one"}',
     ],
 )
 def test_watching_channel_control_events_reject_invalid_payloads(payload):
@@ -133,10 +136,19 @@ def test_watching_channel_control_event_accepts_empty_and_ordered_channels():
     assert event == {
         "event": "watching_channels",
         "channels": ["First", "second"],
+        "online_channels": ["First", "second"],
+    }
+    assert _parse_control_event(
+        CONTROL_EVENT_PREFIX
+        + '{"event":"watching_channels","channels":["First"],"online_channels":["third","First","second"]}'
+    ) == {
+        "event": "watching_channels",
+        "channels": ["First"],
+        "online_channels": ["third", "First", "second"],
     }
     assert _parse_control_event(
         CONTROL_EVENT_PREFIX + '{"event":"watching_channels","channels":[]}'
-    ) == {"event": "watching_channels", "channels": []}
+    ) == {"event": "watching_channels", "channels": [], "online_channels": []}
 
 
 def test_runtime_log_tail_reads_rotation_in_order_and_bounds_output(tmp_path):

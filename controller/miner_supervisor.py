@@ -261,6 +261,7 @@ def safe_error(value: object, *, limit: int = 2000) -> str:
 
 def _clear_watching_state(state: MinerInstanceState) -> None:
     state.watching_channels = []
+    state.online_channels = []
     state.watching_updated_at = None
 
 
@@ -268,7 +269,7 @@ def _parse_control_event(line: str) -> dict[str, object] | None:
     if not line.startswith(CONTROL_EVENT_PREFIX):
         return None
     payload = line[len(CONTROL_EVENT_PREFIX) :]
-    if len(payload) > 2048:
+    if len(payload) > 64 * 1024:
         raise ValueError("Control event exceeded the size limit.")
     try:
         event = json.loads(payload)
@@ -280,6 +281,8 @@ def _parse_control_event(line: str) -> dict[str, object] | None:
     if forbidden.intersection(str(key).casefold() for key in event):
         raise ValueError("Control event contained a forbidden secret field.")
     kind = event["event"]
+    if kind != "watching_channels" and len(payload) > 2048:
+        raise ValueError("Control event exceeded the size limit.")
     if kind == "device_code":
         if set(event) != {"event", "user_code", "verification_uri", "expires_in"}:
             raise ValueError("Device-code event has unexpected fields.")
@@ -301,18 +304,33 @@ def _parse_control_event(line: str) -> dict[str, object] | None:
             raise ValueError("Authentication-failure event has an invalid shape.")
         event["error"] = safe_error(event["error"], limit=500)
     elif kind == "watching_channels":
-        if set(event) != {"event", "channels"} or not isinstance(event.get("channels"), list):
+        fields = set(event)
+        if fields not in (
+            {"event", "channels"},
+            {"event", "channels", "online_channels"},
+        ) or not isinstance(event.get("channels"), list):
             raise ValueError("Watching-channels event has an invalid shape.")
         channels = event["channels"]
-        if len(channels) > 2:
+        online_channels = event.get("online_channels", channels)
+        if not isinstance(online_channels, list):
+            raise ValueError("Watching-channels event has an invalid online-channel list.")
+        if len(channels) > 2 or len(online_channels) > 1000:
             raise ValueError("Watching-channels event exceeded the channel limit.")
         try:
             normalized = services.normalize_channels(channels, require_nonempty=False)
+            normalized_online = services.normalize_channels(
+                online_channels,
+                require_nonempty=False,
+            )
         except ValidationError as exc:
             raise ValueError("Watching-channels event has invalid channel names.") from exc
-        if len(normalized) != len(channels):
+        if len(normalized) != len(channels) or len(normalized_online) != len(online_channels):
             raise ValueError("Watching-channels event has duplicate or empty channel names.")
+        online_names = {channel.casefold() for channel in normalized_online}
+        if any(channel.casefold() not in online_names for channel in normalized):
+            raise ValueError("Watching channels must be included in online channels.")
         event["channels"] = normalized
+        event["online_channels"] = normalized_online
     else:
         raise ValueError("Control event type is unsupported.")
     return event
@@ -1315,6 +1333,7 @@ class MinerSupervisor:
                     "next_retry_at",
                     "stable_since",
                     "watching_channels",
+                    "online_channels",
                     "watching_updated_at",
                     "updated_at",
                 )
@@ -2297,8 +2316,15 @@ class MinerSupervisor:
             for channel in run.channels
             if isinstance(channel, str)
         }
-        requested = [str(channel).casefold() for channel in event["channels"]]
-        if any(channel not in by_name for channel in requested):
+        requested = {str(channel).casefold() for channel in event["channels"]}
+        requested_online = {
+            str(channel).casefold()
+            for channel in event.get("online_channels", event["channels"])
+        }
+        if any(
+            channel not in by_name
+            for channel in requested | requested_online
+        ):
             self._write_managed_lifecycle(
                 managed,
                 "watching_channels_rejected",
@@ -2310,11 +2336,18 @@ class MinerSupervisor:
             for channel in run.channels
             if isinstance(channel, str) and channel.casefold() in requested
         ]
+        online = [
+            channel
+            for channel in run.channels
+            if isinstance(channel, str) and channel.casefold() in requested_online
+        ]
         state.watching_channels = selected
+        state.online_channels = online
         state.watching_updated_at = self.now()
         state.save(
             update_fields=(
                 "watching_channels",
+                "online_channels",
                 "watching_updated_at",
                 "updated_at",
             )
@@ -3037,6 +3070,7 @@ class MinerSupervisor:
             next_retry_at=None,
             stable_since=None,
             watching_channels=[],
+            online_channels=[],
             watching_updated_at=None,
             last_heartbeat=now,
             last_error="",

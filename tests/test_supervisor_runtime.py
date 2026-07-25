@@ -267,18 +267,24 @@ def test_watching_channel_events_are_canonical_and_clear_on_stop(tmp_path, setti
     managed = supervisor.processes[account.pk]
 
     managed.put_control_event(
-        {"event": "watching_channels", "channels": ["gamma", "ALPHA"]}
+        {
+            "event": "watching_channels",
+            "channels": ["gamma", "ALPHA"],
+            "online_channels": ["gamma", "beta", "ALPHA"],
+        }
     )
     supervisor.check_health()
 
     state = MinerInstanceState.objects.get(account=account)
     assert state.watching_channels == ["Alpha", "Gamma"]
+    assert state.online_channels == ["Alpha", "Beta", "Gamma"]
     assert state.watching_updated_at == clock.now()
 
     managed.put_control_event({"event": "watching_channels", "channels": []})
     supervisor.check_health()
     state.refresh_from_db()
     assert state.watching_channels == []
+    assert state.online_channels == []
     assert state.watching_updated_at == clock.now()
 
     managed.put_control_event({"event": "watching_channels", "channels": ["Beta"]})
@@ -286,6 +292,7 @@ def test_watching_channel_events_are_canonical_and_clear_on_stop(tmp_path, setti
     supervisor.stop_account(account)
     state.refresh_from_db()
     assert state.watching_channels == []
+    assert state.online_channels == []
     assert state.watching_updated_at is None
 
     state.desired_state = MinerInstanceState.DesiredState.RUNNING
@@ -297,6 +304,7 @@ def test_watching_channel_events_are_canonical_and_clear_on_stop(tmp_path, setti
     state.refresh_from_db()
     assert state.current_run_id == replacement.run_id
     assert state.watching_channels == []
+    assert state.online_channels == []
 
 
 @pytest.mark.django_db

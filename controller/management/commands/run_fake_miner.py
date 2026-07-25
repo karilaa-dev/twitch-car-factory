@@ -123,7 +123,11 @@ class Command(BaseCommand):
             authenticated = True
 
         if authenticated:
-            emit_control_event("watching_channels", channels=channels[:2])
+            emit_control_event(
+                "watching_channels",
+                channels=channels[:2],
+                online_channels=channels,
+            )
 
         exit_code = options["exit_code"]
         if mode == "exit-immediately":

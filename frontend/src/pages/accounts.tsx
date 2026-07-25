@@ -777,6 +777,7 @@ function AccountRuntime({
             current={live.source}
             planned={plannedSource}
             watchingChannels={live.watching_channels}
+            onlineChannels={live.online_channels}
           />
         </CardContent>
       </Card>

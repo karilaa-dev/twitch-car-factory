@@ -17,6 +17,7 @@ describe("LaunchSource", () => {
         current={current}
         planned={{ ...current }}
         watchingChannels={["TWITCHGAMING"]}
+        onlineChannels={["twitchgaming", "MONSTERCAT"]}
       />
     )
 
@@ -36,8 +37,8 @@ describe("LaunchSource", () => {
       screen.getByLabelText("twitchgaming (currently watched)")
     ).toHaveAttribute("data-variant", "success")
     expect(
-      screen.getByLabelText("monstercat (not currently watched)")
-    ).toHaveAttribute("data-variant", "outline")
+      screen.getByLabelText("monstercat (online, not currently watched)")
+    ).toHaveAttribute("data-variant", "warning")
   })
 
   it("highlights changed source fields without tinting the comparison card", () => {
@@ -51,6 +52,7 @@ describe("LaunchSource", () => {
         current={current}
         planned={planned}
         watchingChannels={["MONSTERCAT", "rocketleague"]}
+        onlineChannels={["twitchgaming", "MONSTERCAT", "rocketleague"]}
       />
     )
 
@@ -67,10 +69,11 @@ describe("LaunchSource", () => {
       "data-variant",
       "success"
     )
-    expect(within(diff).getByText("twitchgaming")).toHaveAttribute(
-      "data-variant",
-      "destructive"
-    )
+    expect(
+      within(diff).getByLabelText(
+        "twitchgaming (online, not currently watched)"
+      )
+    ).toHaveAttribute("data-variant", "warning")
     expect(
       within(diff).getByLabelText("monstercat (currently watched)")
     ).toHaveAttribute("data-variant", "success")
@@ -88,6 +91,27 @@ describe("LaunchSource", () => {
     expect(within(diff).getByText("Account override")).toHaveClass(
       "text-muted-foreground"
     )
+  })
+
+  it("keeps live channel status when only the source reference changes", () => {
+    render(
+      <LaunchSource
+        current={current}
+        planned={{ ...current, mode: "custom", name: "primary" }}
+        watchingChannels={["monstercat"]}
+        onlineChannels={["twitchgaming", "monstercat"]}
+      />
+    )
+
+    const diff = screen.getByLabelText("Launch source diff")
+    expect(
+      within(diff).getByLabelText("monstercat (currently watched)")
+    ).toHaveAttribute("data-variant", "success")
+    expect(
+      within(diff).getByLabelText(
+        "twitchgaming (online, not currently watched)"
+      )
+    ).toHaveAttribute("data-variant", "warning")
   })
 
   it("keeps an unchanged mode and reference neutral when only channels change", () => {

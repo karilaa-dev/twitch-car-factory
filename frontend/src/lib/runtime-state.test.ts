@@ -28,6 +28,7 @@ function account(
     observed,
     source: { mode: "default", name: "default", channels: [] },
     watching_channels: [],
+    online_channels: [],
     watching_updated_at: null,
     pid: null,
     last_heartbeat: null,

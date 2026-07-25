@@ -362,6 +362,7 @@ class MinerInstanceState(models.Model):
     stable_since = models.DateTimeField(null=True, blank=True)
     last_heartbeat = models.DateTimeField(null=True, blank=True)
     watching_channels = models.JSONField(default=list, blank=True)
+    online_channels = models.JSONField(default=list, blank=True)
     watching_updated_at = models.DateTimeField(null=True, blank=True)
     last_error = models.TextField(blank=True)
     authentication_status = models.CharField(
@@ -388,11 +389,19 @@ class MinerInstanceState(models.Model):
             not in (self.ObservedState.STARTING, self.ObservedState.RUNNING)
         ):
             self.watching_channels = []
+            self.online_channels = []
             self.watching_updated_at = None
             update_fields = kwargs.get("update_fields")
             if update_fields is not None:
                 kwargs["update_fields"] = tuple(
-                    dict.fromkeys((*update_fields, "watching_channels", "watching_updated_at"))
+                    dict.fromkeys(
+                        (
+                            *update_fields,
+                            "watching_channels",
+                            "online_channels",
+                            "watching_updated_at",
+                        )
+                    )
                 )
         super().save(*args, **kwargs)
 

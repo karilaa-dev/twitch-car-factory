@@ -82,6 +82,7 @@ export interface AccountSummary {
   observed: RuntimeStatus
   source: ChannelSource
   watching_channels: string[]
+  online_channels: string[]
   watching_updated_at: string | null
   pid: number | null
   last_heartbeat: string | null

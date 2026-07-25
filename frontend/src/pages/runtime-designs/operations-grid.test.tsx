@@ -26,9 +26,10 @@ const account: AccountSummary = {
   source: {
     mode: "default",
     name: "Farm defaults",
-    channels: ["Channel_One", "channel_two"],
+    channels: ["offline", "online_only", "watched_b", "watched_a"],
   },
-  watching_channels: ["channel_one"],
+  watching_channels: ["watched_b", "watched_a"],
+  online_channels: ["online_only", "watched_b", "watched_a"],
   watching_updated_at: "2026-07-24T12:00:00Z",
   pid: 42,
   last_heartbeat: "2026-07-24T12:00:00Z",
@@ -60,7 +61,7 @@ const snapshot: RuntimeSnapshot = {
 }
 
 describe("DesktopOperationsGrid", () => {
-  it("highlights watched channels in live account operations", () => {
+  it("groups watched, online, and offline channels in live account operations", () => {
     render(
       <MemoryRouter>
         <DesktopOperationsGrid
@@ -73,11 +74,19 @@ describe("DesktopOperationsGrid", () => {
       </MemoryRouter>
     )
 
+    const channels = screen.getByLabelText(
+      "Farming channels ordered by live status: watched, online, then offline"
+    )
+    expect(channels.textContent).toBe("watched_bwatched_aonline_onlyoffline")
     expect(
-      screen.getByLabelText("Channel_One (currently watched)")
+      screen.getByLabelText("watched_b (currently watched)")
     ).toHaveAttribute("data-variant", "success")
     expect(
-      screen.getByLabelText("channel_two (not currently watched)")
+      screen.getByLabelText("online_only (online, not currently watched)")
+    ).toHaveAttribute("data-variant", "warning")
+    expect(
+      screen.getByLabelText("offline (offline or status unavailable)")
     ).toHaveAttribute("data-variant", "outline")
+    expect(screen.queryByText(/^\+\d+$/)).not.toBeInTheDocument()
   })
 })

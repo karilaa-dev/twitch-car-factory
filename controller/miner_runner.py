@@ -49,6 +49,21 @@ def _snapshot_streamers(streamers: object) -> tuple[WatchingStreamerSnapshot, ..
     )
 
 
+def online_ordered_channels(streamers: object) -> list[str]:
+    """Return every Twitch-detected online channel in source order."""
+
+    online: list[str] = []
+    for streamer in streamers:
+        username = getattr(streamer, "username", "")
+        if (
+            getattr(streamer, "is_online", False) is True
+            and isinstance(username, str)
+            and username
+        ):
+            online.append(username)
+    return online
+
+
 def selected_ordered_channels(
     streamers: object,
     *,
@@ -74,15 +89,21 @@ def selected_ordered_channels(
 
 
 def _observe_watching_channels(streamers: object, stopped: threading.Event) -> None:
-    previous: tuple[str, ...] | None = None
+    previous: tuple[tuple[str, ...], tuple[str, ...]] | None = None
     refreshed_at = 0.0
     while not stopped.is_set():
         now = time.monotonic()
         snapshot = _snapshot_streamers(streamers)
         selected = tuple(selected_ordered_channels(snapshot))
-        if selected != previous or now - refreshed_at >= 60:
-            emit_control_event("watching_channels", channels=list(selected))
-            previous = selected
+        online = tuple(online_ordered_channels(snapshot))
+        current = (selected, online)
+        if current != previous or now - refreshed_at >= 60:
+            emit_control_event(
+                "watching_channels",
+                channels=list(selected),
+                online_channels=list(online),
+            )
+            previous = current
             refreshed_at = now
         stopped.wait(2)
 
@@ -311,7 +332,11 @@ def run_miner(payload: LaunchPayload) -> None:
         finally:
             stopped.set()
             observer.join(timeout=3)
-            emit_control_event("watching_channels", channels=[])
+            emit_control_event(
+                "watching_channels",
+                channels=[],
+                online_channels=[],
+            )
 
     TwitchLogin.send_oauth_request = observed_oauth_request
     Twitch.send_minute_watched_events = observed_send_minute_watched_events

@@ -268,8 +268,16 @@ class ApiContractTests(TestCase):
             expires_at=timezone.now() + timedelta(seconds=30),
         )
         self.state.watching_channels = ["twitch"]
+        self.state.online_channels = ["twitch"]
         self.state.watching_updated_at = timezone.now()
-        self.state.save(update_fields=("watching_channels", "watching_updated_at", "updated_at"))
+        self.state.save(
+            update_fields=(
+                "watching_channels",
+                "online_channels",
+                "watching_updated_at",
+                "updated_at",
+            )
+        )
 
         response = self.client.get(self.api("runtime"))
         data = self.assert_envelope(response)
@@ -277,6 +285,7 @@ class ApiContractTests(TestCase):
         self.assertEqual(data["summary"]["observed_running"], 1)
         self.assertEqual(data["accounts"][0]["source"]["channels"], run.channels)
         self.assertEqual(data["accounts"][0]["watching_channels"], ["twitch"])
+        self.assertEqual(data["accounts"][0]["online_channels"], ["twitch"])
         self.assertIsNotNone(data["accounts"][0]["watching_updated_at"])
         self.assertEqual(data["incidents"][0]["id"], incident.pk)
         self.assertEqual(data["command_faults"][0]["id"], command.pk)
@@ -310,6 +319,7 @@ class ApiContractTests(TestCase):
         self.state.current_run = run
         self.state.observed_state = MinerInstanceState.ObservedState.RUNNING
         self.state.watching_channels = ["beta", "ALPHA"]
+        self.state.online_channels = ["gamma", "beta", "ALPHA"]
         self.state.watching_updated_at = timezone.now()
         self.state.save()
 
@@ -317,6 +327,8 @@ class ApiContractTests(TestCase):
         by_name = {preset["name"]: preset for preset in presets}
         self.assertEqual(by_name["Watched"]["watching_channels"], ["Alpha", "Beta"])
         self.assertEqual(by_name["Unrelated"]["watching_channels"], [])
+        runtime = self.assert_envelope(self.client.get(self.api("runtime")))
+        self.assertEqual(runtime["accounts"][0]["online_channels"], ["Alpha", "Beta", "Gamma"])
 
         self.account.selection.preset = unrelated_preset
         self.account.selection.save(update_fields=("preset", "updated_at"))
@@ -329,6 +341,7 @@ class ApiContractTests(TestCase):
         self.state.save(update_fields=("watching_updated_at", "updated_at"))
         runtime = self.assert_envelope(self.client.get(self.api("runtime")))
         self.assertEqual(runtime["accounts"][0]["watching_channels"], [])
+        self.assertEqual(runtime["accounts"][0]["online_channels"], [])
 
     def credential_ciphertext(self):
         return AccountCredential.objects.get(account=self.account).password_ciphertext

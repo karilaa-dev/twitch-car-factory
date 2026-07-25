@@ -85,3 +85,83 @@ export function WatchedChannelList({
     />
   )
 }
+
+type RuntimeChannelListProps = Pick<
+  ChannelListProps,
+  "channels" | "empty" | "className" | "ariaLabel"
+> & {
+  watchingChannels: string[]
+  onlineChannels: string[]
+  getInactiveVariant?: (
+    channel: string,
+    originalIndex: number
+  ) => React.ComponentProps<typeof Badge>["variant"]
+}
+
+export function RuntimeChannelLegend() {
+  return (
+    <div
+      className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground"
+      role="group"
+      aria-label="Live channel status legend"
+    >
+      <Badge variant="success">Currently watched</Badge>
+      <Badge variant="warning">Online, not watched</Badge>
+      <Badge variant="outline">Offline or unknown</Badge>
+    </div>
+  )
+}
+
+export function RuntimeChannelList({
+  channels,
+  watchingChannels,
+  onlineChannels,
+  getInactiveVariant,
+  ariaLabel = "Farming channels ordered by live status: watched, online, then offline",
+  ...props
+}: RuntimeChannelListProps) {
+  const watched = new Set(watchingChannels.map(normalizeChannel))
+  const online = new Set(onlineChannels.map(normalizeChannel))
+  const isWatching = (channel: string) => watched.has(normalizeChannel(channel))
+  const isOnline = (channel: string) => online.has(normalizeChannel(channel))
+  const indexedChannels = channels.map((channel, originalIndex) => ({
+    channel,
+    originalIndex,
+  }))
+  const ordered = [
+    ...indexedChannels.filter(({ channel }) => isWatching(channel)),
+    ...indexedChannels.filter(
+      ({ channel }) => !isWatching(channel) && isOnline(channel)
+    ),
+    ...indexedChannels.filter(
+      ({ channel }) => !isWatching(channel) && !isOnline(channel)
+    ),
+  ]
+
+  return (
+    <ChannelList
+      {...props}
+      channels={ordered.map(({ channel }) => channel)}
+      ariaLabel={ariaLabel}
+      getVariant={(channel, index) =>
+        isWatching(channel)
+          ? "success"
+          : isOnline(channel)
+            ? "warning"
+            : (getInactiveVariant?.(
+                channel,
+                ordered[index]?.originalIndex ?? -1
+              ) ?? "outline")
+      }
+      getChannelAriaLabel={(channel) =>
+        `${channel} (${
+          isWatching(channel)
+            ? "currently watched"
+            : isOnline(channel)
+              ? "online, not currently watched"
+              : "offline or status unavailable"
+        })`
+      }
+    />
+  )
+}

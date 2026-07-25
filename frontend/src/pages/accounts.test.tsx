@@ -33,10 +33,19 @@ const account: AccountDetail = {
   authentication: pendingAuthentication,
   desired: "running",
   observed: "starting",
-  source: { mode: "default", name: "farm defaults", channels: ["one"] },
+  source: {
+    mode: "default",
+    name: "farm defaults",
+    channels: ["offline", "online", "one"],
+  },
   watching_channels: ["one"],
+  online_channels: ["online", "one"],
   watching_updated_at: new Date().toISOString(),
-  planned_source: { mode: "default", name: "Farm defaults", channels: ["one"] },
+  planned_source: {
+    mode: "default",
+    name: "Farm defaults",
+    channels: ["offline", "online", "one"],
+  },
   pid: 42,
   last_heartbeat: new Date().toISOString(),
   open_incident: null,
@@ -54,13 +63,13 @@ const account: AccountDetail = {
   commands: [],
 }
 
-function renderAuth() {
+function renderWorkspace(tab: "auth" | "runtime") {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
   return render(
     <QueryClientProvider client={client}>
-      <MemoryRouter initialEntries={["/accounts/1?tab=auth"]}>
+      <MemoryRouter initialEntries={[`/accounts/1?tab=${tab}`]}>
         <Routes>
           <Route path="/accounts/:id" element={<AccountWorkspacePage />} />
         </Routes>
@@ -119,6 +128,22 @@ describe("Account Twitch TV authentication", () => {
     })
   })
 
+  it("shows watched, online-only, and offline channels in runtime status order", async () => {
+    renderWorkspace("runtime")
+
+    expect(await screen.findByText("Runtime state")).toBeVisible()
+    const channels = screen.getByLabelText(
+      "Farming channels ordered by live status: watched, online, then offline"
+    )
+    expect(channels.textContent).toBe("oneonlineoffline")
+    expect(
+      screen.getByLabelText("one (currently watched)")
+    ).toHaveAttribute("data-variant", "success")
+    expect(
+      screen.getByLabelText("online (online, not currently watched)")
+    ).toHaveAttribute("data-variant", "warning")
+  })
+
   it("shows and copies a pending activation code with the Twitch link", async () => {
     const user = userEvent.setup()
     const writeText = vi.fn().mockResolvedValue(undefined)
@@ -126,7 +151,7 @@ describe("Account Twitch TV authentication", () => {
       configurable: true,
       value: { writeText },
     })
-    renderAuth()
+    renderWorkspace("auth")
 
     expect(await screen.findByText("FAKE-CODE")).toBeVisible()
     expect(

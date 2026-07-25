@@ -1,4 +1,4 @@
-import { ChannelList, WatchedChannelList } from "@/components/channel-list"
+import { ChannelList, RuntimeChannelList } from "@/components/channel-list"
 import { Badge } from "@/components/ui/badge"
 import { Separator } from "@/components/ui/separator"
 import { cn } from "@/lib/utils"
@@ -106,9 +106,11 @@ function DiffValue({
 function SourceSummary({
   source,
   watchingChannels,
+  onlineChannels,
 }: {
   source: ChannelSource
   watchingChannels: string[]
+  onlineChannels: string[]
 }) {
   const reference = sourceReference(source)
 
@@ -137,9 +139,10 @@ function SourceSummary({
       </dl>
       <div className="flex flex-col gap-1">
         <p className="text-xs text-muted-foreground">Farming channels</p>
-        <WatchedChannelList
+        <RuntimeChannelList
           channels={source.channels}
           watchingChannels={watchingChannels}
+          onlineChannels={onlineChannels}
         />
       </div>
     </div>
@@ -150,10 +153,12 @@ function SourceDiff({
   current,
   planned,
   watchingChannels,
+  onlineChannels,
 }: {
   current: ChannelSource
   planned: ChannelSource
   watchingChannels: string[]
+  onlineChannels: string[]
 }) {
   const currentReference = sourceReference(current)
   const plannedReference = sourceReference(planned)
@@ -169,12 +174,6 @@ function SourceDiff({
     current.channels,
     planned.channels
   )
-  const watched = new Set(
-    watchingChannels.map((channel) => channel.trim().toLowerCase())
-  )
-  const isWatching = (channel: string) =>
-    watched.has(channel.trim().toLowerCase())
-
   return (
     <div className="rounded-lg border p-3" aria-label="Launch source diff">
       <dl className="grid gap-4 sm:grid-cols-2">
@@ -258,18 +257,13 @@ function SourceDiff({
         {channelsChanged ? (
           <div className="flex min-w-0 flex-col gap-2">
             <DiffValue direction="current">
-              <ChannelList
+              <RuntimeChannelList
                 channels={current.channels}
-                ariaLabel="Current farming channels"
-                getVariant={(channel, index) =>
-                  isWatching(channel)
-                    ? "success"
-                    : currentIndexes.has(index)
-                      ? "outline"
-                      : "destructive"
-                }
-                getChannelAriaLabel={(channel) =>
-                  `${channel} (${isWatching(channel) ? "currently watched" : "not currently watched"})`
+                watchingChannels={watchingChannels}
+                onlineChannels={onlineChannels}
+                ariaLabel="Current farming channels ordered by live status"
+                getInactiveVariant={(_channel, index) =>
+                  currentIndexes.has(index) ? "outline" : "destructive"
                 }
               />
             </DiffValue>
@@ -284,7 +278,11 @@ function SourceDiff({
             </DiffValue>
           </div>
         ) : (
-          <ChannelList channels={current.channels} />
+          <RuntimeChannelList
+            channels={current.channels}
+            watchingChannels={watchingChannels}
+            onlineChannels={onlineChannels}
+          />
         )}
       </div>
     </div>
@@ -295,10 +293,12 @@ export function LaunchSource({
   current,
   planned,
   watchingChannels = [],
+  onlineChannels = [],
 }: {
   current: ChannelSource
   planned: ChannelSource
   watchingChannels?: string[]
+  onlineChannels?: string[]
 }) {
   const matches = launchSourcesMatch(current, planned)
 
@@ -318,12 +318,17 @@ export function LaunchSource({
         </p>
       </div>
       {matches ? (
-        <SourceSummary source={current} watchingChannels={watchingChannels} />
+        <SourceSummary
+          source={current}
+          watchingChannels={watchingChannels}
+          onlineChannels={onlineChannels}
+        />
       ) : (
         <SourceDiff
           current={current}
           planned={planned}
           watchingChannels={watchingChannels}
+          onlineChannels={onlineChannels}
         />
       )}
     </section>
