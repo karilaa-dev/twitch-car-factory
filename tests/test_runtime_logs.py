@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import io
+import json
 import logging
 import os
 import queue
@@ -149,6 +150,34 @@ def test_watching_channel_control_event_accepts_empty_and_ordered_channels():
     assert _parse_control_event(
         CONTROL_EVENT_PREFIX + '{"event":"watching_channels","channels":[]}'
     ) == {"event": "watching_channels", "channels": [], "online_channels": []}
+
+
+def test_large_watching_event_is_parsed_before_library_output_is_truncated():
+    channels = [
+        f"channel_{index:04d}_{'x' * 80}"
+        for index in range(100)
+    ]
+    payload = json.dumps(
+        {
+            "event": "watching_channels",
+            "channels": channels[:2],
+            "online_channels": channels,
+        },
+        separators=(",", ":"),
+    )
+    assert len(payload) > 8000
+    events = queue.SimpleQueue()
+
+    _drain_miner_output(
+        io.StringIO(CONTROL_EVENT_PREFIX + payload + "\n"),
+        "primary",
+        event_handler=events.put,
+    )
+
+    event = events.get_nowait()
+    assert event["channels"] == channels[:2]
+    assert event["online_channels"] == channels
+    assert events.empty()
 
 
 def test_runtime_log_tail_reads_rotation_in_order_and_bounds_output(tmp_path):

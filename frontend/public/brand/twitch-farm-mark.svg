@@ -5,5 +5,5 @@
   <path fill="#FFFFFF" d="M120 396V238l96-64v64l96-64v64h80v158H120Z"/>
   <rect x="168" y="294" width="48" height="58" rx="12" fill="#772CE8"/>
   <rect x="260" y="294" width="48" height="58" rx="12" fill="#772CE8"/>
-  <rect x="352" y="294" width="40" height="102" rx="12" fill="#772CE8"/>
+  <path fill="#772CE8" d="M352 396v-90c0-7 5-12 12-12h16c7 0 12 5 12 12v90h-40Z"/>
 </svg>

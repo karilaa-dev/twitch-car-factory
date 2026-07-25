@@ -107,7 +107,7 @@ function GeneralSettingsForm({ initial }: { initial: FarmSettings }) {
         method: "PUT",
         json: {
           default_channels: channels,
-          autostart_new_accounts: initial.autostart_new_accounts,
+          autostart_new_accounts: false,
         },
       }),
     onSuccess: async () => {

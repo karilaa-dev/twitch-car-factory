@@ -347,19 +347,19 @@ def _drain_miner_output(
     try:
         for raw_line in stream:
             unstyled_line = _ANSI_ESCAPE.sub("", raw_line.rstrip("\r\n"))
+            if unstyled_line.startswith(CONTROL_EVENT_PREFIX):
+                try:
+                    event = _parse_control_event(unstyled_line)
+                except ValueError as exc:
+                    logger.warning("Rejected miner control event for %s: %s", account_key, exc)
+                    if log_writer is not None:
+                        log_writer.lifecycle("control_event_rejected", error=safe_error(exc))
+                else:
+                    if event is not None and event_handler is not None:
+                        event_handler(event)
+                continue
             line = safe_error(unstyled_line, limit=8000)
             if line:
-                if line.startswith(CONTROL_EVENT_PREFIX):
-                    try:
-                        event = _parse_control_event(line)
-                    except ValueError as exc:
-                        logger.warning("Rejected miner control event for %s: %s", account_key, exc)
-                        if log_writer is not None:
-                            log_writer.lifecycle("control_event_rejected", error=safe_error(exc))
-                    else:
-                        if event is not None and event_handler is not None:
-                            event_handler(event)
-                    continue
                 # The pinned miner sets the root logger to DEBUG internally.
                 # Keep protocol payloads out of both combined and account logs
                 # even if its handler configuration regresses in a later fork.
