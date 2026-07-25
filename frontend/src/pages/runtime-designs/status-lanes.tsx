@@ -10,7 +10,10 @@ import {
   Wifi,
 } from "lucide-react"
 
-import { ChannelList } from "@/components/channel-list"
+import {
+  RuntimeChannelLegend,
+  RuntimeChannelList,
+} from "@/components/channel-list"
 import { ConfirmAction } from "@/components/confirm-action"
 import { CurrentState } from "@/components/current-state"
 import { InteractiveCard } from "@/components/interactive-card"
@@ -140,6 +143,8 @@ export function MobileStatusLanes({
           </ButtonGroup>
         }
       />
+
+      <RuntimeChannelLegend />
 
       {data.supervisor.status !== "healthy" ? (
         <Alert variant="destructive">
@@ -285,9 +290,10 @@ export function MobileStatusLanes({
                                 {account.source.mode}
                               </Badge>
                             </div>
-                            <ChannelList
+                            <RuntimeChannelList
                               channels={account.source.channels}
-                              limit={3}
+                              watchingChannels={account.watching_channels}
+                              onlineChannels={account.online_channels}
                             />
                           </div>
                           <div className="flex items-center justify-between gap-2 border-t pt-2 text-xs text-muted-foreground">

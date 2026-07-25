@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
 import json
 import logging
@@ -242,6 +242,59 @@ def _iso(value: datetime | None) -> str | None:
     return value.isoformat().replace("+00:00", "Z") if value else None
 
 
+WATCHING_CHANNELS_FRESH_FOR = timedelta(minutes=5)
+
+
+def _fresh_channel_status(
+    state: MinerInstanceState | None,
+    *,
+    now: datetime | None = None,
+) -> tuple[list[str], list[str]]:
+    if (
+        state is None
+        or state.current_run is None
+        or state.observed_state
+        not in (
+            MinerInstanceState.ObservedState.STARTING,
+            MinerInstanceState.ObservedState.RUNNING,
+        )
+        or state.watching_updated_at is None
+        or state.watching_updated_at < (now or timezone.now()) - WATCHING_CHANNELS_FRESH_FOR
+    ):
+        return [], []
+    requested_online = {
+        channel.casefold()
+        for channel in state.online_channels
+        if isinstance(channel, str)
+    }
+    online = [
+        channel
+        for channel in state.current_run.channels
+        if isinstance(channel, str) and channel.casefold() in requested_online
+    ]
+    online_names = {channel.casefold() for channel in online}
+    requested_watching = {
+        channel.casefold()
+        for channel in state.watching_channels
+        if isinstance(channel, str) and channel.casefold() in online_names
+    }
+    watching = [
+        channel
+        for channel in state.current_run.channels
+        if isinstance(channel, str) and channel.casefold() in requested_watching
+    ][:2]
+    return watching, online
+
+
+def _fresh_watching_channels(
+    state: MinerInstanceState | None,
+    *,
+    now: datetime | None = None,
+) -> list[str]:
+    watching, _online = _fresh_channel_status(state, now=now)
+    return watching
+
+
 @dataclass(frozen=True, slots=True)
 class AccountTelemetry:
     account: MinerAccount
@@ -436,6 +489,7 @@ def _serialize_account(row: AccountTelemetry) -> dict[str, Any]:
     )
     if expired and auth_status == MinerInstanceState.AuthenticationStatus.PENDING:
         auth_status = MinerInstanceState.AuthenticationStatus.REAUTH_REQUIRED
+    watching_channels, online_channels = _fresh_channel_status(state)
     return {
         "id": account.pk,
         "config_key": account.config_key,
@@ -472,6 +526,9 @@ def _serialize_account(row: AccountTelemetry) -> dict[str, Any]:
             "label": row.source_label,
             "channels": list(row.channels),
         },
+        "watching_channels": watching_channels,
+        "online_channels": online_channels,
+        "watching_updated_at": _iso(state.watching_updated_at) if state else None,
         "pid": row.pid,
         "last_heartbeat": _iso(row.last_heartbeat),
         "open_incident": (
@@ -537,18 +594,39 @@ def _serialize_run(run: MinerRun) -> dict[str, Any]:
 
 
 def _preset_summary(preset: ChannelPreset) -> dict[str, Any]:
+    channels = [channel.name for channel in preset.channels.all()]
+    watched: set[str] = set()
+    assignments = list(preset.account_selections.all())
+    for assignment in assignments:
+        try:
+            state = assignment.account.runtime_state
+        except MinerInstanceState.DoesNotExist:
+            continue
+        if (
+            state.current_run is None
+            or state.current_run.source_mode != AccountChannelSelection.Mode.PRESET
+            or state.current_run.source_name != preset.name
+        ):
+            continue
+        watched.update(channel.casefold() for channel in _fresh_watching_channels(state))
     return {
         "id": preset.pk,
         "name": preset.name,
-        "channels": [channel.name for channel in preset.channels.all()],
-        "assignment_count": len(preset.account_selections.all()),
+        "channels": channels,
+        "watching_channels": [
+            channel for channel in channels if channel.casefold() in watched
+        ],
+        "assignment_count": len(assignments),
         "updated_at": _iso(preset.updated_at),
     }
 
 
 def _preset_queryset():
     return ChannelPreset.objects.prefetch_related(
-        "channels", "account_selections", "account_selections__account"
+        "channels",
+        "account_selections",
+        "account_selections__account",
+        "account_selections__account__runtime_state__current_run",
     ).order_by("name")
 
 

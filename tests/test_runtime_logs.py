@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import io
+import json
 import logging
 import os
 import queue
@@ -12,7 +13,7 @@ import pytest
 from django.test import override_settings
 
 from controller.miner_runner import CONTROL_EVENT_PREFIX
-from controller.miner_supervisor import _drain_miner_output
+from controller.miner_supervisor import _drain_miner_output, _parse_control_event
 from controller import runtime_logs
 from controller.runtime_logs import (
     MAX_LOG_BYTES,
@@ -96,7 +97,7 @@ def test_control_events_are_validated_and_never_written_as_library_output(tmp_pa
             ),
             "primary",
             writer,
-            events,
+            events.put,
         )
         writer.finalize("done")
         page = read_run_log_page(account_id=7, run_id=91)
@@ -109,6 +110,74 @@ def test_control_events_are_validated_and_never_written_as_library_output(tmp_pa
     assert "INFO library account=primary run=91: upstream info" in rendered
     assert "must-not-pass" not in rendered
     assert "control_event_rejected" in rendered
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"event":"watching_channels","channels":["one","two","three"]}',
+        '{"event":"watching_channels","channels":["one","ONE"]}',
+        '{"event":"watching_channels","channels":[1]}',
+        '{"event":"watching_channels","channels":[],"extra":true}',
+        '{"event":"watching_channels","channels":["one"],"online_channels":[]}',
+        '{"event":"watching_channels","channels":[],"online_channels":["one","ONE"]}',
+        '{"event":"watching_channels","channels":[],"online_channels":"one"}',
+    ],
+)
+def test_watching_channel_control_events_reject_invalid_payloads(payload):
+    with pytest.raises(ValueError):
+        _parse_control_event(CONTROL_EVENT_PREFIX + payload)
+
+
+def test_watching_channel_control_event_accepts_empty_and_ordered_channels():
+    event = _parse_control_event(
+        CONTROL_EVENT_PREFIX
+        + '{"event":"watching_channels","channels":["First","second"]}'
+    )
+    assert event == {
+        "event": "watching_channels",
+        "channels": ["First", "second"],
+        "online_channels": ["First", "second"],
+    }
+    assert _parse_control_event(
+        CONTROL_EVENT_PREFIX
+        + '{"event":"watching_channels","channels":["First"],"online_channels":["third","First","second"]}'
+    ) == {
+        "event": "watching_channels",
+        "channels": ["First"],
+        "online_channels": ["third", "First", "second"],
+    }
+    assert _parse_control_event(
+        CONTROL_EVENT_PREFIX + '{"event":"watching_channels","channels":[]}'
+    ) == {"event": "watching_channels", "channels": [], "online_channels": []}
+
+
+def test_large_watching_event_is_parsed_before_library_output_is_truncated():
+    channels = [
+        f"channel_{index:04d}_{'x' * 80}"
+        for index in range(100)
+    ]
+    payload = json.dumps(
+        {
+            "event": "watching_channels",
+            "channels": channels[:2],
+            "online_channels": channels,
+        },
+        separators=(",", ":"),
+    )
+    assert len(payload) > 8000
+    events = queue.SimpleQueue()
+
+    _drain_miner_output(
+        io.StringIO(CONTROL_EVENT_PREFIX + payload + "\n"),
+        "primary",
+        event_handler=events.put,
+    )
+
+    event = events.get_nowait()
+    assert event["channels"] == channels[:2]
+    assert event["online_channels"] == channels
+    assert events.empty()
 
 
 def test_runtime_log_tail_reads_rotation_in_order_and_bounds_output(tmp_path):

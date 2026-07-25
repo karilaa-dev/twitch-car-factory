@@ -32,6 +32,9 @@ function account(
       name: "Farm defaults",
       channels: ["channel_one"],
     },
+    watching_channels: [],
+    online_channels: [],
+    watching_updated_at: null,
     pid: id,
     last_heartbeat: "2026-07-15T12:00:00Z",
     open_incident: null,
@@ -88,6 +91,44 @@ describe("MobileStatusLanes", () => {
     expect(
       screen.queryByRole("heading", { name: "Stopped or idle" })
     ).not.toBeInTheDocument()
+  })
+
+  it("groups each account's watched, online, and offline channels", () => {
+    render(
+      <MemoryRouter>
+        <MobileStatusLanes
+          data={snapshot([
+            account(1, {
+              source: {
+                mode: "default",
+                name: "Farm defaults",
+                channels: ["offline", "Online_Only", "watched_b", "watched_a"],
+              },
+              watching_channels: ["WATCHED_A", "watched_b"],
+              online_channels: ["online_only", "watched_b", "watched_a"],
+            }),
+          ])}
+          globalPending={false}
+          accountPending={false}
+          onGlobalAction={vi.fn()}
+          onAccountAction={vi.fn()}
+        />
+      </MemoryRouter>
+    )
+
+    const channels = screen.getByLabelText(
+      "Farming channels ordered by live status: watched, online, then offline"
+    )
+    expect(channels.textContent).toBe("watched_bwatched_aOnline_Onlyoffline")
+    expect(
+      screen.getByLabelText("watched_a (currently watched)")
+    ).toHaveAttribute("data-variant", "success")
+    expect(
+      screen.getByLabelText("Online_Only (online, not currently watched)")
+    ).toHaveAttribute("data-variant", "warning")
+    expect(
+      screen.getByLabelText("offline (offline or status unavailable)")
+    ).toHaveAttribute("data-variant", "outline")
   })
 
   it("keeps each populated lane visible", () => {

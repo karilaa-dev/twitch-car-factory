@@ -30,7 +30,7 @@ import { toast } from "sonner"
 import { z } from "zod"
 
 import { ChannelEditor } from "@/components/channel-editor"
-import { ChannelList } from "@/components/channel-list"
+import { ChannelList, WatchedChannelList } from "@/components/channel-list"
 import { ConfirmAction } from "@/components/confirm-action"
 import { CurrentState } from "@/components/current-state"
 import {
@@ -77,7 +77,6 @@ import {
 } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
 import { Spinner } from "@/components/ui/spinner"
-import { Switch } from "@/components/ui/switch"
 import {
   Table,
   TableBody,
@@ -138,7 +137,11 @@ export function AccountsPage() {
         cell: ({ row }) => (
           <div className="grid max-w-72 gap-1">
             <span>{row.original.source.label}</span>
-            <ChannelList channels={row.original.source.channels} limit={3} />
+            <WatchedChannelList
+              channels={row.original.source.channels}
+              watchingChannels={row.original.watching_channels}
+              limit={3}
+            />
           </div>
         ),
       }),
@@ -246,7 +249,10 @@ export function AccountsPage() {
                         <p className="mb-1 text-xs text-muted-foreground">
                           Channel source · {account.source.label}
                         </p>
-                        <ChannelList channels={account.source.channels} />
+                        <WatchedChannelList
+                          channels={account.source.channels}
+                          watchingChannels={account.watching_channels}
+                        />
                       </div>
                     </CardContent>
                   </InteractiveCard>
@@ -288,7 +294,6 @@ const createSchema = z
     mode: z.enum(["default", "custom", "preset"]),
     preset_id: z.number().nullable(),
     channels: z.array(z.string()),
-    start_after_save: z.boolean(),
   })
   .superRefine((value, context) => {
     if (value.mode === "preset" && !value.preset_id)
@@ -322,13 +327,8 @@ export function NewAccountPage() {
       mode: "default",
       preset_id: null,
       channels: [],
-      start_after_save: false,
     },
   })
-  React.useEffect(() => {
-    if (accounts.data)
-      form.setValue("start_after_save", accounts.data.autostart_new_accounts)
-  }, [accounts.data, form])
   const submit = async (values: CreateValues) => {
     setPending(true)
     try {
@@ -348,7 +348,6 @@ export function NewAccountPage() {
           "mode",
           "preset_id",
           "channels",
-          "start_after_save",
         ],
         aliases: {
           custom_channels: "channels",
@@ -555,26 +554,6 @@ export function NewAccountPage() {
                   </AlertDescription>
                 </Alert>
               ) : null}
-              <Controller
-                name="start_after_save"
-                control={form.control}
-                render={({ field }) => (
-                  <Field orientation="horizontal">
-                    <FieldLabel htmlFor="start-after-save">
-                      <FieldTitle>Start after saving</FieldTitle>
-                      <FieldDescription>
-                        Validate the complete launch source before recording
-                        running intent.
-                      </FieldDescription>
-                    </FieldLabel>
-                    <Switch
-                      id="start-after-save"
-                      checked={field.value}
-                      onCheckedChange={field.onChange}
-                    />
-                  </Field>
-                )}
-              />
               <FieldError errors={[form.formState.errors.root]} />
               <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
                 <Button
@@ -766,7 +745,12 @@ function AccountRuntime({
             </div>
           </dl>
           <Separator />
-          <LaunchSource current={live.source} planned={plannedSource} />
+          <LaunchSource
+            current={live.source}
+            planned={plannedSource}
+            watchingChannels={live.watching_channels}
+            onlineChannels={live.online_channels}
+          />
         </CardContent>
       </Card>
       <AccountChannelSourceSettings

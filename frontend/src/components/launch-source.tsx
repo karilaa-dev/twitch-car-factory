@@ -1,4 +1,4 @@
-import { ChannelList } from "@/components/channel-list"
+import { ChannelList, RuntimeChannelList } from "@/components/channel-list"
 import { Badge } from "@/components/ui/badge"
 import { Separator } from "@/components/ui/separator"
 import { cn } from "@/lib/utils"
@@ -33,7 +33,11 @@ function unchangedChannelIndexes(current: string[], planned: string[]) {
     Array<number>(planned.length + 1).fill(0)
   )
 
-  for (let currentIndex = current.length - 1; currentIndex >= 0; currentIndex--) {
+  for (
+    let currentIndex = current.length - 1;
+    currentIndex >= 0;
+    currentIndex--
+  ) {
     for (
       let plannedIndex = planned.length - 1;
       plannedIndex >= 0;
@@ -99,7 +103,15 @@ function DiffValue({
   )
 }
 
-function SourceSummary({ source }: { source: ChannelSource }) {
+function SourceSummary({
+  source,
+  watchingChannels,
+  onlineChannels,
+}: {
+  source: ChannelSource
+  watchingChannels: string[]
+  onlineChannels: string[]
+}) {
   const reference = sourceReference(source)
 
   return (
@@ -127,7 +139,11 @@ function SourceSummary({ source }: { source: ChannelSource }) {
       </dl>
       <div className="flex flex-col gap-1">
         <p className="text-xs text-muted-foreground">Farming channels</p>
-        <ChannelList channels={source.channels} />
+        <RuntimeChannelList
+          channels={source.channels}
+          watchingChannels={watchingChannels}
+          onlineChannels={onlineChannels}
+        />
       </div>
     </div>
   )
@@ -136,9 +152,13 @@ function SourceSummary({ source }: { source: ChannelSource }) {
 function SourceDiff({
   current,
   planned,
+  watchingChannels,
+  onlineChannels,
 }: {
   current: ChannelSource
   planned: ChannelSource
+  watchingChannels: string[]
+  onlineChannels: string[]
 }) {
   const currentReference = sourceReference(current)
   const plannedReference = sourceReference(planned)
@@ -154,7 +174,6 @@ function SourceDiff({
     current.channels,
     planned.channels
   )
-
   return (
     <div className="rounded-lg border p-3" aria-label="Launch source diff">
       <dl className="grid gap-4 sm:grid-cols-2">
@@ -238,10 +257,12 @@ function SourceDiff({
         {channelsChanged ? (
           <div className="flex min-w-0 flex-col gap-2">
             <DiffValue direction="current">
-              <ChannelList
+              <RuntimeChannelList
                 channels={current.channels}
-                ariaLabel="Current farming channels"
-                getVariant={(_channel, index) =>
+                watchingChannels={watchingChannels}
+                onlineChannels={onlineChannels}
+                ariaLabel="Current farming channels ordered by live status"
+                getInactiveVariant={(_channel, index) =>
                   currentIndexes.has(index) ? "outline" : "destructive"
                 }
               />
@@ -257,7 +278,11 @@ function SourceDiff({
             </DiffValue>
           </div>
         ) : (
-          <ChannelList channels={current.channels} />
+          <RuntimeChannelList
+            channels={current.channels}
+            watchingChannels={watchingChannels}
+            onlineChannels={onlineChannels}
+          />
         )}
       </div>
     </div>
@@ -267,9 +292,13 @@ function SourceDiff({
 export function LaunchSource({
   current,
   planned,
+  watchingChannels = [],
+  onlineChannels = [],
 }: {
   current: ChannelSource
   planned: ChannelSource
+  watchingChannels?: string[]
+  onlineChannels?: string[]
 }) {
   const matches = launchSourcesMatch(current, planned)
 
@@ -289,9 +318,18 @@ export function LaunchSource({
         </p>
       </div>
       {matches ? (
-        <SourceSummary source={current} />
+        <SourceSummary
+          source={current}
+          watchingChannels={watchingChannels}
+          onlineChannels={onlineChannels}
+        />
       ) : (
-        <SourceDiff current={current} planned={planned} />
+        <SourceDiff
+          current={current}
+          planned={planned}
+          watchingChannels={watchingChannels}
+          onlineChannels={onlineChannels}
+        />
       )}
     </section>
   )

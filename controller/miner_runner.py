@@ -14,6 +14,8 @@ from pathlib import Path
 import pickle
 import signal
 import sys
+import threading
+import time
 from dataclasses import dataclass, field
 
 from django.views.decorators.debug import sensitive_variables
@@ -27,6 +29,83 @@ def emit_control_event(event: str, **payload: object) -> None:
 
     message = {"event": event, **payload}
     print(CONTROL_EVENT_PREFIX + json.dumps(message, separators=(",", ":")), flush=True)
+
+
+@dataclass(frozen=True, slots=True)
+class WatchingStreamerSnapshot:
+    username: str
+    is_online: bool
+    online_at: float
+
+
+def _snapshot_streamers(streamers: object) -> tuple[WatchingStreamerSnapshot, ...]:
+    return tuple(
+        WatchingStreamerSnapshot(
+            username=getattr(streamer, "username", ""),
+            is_online=getattr(streamer, "is_online", False) is True,
+            online_at=getattr(streamer, "online_at", 0),
+        )
+        for streamer in tuple(streamers)
+    )
+
+
+def online_ordered_channels(streamers: object) -> list[str]:
+    """Return every Twitch-detected online channel in source order."""
+
+    online: list[str] = []
+    for streamer in streamers:
+        username = getattr(streamer, "username", "")
+        if (
+            getattr(streamer, "is_online", False) is True
+            and isinstance(username, str)
+            and username
+        ):
+            online.append(username)
+    return online
+
+
+def selected_ordered_channels(
+    streamers: object,
+    *,
+    now: float | None = None,
+    limit: int = 2,
+) -> list[str]:
+    """Mirror the pinned miner's ORDER eligibility for runtime telemetry."""
+
+    current_time = time.time() if now is None else now
+    selected: list[str] = []
+    for streamer in streamers:
+        online_at = getattr(streamer, "online_at", 0)
+        if getattr(streamer, "is_online", False) is not True:
+            continue
+        if online_at != 0 and current_time - online_at <= 30:
+            continue
+        username = getattr(streamer, "username", "")
+        if isinstance(username, str) and username:
+            selected.append(username)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _observe_watching_channels(streamers: object, stopped: threading.Event) -> None:
+    previous: tuple[tuple[str, ...], tuple[str, ...]] | None = None
+    refreshed_at = 0.0
+    while not stopped.is_set():
+        now = time.monotonic()
+        snapshot = _snapshot_streamers(streamers)
+        selected = tuple(selected_ordered_channels(snapshot))
+        online = tuple(online_ordered_channels(snapshot))
+        current = (selected, online)
+        if current != previous or now - refreshed_at >= 60:
+            emit_control_event(
+                "watching_channels",
+                channels=list(selected),
+                online_channels=list(online),
+            )
+            previous = current
+            refreshed_at = now
+        stopped.wait(2)
 
 
 def prepare_upstream_logging() -> None:
@@ -212,6 +291,7 @@ def run_miner(payload: LaunchPayload) -> None:
     from TwitchChannelPointsMiner.classes.Chat import ChatPresence
     from TwitchChannelPointsMiner.classes.Settings import Priority
     from TwitchChannelPointsMiner.classes.entities.Streamer import StreamerSettings
+    from TwitchChannelPointsMiner.classes.Twitch import Twitch
     from TwitchChannelPointsMiner.classes.TwitchLogin import TwitchLogin
     from TwitchChannelPointsMiner.logger import ColorPalette, LoggerSettings
 
@@ -231,7 +311,35 @@ def run_miner(payload: LaunchPayload) -> None:
                 )
         return response
 
+    original_send_minute_watched_events = Twitch.send_minute_watched_events
+
+    def observed_send_minute_watched_events(twitch, streamers, priority, chunk_size=3):
+        stopped = threading.Event()
+        observer = threading.Thread(
+            target=_observe_watching_channels,
+            args=(streamers, stopped),
+            name="Watching channel observer",
+            daemon=True,
+        )
+        observer.start()
+        try:
+            return original_send_minute_watched_events(
+                twitch,
+                streamers,
+                priority,
+                chunk_size,
+            )
+        finally:
+            stopped.set()
+            observer.join(timeout=3)
+            emit_control_event(
+                "watching_channels",
+                channels=[],
+                online_channels=[],
+            )
+
     TwitchLogin.send_oauth_request = observed_oauth_request
+    Twitch.send_minute_watched_events = observed_send_minute_watched_events
     twitch_miner = None
     authenticated = False
     try:
@@ -239,7 +347,7 @@ def run_miner(payload: LaunchPayload) -> None:
             username=payload.username,
             password=payload.password or None,
             claim_drops_startup=False,
-            priority=[Priority.DROPS, Priority.ORDER, Priority.STREAK],
+            priority=[Priority.ORDER],
             enable_analytics=False,
             disable_ssl_cert_verification=False,
             disable_at_in_nickname=False,
@@ -288,6 +396,7 @@ def run_miner(payload: LaunchPayload) -> None:
                 pass
         raise
     finally:
+        Twitch.send_minute_watched_events = original_send_minute_watched_events
         TwitchLogin.send_oauth_request = original_oauth_request
 
 

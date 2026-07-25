@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" role="img" aria-labelledby="title desc">
+  <title id="title">Twitch Farm Control Room inverse logo</title>
+  <desc id="desc">The Twitch Farm factory mark with a white horizontal wordmark for dark backgrounds.</desc>
+  <g transform="translate(40 40) scale(.46875)">
+    <rect x="0" y="0" width="512" height="512" rx="112" fill="#A970FF"/>
+    <path fill="#18181B" d="M88 388V220l104-68v68l104-68v68h88v168H88Z"/>
+    <rect x="140" y="278" width="52" height="62" rx="12" fill="#A970FF"/>
+    <rect x="240" y="278" width="52" height="62" rx="12" fill="#A970FF"/>
+    <path fill="#A970FF" d="M340 388v-98c0-7 5-12 12-12h20c7 0 12 5 12 12v98h-44Z"/>
+  </g>
+  <text x="336" y="150" fill="#FFFFFF" font-family="Geist, Inter, Arial, sans-serif" font-size="92" font-weight="760" letter-spacing="-3">Twitch Farm</text>
+  <text x="340" y="211" fill="#A970FF" font-family="Geist, Inter, Arial, sans-serif" font-size="32" font-weight="650" letter-spacing="8">CONTROL ROOM</text>
+</svg>

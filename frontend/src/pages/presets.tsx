@@ -17,7 +17,7 @@ import { toast } from "sonner"
 import { z } from "zod"
 
 import { ChannelEditor } from "@/components/channel-editor"
-import { ChannelList } from "@/components/channel-list"
+import { WatchedChannelList } from "@/components/channel-list"
 import { ConfirmAction } from "@/components/confirm-action"
 import { InteractiveCard } from "@/components/interactive-card"
 import { PageHeader, PageSkeleton } from "@/components/page"
@@ -61,6 +61,7 @@ export function PresetsPage() {
   const presets = useQuery({
     queryKey: ["presets"],
     queryFn: () => api<PresetListData>("/presets"),
+    refetchInterval: 5_000,
   })
   if (presets.isLoading) return <PageSkeleton />
   return (
@@ -78,29 +79,46 @@ export function PresetsPage() {
         }
       />
       {presets.data?.presets.length ? (
-        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-          {presets.data.presets.map((preset) => (
-            <InteractiveCard
-              key={preset.id}
-              to={`/presets/${preset.id}`}
-              aria-label={`Open ${preset.name}`}
-            >
-              <CardHeader>
-                <CardTitle>{preset.name}</CardTitle>
-                <CardDescription>
-                  Updated {formatTime(preset.updated_at)}
-                </CardDescription>
-                <CardAction>
-                  <Badge variant="secondary">
-                    {preset.assignment_count} assigned
-                  </Badge>
-                </CardAction>
-              </CardHeader>
-              <CardContent>
-                <ChannelList channels={preset.channels} limit={6} />
-              </CardContent>
-            </InteractiveCard>
-          ))}
+        <div className="grid gap-3">
+          <div
+            className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-muted-foreground"
+            aria-label="Channel status legend"
+          >
+            <span className="flex items-center gap-1.5">
+              <Badge variant="success">Example</Badge> Currently watched
+            </span>
+            <span className="flex items-center gap-1.5">
+              <Badge variant="outline">Example</Badge> Not currently watched
+            </span>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+            {presets.data.presets.map((preset) => (
+              <InteractiveCard
+                key={preset.id}
+                to={`/presets/${preset.id}`}
+                aria-label={`Open ${preset.name}`}
+              >
+                <CardHeader>
+                  <CardTitle>{preset.name}</CardTitle>
+                  <CardDescription>
+                    Updated {formatTime(preset.updated_at)}
+                  </CardDescription>
+                  <CardAction>
+                    <Badge variant="secondary">
+                      {preset.assignment_count} assigned
+                    </Badge>
+                  </CardAction>
+                </CardHeader>
+                <CardContent>
+                  <WatchedChannelList
+                    channels={preset.channels}
+                    watchingChannels={preset.watching_channels}
+                    limit={6}
+                  />
+                </CardContent>
+              </InteractiveCard>
+            ))}
+          </div>
         </div>
       ) : (
         <Card>

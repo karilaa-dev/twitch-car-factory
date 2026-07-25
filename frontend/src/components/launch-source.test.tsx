@@ -12,7 +12,14 @@ const current: ChannelSource = {
 
 describe("LaunchSource", () => {
   it("merges identical current and planned sources", () => {
-    render(<LaunchSource current={current} planned={{ ...current }} />)
+    render(
+      <LaunchSource
+        current={current}
+        planned={{ ...current }}
+        watchingChannels={["TWITCHGAMING"]}
+        onlineChannels={["twitchgaming", "MONSTERCAT"]}
+      />
+    )
 
     expect(screen.getByText("Launch source", { exact: true })).toBeVisible()
     expect(
@@ -26,6 +33,12 @@ describe("LaunchSource", () => {
       "data-variant",
       "secondary"
     )
+    expect(
+      screen.getByLabelText("twitchgaming (currently watched)")
+    ).toHaveAttribute("data-variant", "success")
+    expect(
+      screen.getByLabelText("monstercat (online, not currently watched)")
+    ).toHaveAttribute("data-variant", "warning")
   })
 
   it("highlights changed source fields without tinting the comparison card", () => {
@@ -34,7 +47,14 @@ describe("LaunchSource", () => {
       name: "primary",
       channels: ["rocketleague"],
     }
-    render(<LaunchSource current={current} planned={planned} />)
+    render(
+      <LaunchSource
+        current={current}
+        planned={planned}
+        watchingChannels={["MONSTERCAT", "rocketleague"]}
+        onlineChannels={["twitchgaming", "MONSTERCAT", "rocketleague"]}
+      />
+    )
 
     const diff = screen.getByLabelText("Launch source diff")
     expect(within(diff).getAllByText("Current").length).toBeGreaterThan(0)
@@ -49,14 +69,21 @@ describe("LaunchSource", () => {
       "data-variant",
       "success"
     )
-    expect(within(diff).getByText("twitchgaming")).toHaveAttribute(
-      "data-variant",
-      "destructive"
-    )
+    expect(
+      within(diff).getByLabelText(
+        "twitchgaming (online, not currently watched)"
+      )
+    ).toHaveAttribute("data-variant", "warning")
+    expect(
+      within(diff).getByLabelText("monstercat (currently watched)")
+    ).toHaveAttribute("data-variant", "success")
     expect(within(diff).getByText("rocketleague")).toHaveAttribute(
       "data-variant",
       "success"
     )
+    expect(
+      within(diff).queryByLabelText("rocketleague (currently watched)")
+    ).not.toBeInTheDocument()
     expect(within(diff).getByText("Source reference")).toBeVisible()
     expect(within(diff).getByText("Source preset")).toHaveClass(
       "text-muted-foreground"
@@ -64,6 +91,27 @@ describe("LaunchSource", () => {
     expect(within(diff).getByText("Account override")).toHaveClass(
       "text-muted-foreground"
     )
+  })
+
+  it("keeps live channel status when only the source reference changes", () => {
+    render(
+      <LaunchSource
+        current={current}
+        planned={{ ...current, mode: "custom", name: "primary" }}
+        watchingChannels={["monstercat"]}
+        onlineChannels={["twitchgaming", "monstercat"]}
+      />
+    )
+
+    const diff = screen.getByLabelText("Launch source diff")
+    expect(
+      within(diff).getByLabelText("monstercat (currently watched)")
+    ).toHaveAttribute("data-variant", "success")
+    expect(
+      within(diff).getByLabelText(
+        "twitchgaming (online, not currently watched)"
+      )
+    ).toHaveAttribute("data-variant", "warning")
   })
 
   it("keeps an unchanged mode and reference neutral when only channels change", () => {

@@ -267,17 +267,81 @@ class ApiContractTests(TestCase):
             pid=999,
             expires_at=timezone.now() + timedelta(seconds=30),
         )
+        self.state.watching_channels = ["twitch"]
+        self.state.online_channels = ["twitch"]
+        self.state.watching_updated_at = timezone.now()
+        self.state.save(
+            update_fields=(
+                "watching_channels",
+                "online_channels",
+                "watching_updated_at",
+                "updated_at",
+            )
+        )
 
         response = self.client.get(self.api("runtime"))
         data = self.assert_envelope(response)
         self.assertEqual(data["supervisor"]["status"], "healthy")
         self.assertEqual(data["summary"]["observed_running"], 1)
         self.assertEqual(data["accounts"][0]["source"]["channels"], run.channels)
+        self.assertEqual(data["accounts"][0]["watching_channels"], ["twitch"])
+        self.assertEqual(data["accounts"][0]["online_channels"], ["twitch"])
+        self.assertIsNotNone(data["accounts"][0]["watching_updated_at"])
         self.assertEqual(data["incidents"][0]["id"], incident.pk)
         self.assertEqual(data["command_faults"][0]["id"], command.pk)
         serialized = response.content.decode()
         self.assertNotIn(self.twitch_password, serialized)
         self.assertNotIn(self.credential_ciphertext(), serialized)
+
+    def test_watching_channels_expire_and_aggregate_only_for_assigned_preset(self):
+        self.login()
+        watched_preset = self.create_preset(
+            name="Watched",
+            channels=["Alpha", "Beta", "Gamma"],
+        )
+        unrelated_preset = self.create_preset(
+            name="Unrelated",
+            channels=["Alpha", "Other"],
+        )
+        self.account.selection.mode = AccountChannelSelection.Mode.PRESET
+        self.account.selection.preset = watched_preset
+        self.account.selection.save()
+        run = MinerRun.objects.create(
+            account=self.account,
+            source_mode="preset",
+            source_name=watched_preset.name,
+            channels=watched_preset.channel_names,
+            configuration_fingerprint="b" * 64,
+            channel_revision=self.account.channel_revision,
+            pid=4322,
+            startup_confirmed_at=timezone.now(),
+        )
+        self.state.current_run = run
+        self.state.observed_state = MinerInstanceState.ObservedState.RUNNING
+        self.state.watching_channels = ["beta", "ALPHA"]
+        self.state.online_channels = ["gamma", "beta", "ALPHA"]
+        self.state.watching_updated_at = timezone.now()
+        self.state.save()
+
+        presets = self.assert_envelope(self.client.get(self.api("presets")))["presets"]
+        by_name = {preset["name"]: preset for preset in presets}
+        self.assertEqual(by_name["Watched"]["watching_channels"], ["Alpha", "Beta"])
+        self.assertEqual(by_name["Unrelated"]["watching_channels"], [])
+        runtime = self.assert_envelope(self.client.get(self.api("runtime")))
+        self.assertEqual(runtime["accounts"][0]["online_channels"], ["Alpha", "Beta", "Gamma"])
+
+        self.account.selection.preset = unrelated_preset
+        self.account.selection.save(update_fields=("preset", "updated_at"))
+        reassigned = self.assert_envelope(self.client.get(self.api("presets")))["presets"]
+        by_name = {preset["name"]: preset for preset in reassigned}
+        self.assertEqual(by_name["Watched"]["watching_channels"], [])
+        self.assertEqual(by_name["Unrelated"]["watching_channels"], [])
+
+        self.state.watching_updated_at = timezone.now() - timedelta(minutes=6)
+        self.state.save(update_fields=("watching_updated_at", "updated_at"))
+        runtime = self.assert_envelope(self.client.get(self.api("runtime")))
+        self.assertEqual(runtime["accounts"][0]["watching_channels"], [])
+        self.assertEqual(runtime["accounts"][0]["online_channels"], [])
 
     def credential_ciphertext(self):
         return AccountCredential.objects.get(account=self.account).password_ciphertext

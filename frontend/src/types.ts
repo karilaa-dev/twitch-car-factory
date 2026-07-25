@@ -81,6 +81,9 @@ export interface AccountSummary {
   desired: "running" | "stopped"
   observed: RuntimeStatus
   source: ChannelSource
+  watching_channels: string[]
+  online_channels: string[]
+  watching_updated_at: string | null
   pid: number | null
   last_heartbeat: string | null
   open_incident: { id: number; summary: string; opened_at: string } | null
@@ -158,6 +161,7 @@ export interface PresetSummary {
   id: number
   name: string
   channels: string[]
+  watching_channels: string[]
   assignment_count: number
   updated_at: string
 }

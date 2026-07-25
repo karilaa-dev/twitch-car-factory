@@ -1,6 +1,9 @@
 import { AlertTriangle, Play, RefreshCw, Square } from "lucide-react"
 
-import { ChannelList } from "@/components/channel-list"
+import {
+  RuntimeChannelLegend,
+  RuntimeChannelList,
+} from "@/components/channel-list"
 import { ConfirmAction } from "@/components/confirm-action"
 import { CurrentState } from "@/components/current-state"
 import { InteractiveTableRow } from "@/components/interactive-card"
@@ -132,6 +135,8 @@ export function DesktopOperationsGrid({
         </ButtonGroup>
       </header>
 
+      <RuntimeChannelLegend />
+
       {data.supervisor.status !== "healthy" ? (
         <Alert variant="destructive">
           <AlertTriangle />
@@ -229,7 +234,11 @@ export function DesktopOperationsGrid({
                     <p className="max-w-64 truncate font-medium">
                       {account.source.label || account.source.name}
                     </p>
-                    <ChannelList channels={account.source.channels} limit={3} />
+                    <RuntimeChannelList
+                      channels={account.source.channels}
+                      watchingChannels={account.watching_channels}
+                      onlineChannels={account.online_channels}
+                    />
                   </TableCell>
                   <TableCell>
                     <p>{formatTime(account.last_heartbeat)}</p>

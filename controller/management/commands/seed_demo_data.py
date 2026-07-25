@@ -265,6 +265,9 @@ class Command(BaseCommand):
             else None
         )
         state.last_heartbeat = now - timedelta(seconds=index * 3) if run else None
+        state.watching_channels = list(demo.channels[:2]) if has_live_run else []
+        state.online_channels = list(demo.channels) if has_live_run else []
+        state.watching_updated_at = now if has_live_run else None
         state.last_error = (
             "Fake miner exited unexpectedly; automatic recovery is scheduled."
             if demo.state == MinerInstanceState.ObservedState.DEGRADED

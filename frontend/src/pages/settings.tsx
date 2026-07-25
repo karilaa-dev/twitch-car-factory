@@ -36,7 +36,6 @@ import {
 } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Spinner } from "@/components/ui/spinner"
-import { Switch } from "@/components/ui/switch"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { api, formatTime, mutationError } from "@/lib/api"
 import type { FarmSettings, ImportPreview } from "@/types"
@@ -102,14 +101,14 @@ function GeneralSettings() {
 function GeneralSettingsForm({ initial }: { initial: FarmSettings }) {
   const queryClient = useQueryClient()
   const [channels, setChannels] = React.useState(initial.default_channels)
-  const [autostart, setAutostart] = React.useState(
-    initial.autostart_new_accounts
-  )
   const mutation = useMutation({
     mutationFn: () =>
       api<FarmSettings>("/settings/general", {
         method: "PUT",
-        json: { default_channels: channels, autostart_new_accounts: autostart },
+        json: {
+          default_channels: channels,
+          autostart_new_accounts: false,
+        },
       }),
     onSuccess: async () => {
       toast.success("Farm settings updated.")
@@ -141,20 +140,6 @@ function GeneralSettingsForm({ initial }: { initial: FarmSettings }) {
             value={channels}
             onChange={setChannels}
           />
-          <Field orientation="horizontal">
-            <FieldLabel htmlFor="autostart">
-              <FieldTitle>Suggest starting new accounts</FieldTitle>
-              <FieldDescription>
-                Preselects the start option when adding an account. Imports
-                always remain stopped.
-              </FieldDescription>
-            </FieldLabel>
-            <Switch
-              id="autostart"
-              checked={autostart}
-              onCheckedChange={setAutostart}
-            />
-          </Field>
           <Button
             className="min-h-11 self-end"
             disabled={mutation.isPending}

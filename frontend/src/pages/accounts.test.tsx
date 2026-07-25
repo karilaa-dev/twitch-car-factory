@@ -4,8 +4,12 @@ import userEvent from "@testing-library/user-event"
 import { MemoryRouter, Route, Routes } from "react-router-dom"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
-import { AccountWorkspacePage } from "@/pages/accounts"
-import type { AccountDetail, AccountTelemetry } from "@/types"
+import {
+  AccountsPage,
+  AccountWorkspacePage,
+  NewAccountPage,
+} from "@/pages/accounts"
+import type { AccountDetail, AccountList, AccountTelemetry } from "@/types"
 
 const apiMock = vi.fn()
 vi.mock("@/lib/api", async (importOriginal) => {
@@ -33,8 +37,19 @@ const account: AccountDetail = {
   authentication: pendingAuthentication,
   desired: "running",
   observed: "starting",
-  source: { mode: "default", name: "farm defaults", channels: ["one"] },
-  planned_source: { mode: "default", name: "Farm defaults", channels: ["one"] },
+  source: {
+    mode: "default",
+    name: "farm defaults",
+    channels: ["offline", "online", "one"],
+  },
+  watching_channels: ["one"],
+  online_channels: ["online", "one"],
+  watching_updated_at: new Date().toISOString(),
+  planned_source: {
+    mode: "default",
+    name: "Farm defaults",
+    channels: ["offline", "online", "one"],
+  },
   pid: 42,
   last_heartbeat: new Date().toISOString(),
   open_incident: null,
@@ -52,13 +67,13 @@ const account: AccountDetail = {
   commands: [],
 }
 
-function renderAuth() {
+function renderWorkspace(tab: "auth" | "runtime") {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
   return render(
     <QueryClientProvider client={client}>
-      <MemoryRouter initialEntries={["/accounts/1?tab=auth"]}>
+      <MemoryRouter initialEntries={[`/accounts/1?tab=${tab}`]}>
         <Routes>
           <Route path="/accounts/:id" element={<AccountWorkspacePage />} />
         </Routes>
@@ -66,6 +81,100 @@ function renderAuth() {
     </QueryClientProvider>
   )
 }
+
+describe("AccountsPage", () => {
+  beforeEach(() => {
+    apiMock.mockReset()
+    apiMock.mockResolvedValue({
+      accounts: [account],
+      active_count: 1,
+      presets: [],
+      farm_default_channels: ["one"],
+      autostart_new_accounts: false,
+    } satisfies AccountList)
+  })
+
+  it("highlights watched channels in live account summaries", async () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <AccountsPage />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+
+    const watchedBadges = await screen.findAllByLabelText(
+      "one (currently watched)"
+    )
+    expect(watchedBadges.length).toBeGreaterThan(0)
+    for (const badge of watchedBadges) {
+      expect(badge).toHaveAttribute("data-variant", "success")
+    }
+  })
+})
+
+describe("NewAccountPage", () => {
+  it("creates accounts stopped so Twitch login can be completed first", async () => {
+    const user = userEvent.setup()
+    apiMock.mockReset()
+    apiMock.mockImplementation(
+      (path: string, options?: { method?: string; json?: unknown }) => {
+        if (path === "/accounts" && options?.method === "POST")
+          return Promise.resolve(account)
+        if (path === "/accounts")
+          return Promise.resolve({
+            accounts: [],
+            active_count: 0,
+            presets: [],
+            farm_default_channels: ["one"],
+            autostart_new_accounts: true,
+          } satisfies AccountList)
+        throw new Error(`Unexpected API path: ${path}`)
+      }
+    )
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/accounts/new"]}>
+          <Routes>
+            <Route path="/accounts/new" element={<NewAccountPage />} />
+            <Route path="/accounts/:id" element={<div>Account created</div>} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+
+    expect(await screen.findByText("Account configuration")).toBeVisible()
+    expect(screen.queryByText("Start after saving")).not.toBeInTheDocument()
+
+    await user.type(screen.getByLabelText("Account key"), "secondary")
+    await user.type(
+      screen.getByLabelText("Twitch username"),
+      "secondary_viewer"
+    )
+    await user.click(screen.getByRole("button", { name: "Create account" }))
+
+    await waitFor(() =>
+      expect(apiMock).toHaveBeenCalledWith(
+        "/accounts",
+        expect.objectContaining({ method: "POST" })
+      )
+    )
+    const createCall = apiMock.mock.calls.find(
+      ([, options]) =>
+        (options as { method?: string } | undefined)?.method === "POST"
+    )
+    expect(
+      (createCall?.[1] as { json?: Record<string, unknown> } | undefined)?.json
+    ).not.toHaveProperty("start_after_save")
+    expect(await screen.findByText("Account created")).toBeVisible()
+  })
+})
 
 describe("Account Twitch TV authentication", () => {
   beforeEach(() => {
@@ -83,6 +192,22 @@ describe("Account Twitch TV authentication", () => {
     })
   })
 
+  it("shows watched, online-only, and offline channels in runtime status order", async () => {
+    renderWorkspace("runtime")
+
+    expect(await screen.findByText("Runtime state")).toBeVisible()
+    const channels = screen.getByLabelText(
+      "Farming channels ordered by live status: watched, online, then offline"
+    )
+    expect(channels.textContent).toBe("oneonlineoffline")
+    expect(
+      screen.getByLabelText("one (currently watched)")
+    ).toHaveAttribute("data-variant", "success")
+    expect(
+      screen.getByLabelText("online (online, not currently watched)")
+    ).toHaveAttribute("data-variant", "warning")
+  })
+
   it("shows and copies a pending activation code with the Twitch link", async () => {
     const user = userEvent.setup()
     const writeText = vi.fn().mockResolvedValue(undefined)
@@ -90,7 +215,7 @@ describe("Account Twitch TV authentication", () => {
       configurable: true,
       value: { writeText },
     })
-    renderAuth()
+    renderWorkspace("auth")
 
     expect(await screen.findByText("FAKE-CODE")).toBeVisible()
     expect(
