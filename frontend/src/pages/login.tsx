@@ -1,7 +1,7 @@
 import { zodResolver } from "@hookform/resolvers/zod"
 import * as React from "react"
 import { useQueryClient } from "@tanstack/react-query"
-import { Bot, LogIn } from "lucide-react"
+import { LogIn } from "lucide-react"
 import { useForm } from "react-hook-form"
 import { useNavigate } from "react-router-dom"
 import { z } from "zod"
@@ -46,9 +46,12 @@ export function LoginPage() {
     <main className="grid min-h-dvh place-items-center bg-muted/30 p-3 sm:p-6">
       <Card className="w-full max-w-sm">
         <CardHeader className="text-center">
-          <div className="mx-auto mb-2 flex size-10 items-center justify-center rounded-xl bg-primary text-primary-foreground">
-            <Bot className="size-5" />
-          </div>
+          <img
+            src={`${import.meta.env.BASE_URL}brand/twitch-farm-mark.svg`}
+            alt=""
+            aria-hidden="true"
+            className="mx-auto mb-2 size-16"
+          />
           <CardTitle><h1>Twitch Farm Control Room</h1></CardTitle>
           <CardDescription>Sign in with a staff operator account.</CardDescription>
         </CardHeader>

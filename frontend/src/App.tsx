@@ -1,6 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import {
-  Bot,
   ChevronDown,
   FileText,
   LogOut,
@@ -135,10 +134,13 @@ function AppShell({ session }: { session: SessionData }) {
             to="/"
             className="flex min-h-11 min-w-11 items-center gap-2 rounded-lg font-medium focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none"
           >
-            <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground">
-              <Bot className="size-4" />
-            </span>
-            <span className="hidden whitespace-nowrap sm:inline">
+            <img
+              src={`${import.meta.env.BASE_URL}brand/twitch-farm-mark.svg`}
+              alt=""
+              aria-hidden="true"
+              className="size-9 shrink-0"
+            />
+            <span className="sr-only whitespace-nowrap sm:not-sr-only">
               Twitch Farm
             </span>
           </Link>
