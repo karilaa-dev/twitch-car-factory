@@ -1,8 +1,9 @@
 # Twitch Farm Control Room
 
-An admin-only Django control plane for running multiple Twitch Channel Points
-Miner instances. SQLite is the source of truth for accounts, encrypted
-credentials, channel settings, presets, process intent, and runtime history.
+An admin-only Django control plane with an owned, headless Twitch drops and
+channel-points engine, running one supervised process per account. SQLite is the
+source of truth for accounts, encrypted credentials, channel settings, presets,
+process intent, and runtime history.
 Accounts and application settings are managed through the web UI.
 
 ## Reliability model
@@ -18,13 +19,51 @@ Accounts and application settings are managed through the web UI.
   the singleton lock, leases commands, owns all child processes, and records
   runs, incidents, restart attempts, and recovery.
 - New accounts use passwordless Twitch TV/device login. Existing password-backed
-  accounts remain compatible and can switch one-way to TV login. Miner children
+  accounts reuse valid saved sessions; when those expire, switch the account
+  one-way to TV login. Password-based sign-in is no longer used. Miner children
   receive account and run IDs, never passwords or channels in process arguments.
-- Upstream miner INFO output and lifecycle events are redacted into separate
+- Miner INFO output and lifecycle events are redacted into separate
   per-account run archives. Completed parts are gzip-compressed and retained up
   to 50 MiB per account.
 
 See [the feature and state map](docs/bot-feature-map.md) for full behavior.
+
+## Drops and points engine
+
+`controller/twitch_miner/` replaces `Twitch-Channel-Points-Miner-v2` with a local
+headless reimplementation of [TwitchDropsMiner](https://github.com/DevilXD/TwitchDropsMiner).
+The reference revision and MIT license are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+- Drops use playback-token discovery, HLS playlist reads, and segment HEAD
+  requests about every 20 seconds, without downloading stream video.
+- Inventory, campaign details, account linking, channel eligibility, time
+  windows, and prerequisite drops determine what can be earned. Earned drops
+  are claimed at startup and during collection. Only server-reported progress
+  is used; a successful playlist request alone does not prove reward progress.
+- One channel is watched per account. The first configured online channel with
+  an eligible drop wins; otherwise the first online channel earns points.
+  The engine never adds channels outside the launch snapshot. This replaces
+  the old two-channel selection. Offline, failed, or stalled channels trigger
+  reselection within the configured list.
+- Channel points retain a separate minute-watched heartbeat alongside each
+  playback request, with available bonuses checked every minute. Prediction betting, raid following, chat presence, and moment
+  claiming are not part of this engine.
+- Stream status, inventory, progress, and points are polled every minute;
+  campaign discovery refreshes every ten minutes and when online games change.
+  This headless implementation uses polling instead of upstream's GUI and
+  websocket infrastructure.
+- TV sessions can return an empty campaign dashboard. The engine also reads
+  channel-advertised campaigns and matches current-drop evidence to the exact
+  watched channel. Missing link information permits a trial only on an
+  advertising channel; confirmed unlinked campaigns remain excluded.
+- Existing worker-only cookie files and imported session seeds remain usable.
+  New sessions use the existing **Connect Twitch** device-code flow. A missing
+  or expired legacy password session requires switching to TV login first.
+
+Protocol behavior is covered by mocked transport, upgrade, and lifecycle tests.
+Live smoke testing with an existing TV session verified timed-drop progress,
+automatic claiming, and channel-points accrual. Twitch can change its private
+GraphQL operations and playback behavior, so recheck collection after upgrades.
 
 ## Architecture
 
@@ -96,6 +135,20 @@ uv run python manage.py seed_demo_data
 The command is repeatable, uses only `demo-` account keys, and refuses to run
 when `DJANGO_DEBUG` is disabled. The fake credentials are display fixtures and
 must never be used with Twitch.
+
+## Updating an existing TV-login installation
+
+Keep the existing `data/` and `runtime/` volumes and the same
+`TWITCH_FARM_CREDENTIAL_KEYS` when updating. Apply Django migrations as part of
+the normal version update before starting the new web/worker services. Existing
+TV accounts and their `runtime/cookies/<username>.pkl` sessions are reused in
+place: the old `auth-token` + `persistent` cookie format remains supported, and
+the validated token keeps its original TV client identity. There is no account
+re-creation, cookie conversion, or reconnect step for a still-valid session.
+
+Only choose **Reconnect Twitch** when Twitch has expired or revoked a session;
+that action deliberately replaces it. Fresh device authorizations also use the
+TV client. Password-based sign-in is not required for the upgrade path.
 
 ## Credential encryption keys
 

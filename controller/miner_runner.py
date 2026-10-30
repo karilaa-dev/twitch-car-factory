@@ -15,7 +15,6 @@ import pickle
 import signal
 import sys
 import threading
-import time
 from dataclasses import dataclass, field
 
 from django.views.decorators.debug import sensitive_variables
@@ -31,92 +30,8 @@ def emit_control_event(event: str, **payload: object) -> None:
     print(CONTROL_EVENT_PREFIX + json.dumps(message, separators=(",", ":")), flush=True)
 
 
-@dataclass(frozen=True, slots=True)
-class WatchingStreamerSnapshot:
-    username: str
-    is_online: bool
-    online_at: float
-
-
-def _snapshot_streamers(streamers: object) -> tuple[WatchingStreamerSnapshot, ...]:
-    return tuple(
-        WatchingStreamerSnapshot(
-            username=getattr(streamer, "username", ""),
-            is_online=getattr(streamer, "is_online", False) is True,
-            online_at=getattr(streamer, "online_at", 0),
-        )
-        for streamer in tuple(streamers)
-    )
-
-
-def online_ordered_channels(streamers: object) -> list[str]:
-    """Return every Twitch-detected online channel in source order."""
-
-    online: list[str] = []
-    for streamer in streamers:
-        username = getattr(streamer, "username", "")
-        if (
-            getattr(streamer, "is_online", False) is True
-            and isinstance(username, str)
-            and username
-        ):
-            online.append(username)
-    return online
-
-
-def selected_ordered_channels(
-    streamers: object,
-    *,
-    now: float | None = None,
-    limit: int = 2,
-) -> list[str]:
-    """Mirror the pinned miner's ORDER eligibility for runtime telemetry."""
-
-    current_time = time.time() if now is None else now
-    selected: list[str] = []
-    for streamer in streamers:
-        online_at = getattr(streamer, "online_at", 0)
-        if getattr(streamer, "is_online", False) is not True:
-            continue
-        if online_at != 0 and current_time - online_at <= 30:
-            continue
-        username = getattr(streamer, "username", "")
-        if isinstance(username, str) and username:
-            selected.append(username)
-        if len(selected) >= limit:
-            break
-    return selected
-
-
-def _observe_watching_channels(streamers: object, stopped: threading.Event) -> None:
-    previous: tuple[tuple[str, ...], tuple[str, ...]] | None = None
-    refreshed_at = 0.0
-    while not stopped.is_set():
-        now = time.monotonic()
-        snapshot = _snapshot_streamers(streamers)
-        selected = tuple(selected_ordered_channels(snapshot))
-        online = tuple(online_ordered_channels(snapshot))
-        current = (selected, online)
-        if current != previous or now - refreshed_at >= 60:
-            emit_control_event(
-                "watching_channels",
-                channels=list(selected),
-                online_channels=list(online),
-            )
-            previous = current
-            refreshed_at = now
-        stopped.wait(2)
-
-
 def prepare_upstream_logging() -> None:
-    """Give the miner one INFO-only console pipeline in its dedicated child.
-
-    Django configures a root console handler before this module starts the
-    upstream miner. The library then adds its own queue-backed console handler,
-    which otherwise prints every INFO record twice and lets root-level DEBUG
-    records expose large HTTP/GQL payloads. This process runs one miner only, so
-    replacing the inherited handlers is isolated from the web and supervisor.
-    """
+    """Remove inherited handlers before configuring the child log pipeline."""
 
     logging.disable(logging.DEBUG)
     root_logger = logging.getLogger()
@@ -280,124 +195,36 @@ def prepare_runtime_cookie(username: str, account_id: int | None = None) -> Path
 
 @sensitive_variables()
 def run_miner(payload: LaunchPayload) -> None:
-    """Construct the upstream miner with the legacy behavior and start mining."""
+    """Run the owned headless drops engine inside the supervised child."""
+    from controller.twitch_miner.auth import authenticate, AuthenticationError as LoginError
+    from controller.twitch_miner.client import TwitchClient, AuthenticationError
+    from controller.twitch_miner.engine import DropsMiner
 
     prepare_upstream_logging()
-
-    # Keep these imports inside the real execution path.  Management checks and
-    # supervisor tests do not need to import the comparatively heavy miner stack.
-    from colorama import Fore
-    from TwitchChannelPointsMiner import TwitchChannelPointsMiner
-    from TwitchChannelPointsMiner.classes.Chat import ChatPresence
-    from TwitchChannelPointsMiner.classes.Settings import Priority
-    from TwitchChannelPointsMiner.classes.entities.Streamer import StreamerSettings
-    from TwitchChannelPointsMiner.classes.Twitch import Twitch
-    from TwitchChannelPointsMiner.classes.TwitchLogin import TwitchLogin
-    from TwitchChannelPointsMiner.logger import ColorPalette, LoggerSettings
-
-    original_oauth_request = TwitchLogin.send_oauth_request
-
-    def observed_oauth_request(login, url, json_data):
-        response = original_oauth_request(login, url, json_data)
-        if url == "https://id.twitch.tv/oauth2/device" and response.status_code == 200:
-            body = response.json()
-            allowed = {"user_code", "verification_uri", "expires_in"}
-            if isinstance(body, dict) and allowed.issubset(body):
-                emit_control_event(
-                    "device_code",
-                    user_code=str(body["user_code"]),
-                    verification_uri=str(body["verification_uri"]),
-                    expires_in=int(body["expires_in"]),
-                )
-        return response
-
-    original_send_minute_watched_events = Twitch.send_minute_watched_events
-
-    def observed_send_minute_watched_events(twitch, streamers, priority, chunk_size=3):
-        stopped = threading.Event()
-        observer = threading.Thread(
-            target=_observe_watching_channels,
-            args=(streamers, stopped),
-            name="Watching channel observer",
-            daemon=True,
-        )
-        observer.start()
-        try:
-            return original_send_minute_watched_events(
-                twitch,
-                streamers,
-                priority,
-                chunk_size,
-            )
-        finally:
-            stopped.set()
-            observer.join(timeout=3)
-            emit_control_event(
-                "watching_channels",
-                channels=[],
-                online_channels=[],
-            )
-
-    TwitchLogin.send_oauth_request = observed_oauth_request
-    Twitch.send_minute_watched_events = observed_send_minute_watched_events
-    twitch_miner = None
-    authenticated = False
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    stopped = threading.Event()
+    previous_handlers = {}
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        previous_handlers[signum] = signal.signal(signum, lambda *_args: stopped.set())
     try:
-        twitch_miner = TwitchChannelPointsMiner(
-            username=payload.username,
-            password=payload.password or None,
-            claim_drops_startup=False,
-            priority=[Priority.ORDER],
-            enable_analytics=False,
-            disable_ssl_cert_verification=False,
-            disable_at_in_nickname=False,
-            logger_settings=LoggerSettings(
-                save=False,
-                console_level=logging.INFO,
-                console_username=True,
-                auto_clear=False,
-                time_zone="",
-                file_level=logging.WARNING,
-                emoji=True,
-                less=False,
-                colored=False,
-                color_palette=ColorPalette(
-                    STREAMER_online="GREEN",
-                    streamer_offline="red",
-                    BET_wiN=Fore.MAGENTA,
-                ),
-            ),
-            streamer_settings=StreamerSettings(
-                make_predictions=False,
-                follow_raid=False,
-                claim_drops=True,
-                claim_moments=True,
-                watch_streak=True,
-                chat=ChatPresence.ONLINE,
-            ),
+        session = authenticate(
+            payload.username, payload.auth_method,
+            Path.cwd() / "cookies" / f"{payload.username}.pkl",
+            emit_control_event, stopped,
         )
-        twitch_miner.twitch.login()
-        if not twitch_miner.twitch.twitch_login.check_login():
-            emit_control_event("authentication_failed", error="Twitch authentication was rejected.")
-            raise RuntimeError("Twitch authentication was rejected.")
+        if stopped.is_set():
+            return
         emit_control_event("authenticated")
-        authenticated = True
-        twitch_miner.mine(list(payload.channels), followers=False)
-    except BaseException:
-        if not authenticated:
-            emit_control_event(
-                "authentication_failed",
-                error="Miner authentication or startup failed.",
-            )
-        if twitch_miner is not None:
-            try:
-                twitch_miner.queue_listener.stop()
-            except (AttributeError, RuntimeError):
-                pass
-        raise
+        client = TwitchClient(token=session.token, client_id=session.client_id, user_id=session.user_id, stopped=stopped)
+        DropsMiner(client, payload.username, payload.channels, emit_control_event, stopped).run()
+    except (LoginError, AuthenticationError) as exc:
+        if not stopped.is_set():
+            emit_control_event("authentication_failed", error=str(exc))
+            raise
     finally:
-        Twitch.send_minute_watched_events = original_send_minute_watched_events
-        TwitchLogin.send_oauth_request = original_oauth_request
+        emit_control_event("watching_channels", channels=[], online_channels=[])
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
 
 @sensitive_variables()
@@ -410,7 +237,7 @@ def main(run_id: int, account_id: int) -> None:
 
     django.setup()
     # This process is dedicated to one miner, so a restrictive process-wide
-    # umask safely protects any cookie the upstream library creates later.
+    # umask safely protects any cookie the session writer creates later.
     os.umask(0o077)
     payload = load_launch_payload(run_id, account_id)
     prepare_runtime_cookie(payload.username, account_id)

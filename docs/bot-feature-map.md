@@ -5,6 +5,16 @@ the runtime guarantees enforced by the Django replacement. It is the reference
 for parity tests and future maintenance; the supported runtime is Django-only
 and database-backed.
 
+## Twitch collection runtime
+
+The owned headless engine in `controller/twitch_miner/` replaces the old
+channel-points miner dependency. Drops follow the TwitchDropsMiner playback
+protocol, with authoritative inventory/progress polling and automatic claims.
+Configured channel order is preserved within eligible candidates; only one
+stream is watched per account. Points use a separate heartbeat and bonus claims.
+Saved sessions remain compatible; legacy password accounts must switch to TV
+login when their session expires. See the README for protocol and parity limits.
+
 ## Legacy runtime
 
 The old `main.py` process loaded `config.yaml`, initialized JSON-backed state,

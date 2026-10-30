@@ -1207,7 +1207,7 @@ class MinerSupervisor:
                 part for part in (str(settings.BASE_DIR), existing_pythonpath) if part
             )
             popen_options = {
-                # The upstream miner hardcodes ./cookies. Running children from
+                # The headless engine uses ./cookies. Running children from
                 # the worker-only runtime directory keeps every refreshable
                 # session outside the web service's filesystem view.
                 "cwd": runtime_dir,
