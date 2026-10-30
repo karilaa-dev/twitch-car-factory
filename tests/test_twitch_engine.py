@@ -356,3 +356,72 @@ def test_current_session_for_another_channel_never_proves_eligibility_or_progres
     assert not any(channel.confirmed_campaigns for channel in miner.online)
     assert miner.campaigns["campaign"].drops["drop"].current_minutes == 0
     assert not miner.claimed
+
+
+@pytest.mark.parametrize("session_response", ["missing", "failed", "stale"])
+def test_increasing_inventory_progress_prevents_false_stall(session_response):
+    client, miner, _ = setup()
+    client.live["first"] = "game"
+    client.inventory = [deepcopy(client.campaign)]
+    original = client.gql
+
+    def gql(operation, variables=None):
+        if operation == "CurrentDrop" and session_response == "failed":
+            raise TwitchError("Current session unavailable")
+        return original(operation, variables)
+
+    client.gql = gql
+    if session_response == "stale":
+        client.progress = {"dropID": "drop", "currentMinutesWatched": 0}
+    for minute in range(7):
+        client.inventory[0]["timeBasedDrops"][0]["self"]["currentMinutesWatched"] = minute + 1
+        miner.step(100 + minute * 60, NOW)
+    assert all(call.args == ("first",) for call in client.watch.call_args_list)
+    client.reset_playback.assert_not_called()
+    assert not miner.cooldowns
+    assert miner.campaigns["campaign"].drops["drop"].current_minutes == 7
+
+
+@pytest.mark.parametrize("operation", ["Inventory", "Campaigns"])
+@pytest.mark.parametrize("cached", [False, True])
+def test_metadata_outage_preserves_playback_and_points_until_recovery(operation, cached):
+    client, miner, _ = setup()
+    if cached:
+        miner.step(100, NOW)
+    original = client.gql
+    attempts = []
+
+    def gql(name, variables=None):
+        if name == operation:
+            attempts.append(name)
+            raise TwitchError("Metadata unavailable")
+        return original(name, variables)
+
+    client.gql = gql
+    miner.next_discovery = 0
+    for now in range(160, 521, 20):
+        miner.step(now, NOW)
+    assert len(attempts) == 7  # Metadata retries are bounded to once per minute.
+    assert client.watch.call_count == 19 + int(cached)
+    assert client.send_points_watch.call_count == client.watch.call_count
+    assert client.claim_points.call_count == 7 + int(cached)
+    assert client.watch.call_args.args == (("second",) if cached else ("first",))
+    client.gql = original
+    miner.step(580, NOW)
+    assert client.watch.call_args.args == ("second",)
+
+
+@pytest.mark.parametrize("operation", ["Inventory", "Campaigns"])
+def test_metadata_authentication_failure_still_stops_collection(operation):
+    client, miner, _ = setup()
+    original = client.gql
+
+    def gql(name, variables=None):
+        if name == operation:
+            raise AuthenticationError("Session rejected")
+        return original(name, variables)
+
+    client.gql = gql
+    with pytest.raises(AuthenticationError):
+        miner.step(100, NOW)
+    client.watch.assert_not_called()

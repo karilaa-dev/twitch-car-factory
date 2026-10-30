@@ -51,7 +51,7 @@ class DropsMiner:
         self.next_discovery = 0.0
         self.next_points: dict[str, float] = {}
         self.watching: Channel | None = None
-        self.progress: tuple[str, int] | None = None
+        self.progress: tuple[tuple[str, str, int], ...] | None = None
         self.progress_at = 0.0
 
     def refresh_channels(self) -> None:
@@ -208,24 +208,35 @@ class DropsMiner:
                    for c in self.campaigns.values())
 
     def update_progress(self, channel: Channel, now: float, wall_now: datetime) -> None:
+        campaigns = [
+            campaign for campaign in self.campaigns.values()
+            if campaign.id in (channel.campaigns | channel.confirmed_campaigns)
+            and campaign.eligible_for(channel.id, channel.game_id, wall_now)
+        ]
         current = channel.current_drop
-        if current is None:
-            return
-        for campaign in self.campaigns.values():
-            drop = campaign.drops.get(str(current.get("dropID", "")))
-            if (drop is None or campaign.id not in (channel.campaigns | channel.confirmed_campaigns)
-                    or not campaign.eligible_for(channel.id, channel.game_id, wall_now)):
-                continue
-            minutes = current.get("currentMinutesWatched")
-            if not isinstance(minutes, int) or isinstance(minutes, bool) or minutes < 0:
-                return
-            drop.current_minutes = min(minutes, drop.required_minutes)
-            progress = (drop.id, drop.current_minutes)
-            if progress != self.progress:
-                self.progress, self.progress_at = progress, now
-                logger.info("Drop progress: %s (%s/%s minutes)", drop.name,
-                            drop.current_minutes, drop.required_minutes)
-            return
+        if current is not None:
+            for campaign in campaigns:
+                drop = campaign.drops.get(str(current.get("dropID", "")))
+                minutes = current.get("currentMinutesWatched")
+                if (drop is not None and isinstance(minutes, int)
+                        and not isinstance(minutes, bool) and minutes >= 0):
+                    # CurrentDrop can lag behind the inventory response.
+                    drop.current_minutes = max(drop.current_minutes, min(minutes, drop.required_minutes))
+                    break
+        # Inventory is authoritative progress too, including when CurrentDrop
+        # is absent. Stable ordering avoids treating response order as progress.
+        progress = tuple(sorted(
+            (campaign.id, drop.id, drop.current_minutes)
+            for campaign in campaigns for drop in campaign.drops.values()
+        ))
+        if progress and progress != self.progress:
+            previous = set(self.progress or ())
+            self.progress, self.progress_at = progress, now
+            for campaign in campaigns:
+                for drop in campaign.drops.values():
+                    if not drop.is_claimed and (campaign.id, drop.id, drop.current_minutes) not in previous:
+                        logger.info("Drop progress: %s (%s/%s minutes)", drop.name,
+                                    drop.current_minutes, drop.required_minutes)
 
     def report(self, watched: Channel | None) -> None:
         self.emit("watching_channels", channels=[watched.login] if watched else [],
@@ -238,7 +249,14 @@ class DropsMiner:
             self.refresh_channels()
             if {c.game_id for c in self.online} != previous_games:
                 self.next_discovery = 0
-            self.refresh_inventory(now)
+            try:
+                self.refresh_inventory(now)
+            except AuthenticationError:
+                raise
+            except TwitchError:
+                # Keep playback/points alive with cached eligibility, or the
+                # usual points-only fallback, while retrying metadata next minute.
+                logger.warning("Drops metadata unavailable; continuing playback and retrying.")
             self.refresh_current_sessions()
             self.claim_drops(wall_now)
             self.next_refresh = now + REFRESH_INTERVAL
