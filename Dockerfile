@@ -23,7 +23,7 @@ ENV UV_COMPILE_BYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     DJANGO_DEBUG=0
 
-COPY pyproject.toml uv.lock README.md ./
+COPY pyproject.toml uv.lock README.md THIRD_PARTY_NOTICES.md ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-install-project
 

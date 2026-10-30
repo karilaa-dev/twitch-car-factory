@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import copy
 from enum import StrEnum
 import json
 from typing import Iterable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from TwitchChannelPointsMiner.constants import CLIENT_ID, GQLOperations
+from controller.twitch_miner.constants import GQL_URL, WEB_CLIENT_ID, operation_payload
 
 
 TWITCH_LOOKUP_TIMEOUT_SECONDS = 6
@@ -26,15 +25,13 @@ def _lookup_batch(names: tuple[str, ...]) -> dict[str, TwitchLookupStatus]:
     fallback = {name: TwitchLookupStatus.UNVERIFIED for name in names}
     payload = []
     for name in names:
-        operation = copy.deepcopy(GQLOperations.GetIDFromLogin)
-        operation["variables"]["login"] = name
-        payload.append(operation)
+        payload.append(operation_payload("GetIDFromLogin", {"login": name}))
 
     request = Request(
-        GQLOperations.url,
+        GQL_URL,
         data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
         headers={
-            "Client-Id": CLIENT_ID,
+            "Client-Id": WEB_CLIENT_ID,
             "Content-Type": "application/json",
         },
         method="POST",

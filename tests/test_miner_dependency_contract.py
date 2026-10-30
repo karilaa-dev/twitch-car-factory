@@ -1,109 +1,46 @@
-import inspect
-import logging
+"""Integration contract between the supervised child and the owned engine."""
+from unittest.mock import Mock
 
-from colorama import Fore
-from TwitchChannelPointsMiner import TwitchChannelPointsMiner
-from TwitchChannelPointsMiner.classes.Chat import ChatPresence
-from TwitchChannelPointsMiner.classes.Settings import Priority
-from TwitchChannelPointsMiner.classes.entities.Streamer import Streamer, StreamerSettings
-from TwitchChannelPointsMiner.classes.Twitch import Twitch
-from TwitchChannelPointsMiner.classes.TwitchLogin import TwitchLogin
+import pytest
 
-from controller.miner_runner import (
-    _snapshot_streamers,
-    online_ordered_channels,
-    selected_ordered_channels,
-)
-from TwitchChannelPointsMiner.logger import ColorPalette, LoggerSettings
+from controller import miner_runner
+from controller.twitch_miner import auth, client, engine
 
 
-def test_upstream_miner_supports_runner_configuration():
-    """Keep dependency upgrades compatible with controller.miner_runner."""
+def test_runner_uses_owned_engine_and_emits_authentication_only_after_validation(monkeypatch, tmp_path):
+    events = []
+    session = auth.Session(token="private-token", user_id="42", client_id="validated-client")
+    login = Mock(return_value=session)
+    protocol = Mock()
+    miner = Mock()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(auth, "authenticate", login)
+    monkeypatch.setattr(client, "TwitchClient", protocol)
+    monkeypatch.setattr(engine, "DropsMiner", miner)
+    monkeypatch.setattr(miner_runner, "prepare_upstream_logging", lambda: None)
+    monkeypatch.setattr(miner_runner, "emit_control_event", lambda event, **payload: events.append((event, payload)))
+    payload = miner_runner.LaunchPayload("Alice", "unused-password", ("Alpha", "Beta"), "twitch_tv")
 
-    logger_settings = LoggerSettings(
-        save=False,
-        console_level=logging.INFO,
-        console_username=True,
-        auto_clear=False,
-        time_zone="",
-        file_level=logging.WARNING,
-        emoji=True,
-        less=False,
-        colored=False,
-        color_palette=ColorPalette(
-            STREAMER_online="GREEN",
-            streamer_offline="red",
-            BET_wiN=Fore.MAGENTA,
-        ),
-    )
-    streamer_settings = StreamerSettings(
-        make_predictions=False,
-        follow_raid=False,
-        claim_drops=True,
-        claim_moments=True,
-        watch_streak=True,
-        chat=ChatPresence.ONLINE,
-    )
+    miner_runner.run_miner(payload)
 
-    inspect.signature(TwitchChannelPointsMiner).bind(
-        username="dependency-contract",
-        password=None,
-        claim_drops_startup=False,
-        priority=[Priority.ORDER],
-        enable_analytics=False,
-        disable_ssl_cert_verification=False,
-        disable_at_in_nickname=False,
-        logger_settings=logger_settings,
-        streamer_settings=streamer_settings,
-    )
-    oauth_request = TwitchLogin.send_oauth_request
-    assert callable(oauth_request)
-    inspect.signature(oauth_request).bind(
-        TwitchLogin,
-        "https://id.twitch.tv/oauth2/device",
-        {},
-    )
-    inspect.signature(Twitch.send_minute_watched_events).bind(
-        Twitch,
-        [],
-        [Priority.ORDER],
-        3,
-    )
+    assert login.call_args.args[:3] == ("Alice", "twitch_tv", tmp_path / "cookies" / "Alice.pkl")
+    assert protocol.call_args.kwargs["token"] == "private-token"
+    assert protocol.call_args.kwargs["client_id"] == "validated-client"
+    assert miner.call_args.args[:3] == (protocol.return_value, "Alice", ("Alpha", "Beta"))
+    miner.return_value.run.assert_called_once()
+    assert events[0] == ("authenticated", {})
+    assert events[-1] == ("watching_channels", {"channels": [], "online_channels": []})
+    assert "private-token" not in repr(events)
+    assert "unused-password" not in repr(login.call_args)
 
 
-def test_order_priority_contract_and_telemetry_selection():
-    source = inspect.getsource(Twitch.send_minute_watched_events)
-    assert "max_watch_amount = 2" in source
-    assert "streamers_index[:remaining_watch_amount()]" in source
-
-    first = Streamer("first")
-    second = Streamer("second")
-    third = Streamer("third")
-    fourth = Streamer("fourth")
-    first.is_online = True
-    first.online_at = 980
-    second.is_online = False
-    third.is_online = True
-    third.online_at = 0
-    fourth.is_online = True
-    fourth.online_at = 900
-
-    assert selected_ordered_channels(
-        [first, second, third, fourth],
-        now=1000,
-    ) == ["third", "fourth"]
-    assert online_ordered_channels(
-        [first, second, third, fourth]
-    ) == ["first", "third", "fourth"]
-
-    first.online_at = 900
-    assert selected_ordered_channels(
-        [first, second, third, fourth],
-        now=1000,
-    ) == ["first", "third"]
-
-    snapshot = _snapshot_streamers([first, third, fourth])
-    first.is_online = False
-    third.is_online = False
-    assert selected_ordered_channels(snapshot, now=1000) == ["first", "third"]
-    assert online_ordered_channels(snapshot) == ["first", "third", "fourth"]
+@pytest.mark.parametrize("error", [auth.AuthenticationError, client.AuthenticationError])
+def test_authentication_failures_reach_supervisor(monkeypatch, error):
+    events = []
+    monkeypatch.setattr(auth, "authenticate", Mock(side_effect=error("Twitch authentication was rejected.")))
+    monkeypatch.setattr(miner_runner, "prepare_upstream_logging", lambda: None)
+    monkeypatch.setattr(miner_runner, "emit_control_event", lambda event, **payload: events.append((event, payload)))
+    with pytest.raises(error):
+        miner_runner.run_miner(miner_runner.LaunchPayload("Alice", "", ("Alpha",), "twitch_tv"))
+    assert events[0][0] == "authentication_failed"
+    assert all(event != "authenticated" for event, _ in events)

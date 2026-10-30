@@ -1,22 +1,16 @@
 [project]
 name = "twitch-cat-factory"
 version = "2.0.0"
-description = "Django control plane for reliable Twitch Channel Points Miner instances"
+description = "Django control plane with a headless Twitch drops and points engine"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "colorama>=0.4.6",
     "cryptography>=49.0.0",
     "django>=6.0.7,<6.1",
     "gunicorn>=26.0.0",
     "pyyaml>=6.0.3",
-    "twitch-channel-points-miner-v2>=2.0.7",
-    "validators>=0.35.0",
     "whitenoise>=6.12.0",
 ]
-
-[tool.uv.sources]
-twitch-channel-points-miner-v2 = { git = "https://github.com/rdavydov/Twitch-Channel-Points-Miner-v2.git" }
 
 [dependency-groups]
 dev = [
